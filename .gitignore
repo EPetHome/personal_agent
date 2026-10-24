@@ -1,0 +1,13 @@
+# 批次工作树（每批临时，合入后删除）
+/.worktrees/
+# loop 配置是分支专属，权威副本在 docs/batches/<批次>/autoreview.json
+.autoreview.json
+# 密钥
+.env
+.env.*
+# 常见产物
+node_modules/
+dist/
+logs/
+.pi/
+.DS_Store
