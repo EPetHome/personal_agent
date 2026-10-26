@@ -1,0 +1,32 @@
+{
+  "release": "main",
+  "workspaces": {
+    "dev分支": "../personal agent-dev分支"
+  },
+  "localFiles": [],
+  "methods": {
+    "paths": [".autoreview/methods"],
+    "selfCheck": "sh .autoreview/methods/self-check.sh",
+    "probe": "node -v"
+  },
+  "reviewTimeoutMin": 90,
+  "gate": {
+    "cmd": "sh .autoreview/methods/gate.sh check",
+    "timeoutMin": 10
+  },
+  "acceptance": {
+    "guide": "code/使用说明.md",
+    "timeoutMin": 40
+  },
+  "context": {
+    "root": ".",
+    "sources": [
+      { "id": "rules", "path": "AGENTS.md", "role": "rules" },
+      { "id": "need", "path": "docs/requirements/需求书-personal-agent.md", "role": "requirement" },
+      { "id": "design", "path": "docs/prompt/方案-闭环1-AI工作盯防.md", "role": "design", "dependsOn": ["need"] },
+      { "id": "samples", "path": "docs/batches", "role": "guide", "dependsOn": ["design"] },
+      { "id": "methods", "path": ".autoreview/methods", "role": "guide", "dependsOn": ["design"] }
+    ],
+    "intervalSec": 0
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "推送判断与渠道常驻-20261025",
+  "branch": "feat/推送判断与渠道常驻",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "推送与判断": {
+      "prompt": "../../prompt/提示词-推送与判断.md",
+      "scope": { "allow": ["code/", "docs/batches/推送判断与渠道常驻-20261025/结果.md"] }
+    },
+    "渠道与常驻": {
+      "prompt": "../../prompt/提示词-渠道与常驻.md",
+      "scope": { "allow": ["code/", "docs/batches/推送判断与渠道常驻-20261025/结果.md"] }
+    }
+  },
+  "steps": [["推送与判断"], ["渠道与常驻"]],
+  "e2e": {
+    "workDir": "/Users/Admin/Desktop/personal agent-dev分支",
+    "criteria": "整批验收标准.md",
+    "maxRounds": 3,
+    "acceptance": { "guide": "code/使用说明.md", "timeoutMin": 40 }
+  }
+}

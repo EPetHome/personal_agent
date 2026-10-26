@@ -1,0 +1,16 @@
+{
+  "reviewTimeoutMin": 90,
+  "gate": { "cmd": "PA_SAMPLE_ROOT='/Users/Admin/Desktop/personal agent/docs/batches/闭环1-感知与总览-20261025/samples' PA_SAMPLE_ROOT_V2='/Users/Admin/Desktop/personal agent/docs/batches/真实格式兼容-20261025/samples' bash code/deploy/check.sh", "timeoutMin": 10 },
+  "acceptance": { "guide": "code/使用说明.md", "timeoutMin": 40 },
+  "context": {
+    "root": "../..",
+    "sources": [
+      { "id": "rules", "path": "AGENTS.md", "role": "rules" },
+      { "id": "need", "path": "docs/requirements/需求书-personal-agent.md", "role": "requirement" },
+      { "id": "design", "path": "docs/prompt/方案-闭环1-AI工作盯防.md", "role": "design", "dependsOn": ["need"] },
+      { "id": "task", "path": "docs/prompt/xx/提示词-真实格式兼容.md", "role": "requirement", "dependsOn": ["design"] },
+      { "id": "samples", "path": "docs/batches/真实格式兼容-20261025/samples", "role": "guide", "dependsOn": ["task"] }
+    ],
+    "intervalSec": 0
+  }
+}
