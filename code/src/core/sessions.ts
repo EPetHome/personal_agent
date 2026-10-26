@@ -26,9 +26,10 @@ export function membersOf(record: SessionRecord): readonly SessionMember[] {
   return record.members?.length ? record.members : [record];
 }
 export function memberSnapshot(record: SessionRecord): SessionMember {
-  const { sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, parentSessionId, unavailable } = record;
+  const { sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable } = record;
   return structuredClone({
     sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded,
+    ...(assistantReply === undefined ? {} : { assistantReply }),
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
     ...(unavailable === undefined ? {} : { unavailable }),
   });

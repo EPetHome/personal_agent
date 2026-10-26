@@ -16,7 +16,7 @@ export function event(payload: EventPayload, at: string): AgentEvent {
   return { ...payload, version: 1, at, id };
 }
 export function project(events: AgentEvent[]): Projection {
-  const result: Projection = { sessions: new Map(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map() };
+  const result: Projection = { sessions: new Map(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelCalls: new Map(), channelDeliveries: new Map() };
   const rawPushes = new Map<string, PushRecord>();
   const pushes = new Set<string>();
   const notices = new Set<string>();
@@ -59,6 +59,13 @@ export function project(events: AgentEvent[]): Projection {
       case 'notices_delivered':
         for (const id of entry.ids) result.deliveredNoticeIds.add(id);
         break;
+      case 'model_call_started': {
+        const day = entry.at.slice(0, 10);
+        result.modelCalls.set(day, (result.modelCalls.get(day) ?? 0) + 1);
+        break;
+      }
+      case 'model_checked': result.modelChecks.set(entry.check.key, entry.check); break;
+      case 'channel_delivery': result.channelDeliveries.set(`${entry.channel}:${entry.noticeId}`, entry.ok); break;
       case 'push_cursor': break;
     }
   }

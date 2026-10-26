@@ -35,7 +35,7 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered'];
+  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'channel_delivery'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
@@ -46,6 +46,9 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');
     if (row.kind === 'notice_planned' && !row.notice?.id) throw new Error('发件事件结构损坏');
     if (row.kind === 'notice_suppressed' && (typeof row.dedupeKey !== 'string' || typeof row.evidenceAt !== 'string')) throw new Error('历史提醒抑制事件结构损坏');
+    if (row.kind === 'model_call_started' && (typeof row.key !== 'string' || !['drift', 'waiting'].includes(row.task))) throw new Error('模型用量事件结构损坏');
+    if (row.kind === 'model_checked' && (!row.check || typeof row.check.key !== 'string' || typeof row.check.fingerprint !== 'string' || !Array.isArray(row.check.stepIds))) throw new Error('模型判断事件结构损坏');
+    if (row.kind === 'channel_delivery' && (typeof row.channel !== 'string' || typeof row.noticeId !== 'string' || typeof row.ok !== 'boolean')) throw new Error('渠道交付事件结构损坏');
     if (row.kind === 'notices_delivered' && (!Array.isArray(row.ids) || row.ids.some(id => typeof id !== 'string'))) throw new Error('发件确认事件结构损坏');
   }
   return rows;
@@ -68,6 +71,17 @@ export async function writeState(dataDir: string, state: unknown): Promise<void>
   } finally { await handle.close(); }
   try { await rename(temporary, path); }
   catch (error) { await unlink(temporary).catch(() => {}); throw error; }
+}
+/** 只防止重复模型批次，不阻挡规则检测或反馈；忙时跳过本轮模型阶段。 */
+export async function withModelLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T | null> {
+  const lock = join(dataDir, '.model.lock');
+  try { await mkdir(lock, { mode: 0o700 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    throw error;
+  }
+  try { return await operation(); }
+  finally { await rmdir(lock); }
 }
 export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T> {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });

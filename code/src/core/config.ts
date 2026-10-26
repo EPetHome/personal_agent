@@ -28,6 +28,11 @@ async function canonical(path: string, source = false): Promise<string> {
     return join(await canonical(parent, source), path.slice(parent.length));
   }
 }
+function integer(value: unknown, fallback: number, label: string, minimum: number): number {
+  const result = value ?? fallback;
+  if (!Number.isSafeInteger(result) || (result as number) < minimum || (result as number) > 2_147_483_647) throw new Error(`${label}必须是 >= ${minimum} 的安全整数`);
+  return result as number;
+}
 export async function validateConfig(value: unknown): Promise<Config> {
   const data = object(value, '配置');
   const sources = object(data.sources, 'sources 配置');
@@ -46,6 +51,20 @@ export async function validateConfig(value: unknown): Promise<Config> {
       pi: requiredString(commands.pi, 'commands.pi'),
     },
   };
+  if (data.judge != null) {
+    const judge = object(data.judge, 'judge');
+    config.judge = {
+      executable: requiredString(judge.executable, 'judge.executable'),
+      model: requiredString(judge.model, 'judge.model'),
+      dailyLimit: integer(judge.dailyLimit, 240, 'judge.dailyLimit', 0),
+      timeoutMs: integer(judge.timeoutMs, 30000, 'judge.timeoutMs', 1),
+      cycleTimeoutMs: integer(judge.cycleTimeoutMs, 60000, 'judge.cycleTimeoutMs', 1),
+    };
+  }
+  if (data.localChannel != null) {
+    const channel = object(data.localChannel, 'localChannel');
+    config.localChannel = { executable: requiredString(channel.executable, 'localChannel.executable'), timeoutMs: integer(channel.timeoutMs, 3000, 'localChannel.timeoutMs', 1) };
+  }
   for (const tool of tools) config.sources[tool] = sources[tool] === null ? null : absolute(sources[tool], `sources.${tool}`);
   const readPaths = [...Object.values(config.sources), config.inboxDir].filter((p): p is string => p !== null);
   const dataPath = await canonical(config.dataDir);

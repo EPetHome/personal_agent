@@ -19,9 +19,9 @@ function node(row: JsonObject): JsonObject {
   } else if (message?.role === 'assistant') {
     const blocks: JsonObject[] = [];
     const text = contentText(message.content);
-    if (text) blocks.push({ type: 'text', text: compact(text) });
+    if (text) blocks.push({ type: 'text', text: compact(text, 1200) });
     for (const b of Array.isArray(message.content) ? message.content : []) {
-      if (b?.type === 'toolCall') blocks.push({ type: b.type, id: b.id, name: b.name,
+      if (b?.type === 'toolCall' && !['error', 'aborted'].includes(message.stopReason)) blocks.push({ type: b.type, id: b.id, name: b.name,
         summary: typeof b.name === 'string' ? commandSummary(b.name, b.arguments) : '' });
     }
     result.message = { role: 'assistant', content: blocks, stopReason: message.stopReason };
@@ -89,7 +89,10 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
         addStep(record, { at, text: step.text });
       }
       const text = contentText(message.content);
-      if (text) addStep(record, { at, text });
+      if (text) {
+        addStep(record, { at, text: compact(text) });
+        record.assistantReply = { at, text };
+      }
       record.assistantFinished = message.stopReason === 'stop' && !message.content.some((b: JsonObject) => b.type === 'toolCall');
     } else {
       pending.delete(requiredString(message.toolCallId, 'toolCallId'));

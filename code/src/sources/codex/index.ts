@@ -38,10 +38,12 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     }) !== undefined;
     let recognized = 0;
     let lastAgent: { text: string; phase?: string } | undefined;
+    let turnCompleted = false;
     function agentMessage(message: string, phase: string | undefined, at: string) {
       if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message) });
       const actualPhase = phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
       record.assistantFinished = actualPhase !== 'commentary';
+      if (message) record.assistantReply = { at, text: compact(message, 1200) };
       lastAgent = { text: message, phase: actualPhase };
     }
     for (const row of rows) {
@@ -60,6 +62,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           const userText = humanMessage(item, row);
           if (userText !== null) {
             addIntent(record, userText);
+            turnCompleted = false;
             record.assistantFinished = false;
             record.sessionEnded = false;
           }
@@ -72,8 +75,11 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
             : item.type === 'FileChange' ? { path: Object.keys(item.changes ?? {}).slice(0, 3).join('、') } : item.arguments;
           const step = { at, text: commandSummary(name, args) };
           addStep(record, step);
-          record.assistantFinished = false;
-          record.sessionEnded = false;
+          // 本轮 task_complete 后落盘的后台完成项不重新打开这一轮。
+          if (!turnCompleted || ['in_progress', 'running', 'started'].includes(item.status)) {
+            record.assistantFinished = false;
+            record.sessionEnded = false;
+          }
           // item_completed 是结束事实；显式 in_progress/running 才保留为待返回。
           if (['in_progress', 'running', 'started'].includes(item.status)) {
             const id = requiredString(item.call_id ?? item.id, '工具项 id');
@@ -86,18 +92,24 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
             const userText = humanMessage(p, row);
             if (userText !== null) {
               addIntent(record, userText);
+              turnCompleted = false;
               record.assistantFinished = false;
               record.sessionEnded = false;
             }
           }
         } else if (p.type === 'task_started') {
+          turnCompleted = false;
           record.assistantFinished = false;
           record.sessionEnded = false;
         } else if (p.type === 'agent_message') agentMessage(contentText(p.message), p.phase, at);
         else if (p.type === 'task_complete') {
           record.assistantFinished = true;
+          turnCompleted = true;
           pending.clear();
-          if (typeof p.last_agent_message === 'string') addStep(record, { at, text: compact(p.last_agent_message) });
+          if (typeof p.last_agent_message === 'string') {
+            addStep(record, { at, text: compact(p.last_agent_message) });
+            record.assistantReply = { at, text: compact(p.last_agent_message, 1200) };
+          }
         } else if (p.type === 'session_end') record.sessionEnded = true;
         else if (p.type === 'turn_aborted') {
           record.assistantFinished = false;
@@ -106,6 +118,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       } else if (calls.includes(p.type)) {
         const id = requiredString(p.call_id ?? p.id, 'call_id');
         const step = { id, at, text: commandSummary(p.name ?? 'shell', p.arguments ?? p.input ?? p.action) };
+        turnCompleted = false;
         pending.set(id, step); // 调用项 status:completed 不等于对应 output 已返回。
         record.assistantFinished = false;
         record.sessionEnded = false;
