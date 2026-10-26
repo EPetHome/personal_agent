@@ -8,7 +8,8 @@ case "${1:-check}" in
   *) echo "用法：$0 check" >&2; exit 2 ;;
 esac
 
-ROOT=$(pwd)
+# 样本里的推送事件写着项目根的绝对路径，所以始终读运行版（项目根）里那份只读样本，不读开发空间里的副本。
+ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 SAMPLES="PA_SAMPLE_ROOT=docs/batches/闭环1-感知与总览-20261025/samples
 PA_SAMPLE_ROOT_V2=docs/batches/真实格式兼容-20261025/samples"
 
@@ -18,4 +19,4 @@ for pair in $SAMPLES; do
   export "${pair%%=*}=$ROOT/$dir"
 done
 
-exec bash "$ROOT/code/deploy/check.sh"
+exec bash code/deploy/check.sh
