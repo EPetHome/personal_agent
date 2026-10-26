@@ -1,6 +1,8 @@
 import { join } from 'node:path';
 import { fileChannel } from '../channels/file/index.ts';
-import { localChannel } from '../channels/local/index.ts';
+import { accepts, configuredChannels } from '../channels/index.ts';
+import { maintain } from './maintenance.ts';
+import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
 import { event, project, pushIdentity } from './events.ts';
@@ -11,7 +13,7 @@ import { perceive } from './perception.ts';
 import { findPushTarget, isFailedOriginal, isIgnoredMember, membersOf } from './sessions.ts';
 import { appendJsonl, readEvents, readOutbox, withModelLock, withStoreLock, writeState } from './store.ts';
 import { iso } from './utils.ts';
-import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Projection } from './types.ts';
+import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Notice, Projection } from './types.ts';
 
 export interface Snapshot { at: string; records: JudgedRecord[]; projection: Projection }
 function activeProjection(projection: Projection, config: Config): Projection {
@@ -36,7 +38,7 @@ function activeProjection(projection: Projection, config: Config): Projection {
   return {
     ...projection, sessions, pushes,
     health: new Map([...projection.health].filter(([source]) => source === 'inbox' ? config.inboxDir !== null : config.sources[source] !== null)),
-    notices: projection.notices.filter(notice => (notice.tool === 'inbox' ? config.inboxDir !== null : config.sources[notice.tool] !== null)
+    notices: projection.notices.filter(notice => (notice.tool === 'agent' || (notice.tool === 'inbox' ? config.inboxDir !== null : config.sources[notice.tool] !== null))
       && (!notice.sessionKey || sessions.has(notice.sessionKey))
       && (!notice.memberSessionId || (!!notice.sessionKey && membersOf(sessions.get(notice.sessionKey)!).some(member => member.sessionId === notice.memberSessionId)))
       && (notice.kind !== 'waiting' || notice.dedupeKey.startsWith('model_waiting:') || waitingKeys.has(notice.dedupeKey))
@@ -70,7 +72,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   for (const notice of planned) add({ kind: 'notice_planned', notice });
   const queued = activeProjection(project([...events, ...added]), config);
   for (const channel of channels) for (const notice of queued.notices) {
-    if (notice.level !== '现在就要你') continue;
+    if (!accepts(channel, notice)) continue;
     const key = `${channel.name}:${notice.id}`;
     if (!queued.channelDeliveries.has(key) && !previous.deliveredNoticeIds.has(notice.id)) add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok: false });
   }
@@ -90,7 +92,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   }
   for (const channel of channels) for (const notice of complete.notices) {
     const key = `${channel.name}:${notice.id}`;
-    if (notice.level !== '现在就要你' || complete.channelDeliveries.get(key) !== false || attempted.has(key)) continue;
+    if (!accepts(channel, notice) || complete.channelDeliveries.get(key) !== false || attempted.has(key)) continue;
     attempted.add(key);
     let ok = true;
     try { await channel.send(notice); } catch { ok = false; }
@@ -103,11 +105,28 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   await writeState(config.dataDir, serializedState(view));
   return { ...view, noticesAdded };
 }
-export async function detect(configInput: Config, currentTime = new Date().toISOString(), components: { judge?: Judge; channels?: Channel[] } = {}) {
+export async function publishNotices(config: Config, notices: Notice[], now: string, channels = configuredChannels(config), attempted = new Set<string>()) {
+  return withStoreLock(config.dataDir, async () => {
+    const events = await readEvents(config.dataDir), known = new Set(project(events).notices.map(n => n.id));
+    const added = notices.filter(n => !known.has(n.id)).map(notice => event({ kind: 'notice_planned', notice }, now));
+    return settle(config, events, added, now, channels, attempted);
+  });
+}
+export async function detect(configInput: Config, currentTime = new Date().toISOString(), components: { judge?: Judge; channels?: Channel[]; experienceModel?: ExperienceModel } = {}) {
   const config = await validateConfig(configInput);
   const now = iso(currentTime, '当前时间');
-  const channels = components.channels ?? (config.localChannel ? [localChannel(config.dataDir, config.localChannel)] : []);
+  const channels = components.channels ?? configuredChannels(config);
   const attempted = new Set<string>();
+  let modelDeadline = Infinity;
+  const finish = async (view: Snapshot & { noticesAdded: number }) => {
+    for (const channel of channels) if ('drain' in channel && typeof channel.drain === 'function') await channel.drain(now);
+    // 归因与普通判断共用单轮模型预算，避免常驻被两段各60秒串行拖住。
+    const maintenanceConfig = config.judge ? { ...config, judge: { ...config.judge, cycleTimeoutMs: Math.max(0, modelDeadline - Date.now()) } } : config;
+    const supplemental = await maintain(maintenanceConfig, now, components.experienceModel);
+    if (!supplemental.length) return view;
+    const settled = await publishNotices(config, supplemental, now, channels, attempted);
+    return { ...settled, noticesAdded: view.noticesAdded + settled.noticesAdded };
+  };
   const ruleView = await withStoreLock(config.dataDir, async () => {
     const events = await readEvents(config.dataDir);
     const previous = project(events);
@@ -148,7 +167,8 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。
     return settle(config, events, added, now, channels, attempted);
   });
-  if (!config.judge) return ruleView;
+  if (!config.judge) return finish(ruleView);
+  modelDeadline = Date.now() + (config.judge.cycleTimeoutMs ?? 60000);
   const modelView = await withModelLock(config.dataDir, async () => {
     const projection = await withStoreLock(config.dataDir, async () => activeProjection(project(await readEvents(config.dataDir)), config));
     const records = judgeRecords(projection, now);
@@ -164,7 +184,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     if (!changed) return null;
     return withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
   });
-  return modelView ? { ...modelView, noticesAdded: ruleView.noticesAdded + modelView.noticesAdded } : ruleView;
+  return finish(modelView ? { ...modelView, noticesAdded: ruleView.noticesAdded + modelView.noticesAdded } : ruleView);
 }
 export async function overview(configInput: Config, now?: string): Promise<Snapshot> {
   const config = await validateConfig(configInput);

@@ -1,8 +1,9 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, rename, rmdir, unlink } from 'node:fs/promises';
+import { lstat, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertRegularFile } from './config.ts';
+import { acquireLock } from './locks.ts';
 import type { AgentEvent, Notice } from './types.ts';
 
 async function exists(path: string): Promise<boolean> {
@@ -46,7 +47,7 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');
     if (row.kind === 'notice_planned' && !row.notice?.id) throw new Error('发件事件结构损坏');
     if (row.kind === 'notice_suppressed' && (typeof row.dedupeKey !== 'string' || typeof row.evidenceAt !== 'string')) throw new Error('历史提醒抑制事件结构损坏');
-    if (row.kind === 'model_call_started' && (typeof row.key !== 'string' || !['drift', 'waiting'].includes(row.task))) throw new Error('模型用量事件结构损坏');
+    if (row.kind === 'model_call_started' && (typeof row.key !== 'string' || !['drift', 'waiting', 'attribution', 'same_problem'].includes(row.task))) throw new Error('模型用量事件结构损坏');
     if (row.kind === 'model_checked' && (!row.check || typeof row.check.key !== 'string' || typeof row.check.fingerprint !== 'string' || !Array.isArray(row.check.stepIds))) throw new Error('模型判断事件结构损坏');
     if (row.kind === 'channel_delivery' && (typeof row.channel !== 'string' || typeof row.noticeId !== 'string' || typeof row.ok !== 'boolean')) throw new Error('渠道交付事件结构损坏');
     if (row.kind === 'notices_delivered' && (!Array.isArray(row.ids) || row.ids.some(id => typeof id !== 'string'))) throw new Error('发件确认事件结构损坏');
@@ -74,23 +75,14 @@ export async function writeState(dataDir: string, state: unknown): Promise<void>
 }
 /** 只防止重复模型批次，不阻挡规则检测或反馈；忙时跳过本轮模型阶段。 */
 export async function withModelLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T | null> {
-  const lock = join(dataDir, '.model.lock');
-  try { await mkdir(lock, { mode: 0o700 }); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return null;
-    throw error;
-  }
+  let release: () => Promise<void>;
+  try { release = await acquireLock(dataDir, '.model.lock'); }
+  catch (error) { if ((error as Error).message.includes('正被占用')) return null; throw error; }
   try { return await operation(); }
-  finally { await rmdir(lock); }
+  finally { await release(); }
 }
 export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T> {
-  await mkdir(dataDir, { recursive: true, mode: 0o700 });
-  const lock = join(dataDir, '.detect.lock');
-  try { await mkdir(lock, { mode: 0o700 }); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`数据目录正被占用；如进程异常退出，请确认没有检测进程后删除 ${lock}`);
-    throw error;
-  }
+  const release = await acquireLock(dataDir, '.detect.lock');
   try {
     for (const name of ['events.jsonl', 'outbox.jsonl', 'feedback.jsonl']) {
       const path = join(dataDir, name);
@@ -98,5 +90,5 @@ export async function withStoreLock<T>(dataDir: string, operation: () => Promise
       else { const handle = await open(path, 'ax', 0o600); await handle.close(); }
     }
     return await operation();
-  } finally { await rmdir(lock); }
+  } finally { await release(); }
 }

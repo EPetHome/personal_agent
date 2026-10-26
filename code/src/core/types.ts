@@ -14,6 +14,16 @@ export interface Config {
   /** 省略/null 保持纯规则模式，不启动任何模型或通知进程。 */
   judge?: JudgeConfig | null;
   localChannel?: { executable: string; timeoutMs: number } | null;
+  feishu?: FeishuConfig | null;
+  service?: { intervalMs: number; restartWindowMs: number; restartThreshold: number };
+  learning?: boolean;
+}
+export interface FeishuConfig {
+  mode: 'fake' | 'real';
+  /** 同时是唯一收件人和允许反馈的操作者，使用 open_id。 */
+  receiverId: string;
+  envFile?: string;
+  timeoutMs: number;
 }
 export interface JudgeConfig {
   executable: string;
@@ -174,13 +184,26 @@ export interface Notice {
   id: string;
   dedupeKey: string;
   at: string;
-  tool: HealthSource;
-  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed';
+  tool: HealthSource | 'agent';
+  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed' | 'weekly' | 'recurrence' | 'service_restart';
   level: '现在就要你' | '有空看';
   sessionKey?: string;
   memberSessionId?: string;
   content: NoticeContent;
   text: string;
+  reviews?: ReviewItem[];
+}
+export interface ReviewItem {
+  experienceId: string;
+  /** 与卡片所示经验绑定的审阅版本；旧日志缺此字段时回调拒绝写入。 */
+  experienceRevision?: string;
+  title: string;
+  count: number;
+  previousAt: string | null;
+  previousCountermeasure: string;
+  layer: string;
+  countermeasure: string;
+  status: string;
 }
 export type EventPayload =
   | { kind: 'session_observed'; record: SessionRecord }
@@ -192,7 +215,7 @@ export type EventPayload =
   | { kind: 'notice_planned'; notice: Notice }
   | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string }
   | { kind: 'notices_delivered'; ids: string[] }
-  | { kind: 'model_call_started'; task: JudgmentTask; key: string }
+  | { kind: 'model_call_started'; task: JudgmentTask | 'attribution' | 'same_problem'; key: string }
   | { kind: 'model_checked'; check: ModelCheck }
   | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
@@ -214,6 +237,8 @@ export interface ChannelReply {
   noticeId?: string | null;
   content: string;
   at: string;
+  /** 渠道事件去重键，仅内部使用。 */
+  replyId?: string;
 }
 export interface Feedback {
   version: 1;
@@ -223,10 +248,13 @@ export interface Feedback {
   noticeId: string | null;
   verdict: '正确' | '误报' | '漏了';
   comment: string;
+  replyId?: string;
 }
 /** 渠道只发给用户本人，不替用户回复来源工具。编号只在结构化参数内。 */
 export interface Channel {
   name: string;
+  /** 省略时兼容段 1：只投「现在就要你」。 */
+  levels?: readonly Notice['level'][];
   send(notice: Notice): Promise<void>;
   receive(reply: ChannelReply): Promise<'已记下'>;
 }

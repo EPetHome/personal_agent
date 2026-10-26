@@ -185,5 +185,7 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);
   const failed = projection.notices.filter(n => projection.channelDeliveries.get(`local:${n.id}`) === false).length;
   if (failed) lines.push(`本机通知尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
+  const feishuFailed = projection.notices.filter(n => projection.channelDeliveries.get(`feishu:${n.id}`) === false).length;
+  if (feishuFailed) lines.push(`飞书尚未成功：${feishuFailed} 条；已写发件记录，下轮检测重试。`);
   return lines.join('\n');
 }

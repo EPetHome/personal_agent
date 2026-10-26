@@ -1,5 +1,5 @@
 import { readFile, realpath, lstat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { object, requiredString } from './utils.ts';
 import { tools } from './types.ts';
 import type { Config } from './types.ts';
@@ -65,9 +65,31 @@ export async function validateConfig(value: unknown): Promise<Config> {
     const channel = object(data.localChannel, 'localChannel');
     config.localChannel = { executable: requiredString(channel.executable, 'localChannel.executable'), timeoutMs: integer(channel.timeoutMs, 3000, 'localChannel.timeoutMs', 1) };
   }
+  if (data.feishu != null) {
+    const channel = object(data.feishu, 'feishu');
+    if (!['fake', 'real'].includes(channel.mode)) throw new Error('feishu.mode 必须是 fake 或 real');
+    if (Object.keys(channel).some(key => !['mode', 'receiverId', 'envFile', 'timeoutMs'].includes(key))) throw new Error('飞书配置只接受 mode/receiverId/envFile/timeoutMs；凭证只能放环境变量或已忽略的 .env');
+    const envFile = channel.envFile === undefined ? undefined : absolute(channel.envFile, 'feishu.envFile');
+    if (envFile && basename(envFile) !== '.env') throw new Error('凭证文件必须命名为 .env 并由 git 忽略');
+    config.feishu = { mode: channel.mode, receiverId: requiredString(channel.receiverId, 'feishu.receiverId'),
+      timeoutMs: integer(channel.timeoutMs, 5000, 'feishu.timeoutMs', 1), ...(envFile ? { envFile } : {}) };
+  }
+  if (data.service != null) {
+    const service = object(data.service, 'service');
+    config.service = { intervalMs: integer(service.intervalMs, 60000, 'service.intervalMs', 1),
+      restartWindowMs: integer(service.restartWindowMs, 300000, 'service.restartWindowMs', 1),
+      restartThreshold: integer(service.restartThreshold, 3, 'service.restartThreshold', 1) };
+  }
+  if (data.learning !== undefined) {
+    if (typeof data.learning !== 'boolean') throw new Error('learning 必须是布尔值');
+    config.learning = data.learning;
+  }
   for (const tool of tools) config.sources[tool] = sources[tool] === null ? null : absolute(sources[tool], `sources.${tool}`);
   const readPaths = [...Object.values(config.sources), config.inboxDir].filter((p): p is string => p !== null);
   const dataPath = await canonical(config.dataDir);
+  const repository = await canonical(resolve(import.meta.dirname, '../../..'));
+  if (contains(repository, dataPath)) throw new Error('数据目录必须放在仓库外，不能把运行数据写进仓库');
+  if (config.feishu?.envFile && contains(dataPath, await canonical(config.feishu.envFile))) throw new Error('.env 须独立放在数据目录外，避免把凭证混进运行数据/导出');
   for (const path of readPaths) {
     const source = await canonical(path, true);
     if (contains(source, dataPath) || contains(dataPath, source)) {
@@ -78,7 +100,10 @@ export async function validateConfig(value: unknown): Promise<Config> {
 }
 export async function loadConfig(path: string | undefined): Promise<Config> {
   if (!path) throw new Error('请先配置：用 --config <配置文件> 显式指定来源、推送、数据目录和回看命令');
-  return validateConfig(JSON.parse(await readFile(path, 'utf8')));
+  let value: unknown;
+  try { value = JSON.parse(await readFile(path, 'utf8')); }
+  catch { throw new Error('配置文件读不了或不是合法 JSON（未输出文件内容）'); }
+  return validateConfig(value);
 }
 export async function assertRegularFile(path: string): Promise<void> {
   const stat = await lstat(path);
