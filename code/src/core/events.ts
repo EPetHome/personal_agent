@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { hash } from './utils.ts';
 import { findPushTarget } from './sessions.ts';
+import { learnSkipBaseline } from './health.ts';
 import type { AgentEvent, EventPayload, Projection, PushRecord } from './types.ts';
 
 export function pushIdentity(push: PushRecord): string {
@@ -15,7 +16,7 @@ export function event(payload: EventPayload, at: string): AgentEvent {
   return { ...payload, version: 1, at, id };
 }
 export function project(events: AgentEvent[]): Projection {
-  const result: Projection = { sessions: new Map(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null };
+  const result: Projection = { sessions: new Map(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map() };
   const rawPushes = new Map<string, PushRecord>();
   const pushes = new Set<string>();
   const notices = new Set<string>();
@@ -29,7 +30,7 @@ export function project(events: AgentEvent[]): Projection {
       case 'push_validated': {
         const push = rawPushes.get(entry.pushId);
         const record = result.sessions.get(entry.recordKey);
-        if (push && record && findPushTarget([record], push) && !pushes.has(entry.id)) {
+        if (push && record && findPushTarget([record], push, true) && !pushes.has(entry.id)) {
           result.pushes.push({ ...push, recordKey: entry.recordKey });
           pushes.add(entry.id);
         }
@@ -39,10 +40,19 @@ export function project(events: AgentEvent[]): Projection {
         const previous = result.health.get(entry.report.source);
         const since = entry.report.errors.length ? previous?.since ?? entry.at : null;
         const episodeId = since ? previous?.episodeId ?? entry.id : null;
-        result.health.set(entry.report.source, { ...entry.report, since, episodeId });
+        const fileFailureSince = entry.report.fileFailures?.count ? previous?.fileFailureSince ?? entry.at : null;
+        const fileFailureEpisodeId = fileFailureSince ? previous?.fileFailureEpisodeId ?? entry.id : null;
+        const skipBaseline = learnSkipBaseline(entry.report, previous?.skipBaseline);
+        result.health.set(entry.report.source, { ...entry.report, since, episodeId, fileFailureSince, fileFailureEpisodeId, skipBaseline });
         break;
       }
-      case 'scan_completed': result.lastScanAt = entry.at; break;
+      case 'scan_completed':
+        result.startedAt ??= entry.at;
+        result.lastScanAt = entry.at;
+        break;
+      case 'notice_suppressed':
+        result.suppressedNotices.set(entry.dedupeKey, entry.evidenceAt);
+        break;
       case 'notice_planned':
         if (!notices.has(entry.notice.id)) { result.notices.push(entry.notice); notices.add(entry.notice.id); }
         break;

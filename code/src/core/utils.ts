@@ -23,11 +23,27 @@ export function jsonLines(text: string): JsonObject[] {
   const rows: JsonObject[] = [];
   for (const [index, line] of text.split('\n').entries()) {
     if (!line.trim()) continue;
-    try { rows.push(object(JSON.parse(line))); }
-    catch { throw new Error(`第 ${index + 1} 行无法解析为 JSON 对象`); }
+    try {
+      const value: unknown = JSON.parse(line);
+      if (value && typeof value === 'object' && !Array.isArray(value)) rows.push(value as JsonObject);
+    } catch { throw new Error(`第 ${index + 1} 行无法解析为 JSON`); }
   }
-  if (!rows.length) throw new Error('会话文件为空');
   return rows;
+}
+export function findRow(rows: Iterable<JsonObject>, matches: (row: JsonObject) => boolean): JsonObject | undefined {
+  for (const row of rows) if (matches(row)) return row;
+}
+export function filterRows(rows: Iterable<JsonObject>, matches: (row: JsonObject) => boolean): Iterable<JsonObject> {
+  return { *[Symbol.iterator]() { for (const row of rows) if (matches(row)) yield row; } };
+}
+/** 故障隔离时只找核心身份；容忍其他行损坏，但结果不能代替完整 parse。 */
+export function findJsonObject(text: string, matches: (row: JsonObject) => boolean): JsonObject | undefined {
+  for (const line of text.split('\n')) {
+    try {
+      const row = object(JSON.parse(line));
+      if (matches(row)) return row;
+    } catch { /* 只提取仍可见的核心身份，不把坏文件判为正常。 */ }
+  }
 }
 export function contentText(value: unknown): string {
   if (typeof value === 'string') return value;
@@ -35,9 +51,30 @@ export function contentText(value: unknown): string {
   return value.filter(b => b && ['text', 'input_text', 'output_text'].includes(b.type))
     .map(b => typeof b.text === 'string' ? b.text : '').join('\n');
 }
+/** 按 Unicode 码点截断，不留下 UTF-16 的半个代理对。 */
+export function truncateText(text: string, limit: number): string {
+  let result = '';
+  let count = 0;
+  for (const character of text) {
+    if (count++ >= limit) return `${result}…`;
+    result += character;
+  }
+  return result;
+}
+/** 提醒正文的硬字节上限；省略号也计入上限。 */
+export function truncateUtf8(text: string, limit: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= limit) return text;
+  let result = '';
+  let bytes = Buffer.byteLength('…');
+  for (const character of text) {
+    bytes += Buffer.byteLength(character);
+    if (bytes > limit) break;
+    result += character;
+  }
+  return `${result}…`;
+}
 export function compact(text: string, limit = 220): string {
-  const line = text.replace(/\s+/g, ' ').trim();
-  return line.length > limit ? `${line.slice(0, limit)}…` : line;
+  return truncateText(text.replace(/\s+/g, ' ').trim(), limit);
 }
 export function shellQuote(value: string): string {
   return /^[a-zA-Z0-9_./:@=-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
@@ -72,8 +109,13 @@ export function emptyRecord(tool: Tool, sessionId: string, project: string, at: 
   };
 }
 export function addIntent(record: SessionRecord, text: string): void {
-  if (record.intent.initial === null) record.intent.initial = text;
-  else record.intent.additions.push(text);
+  const bounded = truncateText(text, 1000);
+  if (record.intent.initial === null) record.intent.initial = bounded;
+  else record.intent.additions.push(bounded);
+}
+export function addStep(record: SessionRecord, step: { at: string; text: string }): void {
+  record.recentSteps.push(step);
+  if (record.recentSteps.length > 8) record.recentSteps.shift();
 }
 export function finishRecord(record: SessionRecord): SessionRecord {
   record.recentSteps = record.recentSteps.slice(-8);

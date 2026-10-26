@@ -9,6 +9,8 @@ export interface Config {
   inboxDir: string | null;
   dataDir: string;
   commands: Record<'cc' | 'codex' | 'pi', string>;
+  /** 词法目录边界匹配，不读取项目本身；未配置时不忽略。 */
+  ignoreProjectPrefixes?: string[];
 }
 export interface Original { path: string; fingerprint: string }
 export interface Step { at: string; text: string }
@@ -19,6 +21,7 @@ export interface LoopFacts {
   reviews: number;
   repairs: number;
   needs: string[];
+  needsProvided?: boolean;
 }
 /** 来源组件和后续步骤唯一的会话交换格式。不保存整份会话/工具返回正文。 */
 export interface SessionRecord {
@@ -35,13 +38,21 @@ export interface SessionRecord {
   assistantFinished: boolean;
   sessionEnded: boolean;
   parentSessionId?: string;
+  /** 本轮原件/归并失败，仅保留已知关联或历史事实，不得据此确认完成。 */
+  unavailable?: boolean;
   loop?: LoopFacts;
   /** 归并会话保留每个成员自己的事实，不能用聚合时间/原件替代子会话身份。 */
   members?: SessionMember[];
 }
+export type SessionIdentity = Pick<SessionRecord, 'sessionId' | 'project' | 'parentSessionId'>;
+/** 失败原件的身份线索，不是可供正常状态/推送对账使用的会话记录。 */
+export type FailedSessionIdentity = SessionIdentity & { tool: Tool; original: Original };
 export type SessionMember = Pick<SessionRecord,
-  'sessionId' | 'project' | 'originals' | 'lastActivityAt' | 'recentSteps' |
-  'pendingTools' | 'assistantFinished' | 'sessionEnded'>;
+  'sessionId' | 'project' | 'originals' | 'recentSteps' |
+  'pendingTools' | 'assistantFinished' | 'sessionEnded' | 'parentSessionId' | 'unavailable'> & {
+    /** 只有失败身份、没有已读取活动事实时为 null，不捏造子成员时间。 */
+    lastActivityAt: string | null;
+  };
 export interface PushRecord {
   tool: Exclude<Tool, 'loop'>;
   event: 'waiting_permission' | 'turn_end' | 'session_end';
@@ -54,20 +65,43 @@ export interface PushRecord {
 }
 /** 只有显式通过对账的推送才进入判断，保留实际发出事件的成员身份。 */
 export interface ValidatedPushRecord extends PushRecord { recordKey: string }
-export interface HealthReport { source: HealthSource; errors: string[]; paths: string[] }
+export interface HealthReport {
+  source: HealthSource;
+  /** 仅整体来源/推送故障会令会话状态无法确认。 */
+  errors: string[];
+  paths: string[];
+  fileFailures?: { count: number; examples: string[] };
+  fileStats?: { total: number; skipped: number };
+  /** 最近一次可见会话清单；旧日志缺此字段时保留旧行为。 */
+  sessionKeys?: string[];
+}
+export interface SourceReadContext { modifiedAt: string }
 export interface SourceComponent {
   tool: Tool;
   extension: string;
-  parse(text: string, original: Original): SessionRecord | null;
+  /** 失败文件的核心身份，仅用于忽略/不可用关联，不能证明正常状态或授权新推送对账。 */
+  identify?(text: string): SessionIdentity | null;
+  identifyRow?(row: Record<string, any>): SessionIdentity | null;
+  /** 来源读取使用可重复遍历的惰性行流，不加载整份原件。 */
+  parseRows?(rows: Iterable<Record<string, any>>, original: Original): SessionRecord | null;
+  parseLines?(lines: Iterable<string>, original: Original, context: SourceReadContext): SessionRecord | null;
+  /** 构造测试/调用方已有文本时的兼容入口。 */
+  parse(text: string, original: Original, context?: SourceReadContext): SessionRecord | null;
 }
-export type Status = '进行中' | '在等我' | '已完成' | '停滞' | '看不见了';
+export type Status = '进行中' | '在等我' | '已完成' | '停滞' | '已搁置' | '看不见了';
 export interface JudgedRecord extends SessionRecord {
   status: Status;
   reason: string;
   waiting?: PushRecord;
-  notice?: '待写发件记录' | '已提醒，本轮去重';
+  notice?: '待写发件记录' | '已提醒，本轮去重' | '首次接入历史记录，不补发';
 }
-export interface HealthState extends HealthReport { since: string | null; episodeId: string | null }
+export interface HealthState extends HealthReport {
+  since: string | null;
+  episodeId: string | null;
+  fileFailureSince?: string | null;
+  fileFailureEpisodeId?: string | null;
+  skipBaseline?: number;
+}
 export interface NoticeContent {
   title: string;
   summary: string;
@@ -80,6 +114,7 @@ export interface NoticeContent {
     reason: string;
     originals: Original[];
     needs?: string[];
+    needsProvided?: boolean;
   };
 }
 export interface Notice {
@@ -88,7 +123,7 @@ export interface Notice {
   dedupeKey: string;
   at: string;
   tool: HealthSource;
-  kind: 'waiting' | 'stalled' | 'blind' | 'loop_paused' | 'loop_completed';
+  kind: 'waiting' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed';
   level: '现在就要你' | '有空看';
   sessionKey?: string;
   content: NoticeContent;
@@ -102,6 +137,7 @@ export type EventPayload =
   | { kind: 'source_health'; report: HealthReport }
   | { kind: 'scan_completed' }
   | { kind: 'notice_planned'; notice: Notice }
+  | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string }
   | { kind: 'notices_delivered'; ids: string[] };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
 export interface Projection {
@@ -111,6 +147,8 @@ export interface Projection {
   notices: Notice[];
   deliveredNoticeIds: Set<string>;
   lastScanAt: string | null;
+  startedAt: string | null;
+  suppressedNotices: Map<string, string>;
 }
 export interface Channel {
   name: string;
