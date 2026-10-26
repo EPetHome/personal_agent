@@ -40,6 +40,9 @@ export function codexMeta(id = 'demo-codex', parent?: string) {
   return { timestamp: start, type: 'session_meta', payload: { id, cwd: '/sample/codex', timestamp: start, ...(parent ? { source: { subagent: { thread_spawn: { parent_thread_id: parent } } } } : {}) } };
 }
 export function codexEvent(payload: Record<string, unknown>, type = 'event_msg', at = start) { return { timestamp: at, type, payload }; }
-export function loopSummary(status = '完成', project = '/sample/real-project', needs = '- A2 需人工确认文案') {
-  return `# 自动评审总结\n- 项目：${project}\n- 开发会话：loop-demo\n- 状态：${status}\n- 评审 3 次，返修 2 次\n## 需要你做的事\n${needs}\n## 各轮\n### 第 1 轮（2026-10-20 10:00:00，耗时 120 秒）\n- 无\n`;
+export function loopSummary(status = '完成', project = '/sample/real-project', needs = '- A2 需人工确认文案', at = start) {
+  const date = new Date(at);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const local = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `# 自动评审总结\n- 项目：${project}\n- 开发会话：loop-demo\n- 状态：${status}\n- 评审 3 次，返修 2 次\n## 需要你做的事\n${needs}\n## 各轮\n### 第 1 轮（${local}，耗时 120 秒）\n- 无\n`;
 }

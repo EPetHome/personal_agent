@@ -1,69 +1,126 @@
-import { addIntent, commandSummary, contentText, emptyRecord, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
-import type { SourceComponent } from '../../core/types.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
+import type { JsonObject } from '../../core/utils.ts';
+import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 
-export const codex: SourceComponent = {
-  tool: 'codex', extension: '.jsonl',
-  parse(text, original) {
-    const rows = jsonLines(text);
-    const meta = rows.find(r => r.type === 'session_meta')?.payload;
-    if (!meta) throw new Error('缺少 Codex session_meta（可能格式已变化）');
-    const record = emptyRecord('codex', requiredString(meta.id ?? meta.session_id, '会话 id'), requiredString(meta.cwd, 'cwd'), iso(meta.timestamp ?? rows[0]?.timestamp), original);
-    record.parentSessionId = meta.parent_session_id ?? meta.source?.subagent?.thread_spawn?.parent_thread_id;
+const events = ['user_message', 'task_started', 'agent_message', 'task_complete', 'session_end', 'turn_aborted'];
+const calls = ['function_call', 'custom_tool_call', 'local_shell_call'];
+const outputs = ['function_call_output', 'custom_tool_call_output', 'local_shell_call_output'];
+const items = ['UserMessage', 'AgentMessage', 'CommandExecution', 'FileChange', 'McpToolCall'];
+function completedItem(row: JsonObject): JsonObject | undefined {
+  if (row.type === 'event_msg' && row.payload?.type === 'item_completed') return row.payload.item;
+  if (row.type === 'item_completed') return row.item ?? row.payload?.item ?? row.payload;
+}
+function humanMessage(item: JsonObject, row: JsonObject): string | null {
+  const text = contentText(item.content ?? item.message);
+  return !text.trimStart().startsWith('<') && isHuman(text, row, item) ? text : null;
+}
+
+function identifyRow(row: JsonObject): SessionIdentity | null {
+  const meta = row.type === 'session_meta' ? row.payload : undefined;
+  if (!meta || typeof (meta.id ?? meta.session_id) !== 'string' || !(meta.id ?? meta.session_id).trim()
+    || typeof meta.cwd !== 'string' || !meta.cwd.trim()) return null;
+  const parent = meta.parent_session_id ?? meta.source?.subagent?.thread_spawn?.parent_thread_id;
+  return { sessionId: meta.id ?? meta.session_id, project: meta.cwd,
+    ...(typeof parent === 'string' && parent.trim() ? { parentSessionId: parent } : {}) };
+}
+function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecord | null {
+    const header = findRow(rows, r => r.type === 'session_meta');
+    const meta = header?.payload;
+    if (!header || !identifyRow(header)) return null;
+    const record = emptyRecord('codex', requiredString(meta.id ?? meta.session_id, '会话 id'), requiredString(meta.cwd, 'cwd'), iso(meta.timestamp ?? header.timestamp), original);
+    const parent = meta.parent_session_id ?? meta.source?.subagent?.thread_spawn?.parent_thread_id;
+    if (typeof parent === 'string' && parent) record.parentSessionId = parent;
     const pending = new Map<string, { id: string; at: string; text: string }>();
+    // 两代事件同时出现时只取新版本人消息；response_item user 是重复副本，始终忽略。
+    const hasNewUsers = findRow(rows, row => {
+      const item = completedItem(row);
+      return item?.type === 'UserMessage' && humanMessage(item, row) !== null;
+    }) !== undefined;
     let recognized = 0;
     let lastAgent: { text: string; phase?: string } | undefined;
+    function agentMessage(message: string, phase: string | undefined, at: string) {
+      if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message) });
+      const actualPhase = phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
+      record.assistantFinished = actualPhase !== 'commentary';
+      lastAgent = { text: message, phase: actualPhase };
+    }
     for (const row of rows) {
+      const item = completedItem(row);
+      const p = row.payload;
+      const isItem = item && items.includes(item.type);
+      const isEvent = row.type === 'event_msg' && p && events.includes(p.type);
+      const isResponse = ['response_item', 'item_completed'].includes(row.type) && p
+        && (calls.includes(p.type) || outputs.includes(p.type) || (p.type === 'message' && p.role === 'assistant'));
+      if (!isItem && !isEvent && !isResponse) continue; // 噪音的 payload、时间等字段也不校验。
       const at = iso(row.timestamp);
       record.lastActivityAt = at > record.lastActivityAt ? at : record.lastActivityAt;
-      const p = row.payload;
-      if (row.type === 'session_meta' || row.type === 'turn_context') continue;
-      if (!p || typeof p.type !== 'string') throw new Error('无法识别 Codex 事件结构');
-      if (row.type === 'event_msg') {
-        recognized++;
-        if (p.type === 'user_message') {
-          const userText = contentText(p.message);
-          if (isHuman(userText, row, p)) addIntent(record, userText);
+      recognized++;
+      if (isItem) {
+        if (item.type === 'UserMessage') {
+          const userText = humanMessage(item, row);
+          if (userText !== null) {
+            addIntent(record, userText);
+            record.assistantFinished = false;
+            record.sessionEnded = false;
+          }
+        } else if (item.type === 'AgentMessage') {
+          agentMessage(contentText(item.content ?? item.text), item.phase, at);
+        } else {
+          const name = item.type === 'CommandExecution' ? 'command'
+            : item.type === 'FileChange' ? '文件改动' : `MCP ${item.server ?? ''}/${item.tool ?? ''}`;
+          const args = item.type === 'CommandExecution' ? { command: item.command }
+            : item.type === 'FileChange' ? { path: Object.keys(item.changes ?? {}).slice(0, 3).join('、') } : item.arguments;
+          const step = { at, text: commandSummary(name, args) };
+          addStep(record, step);
           record.assistantFinished = false;
           record.sessionEnded = false;
+          // item_completed 是结束事实；显式 in_progress/running 才保留为待返回。
+          if (['in_progress', 'running', 'started'].includes(item.status)) {
+            const id = requiredString(item.call_id ?? item.id, '工具项 id');
+            pending.set(id, { ...step, id });
+          } else if (typeof (item.call_id ?? item.id) === 'string') pending.delete(item.call_id ?? item.id);
+        }
+      } else if (isEvent) {
+        if (p.type === 'user_message') {
+          if (!hasNewUsers) {
+            const userText = humanMessage(p, row);
+            if (userText !== null) {
+              addIntent(record, userText);
+              record.assistantFinished = false;
+              record.sessionEnded = false;
+            }
+          }
         } else if (p.type === 'task_started') {
           record.assistantFinished = false;
           record.sessionEnded = false;
-        } else if (p.type === 'agent_message') {
-          const message = contentText(p.message);
-          lastAgent = { text: message, phase: p.phase };
-          record.assistantFinished = p.phase !== 'commentary';
-          if (message) record.recentSteps.push({ at, text: message.slice(0, 220) });
-        } else if (p.type === 'task_complete') {
+        } else if (p.type === 'agent_message') agentMessage(contentText(p.message), p.phase, at);
+        else if (p.type === 'task_complete') {
           record.assistantFinished = true;
           pending.clear();
-          if (typeof p.last_agent_message === 'string') record.recentSteps.push({ at, text: p.last_agent_message.slice(0, 220) });
+          if (typeof p.last_agent_message === 'string') addStep(record, { at, text: compact(p.last_agent_message) });
         } else if (p.type === 'session_end') record.sessionEnded = true;
         else if (p.type === 'turn_aborted') {
           record.assistantFinished = false;
           record.sessionEnded = true;
         }
-      } else if (row.type === 'response_item' || row.type === 'item_completed') {
-        recognized++;
-        // user 的 response_item 是 event_msg 的重复副本，不作为第二条意图。
-        if (['function_call', 'custom_tool_call', 'local_shell_call'].includes(p.type)) {
-          const id = requiredString(p.call_id ?? p.id, 'call_id');
-          const step = { id, at, text: commandSummary(p.name ?? 'shell', p.arguments ?? p.input ?? p.action) };
-          pending.set(id, step); // status:completed 只代表调用已生成，必须等 output。
-          record.assistantFinished = false;
-          record.recentSteps.push({ at, text: step.text });
-        } else if (['function_call_output', 'custom_tool_call_output', 'local_shell_call_output'].includes(p.type)) {
-          pending.delete(requiredString(p.call_id ?? p.id, 'call_id'));
-          record.recentSteps.push({ at, text: '工具结果已返回' });
-        } else if (p.type === 'message' && p.role === 'assistant') {
-          const message = contentText(p.content);
-          if (message && lastAgent?.text !== message) record.recentSteps.push({ at, text: message.slice(0, 220) });
-          const phase = p.phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
-          record.assistantFinished = phase !== 'commentary';
-        }
-      } else if (!['compacted'].includes(row.type)) throw new Error(`无法识别 Codex 记录类型：${row.type}`);
+      } else if (calls.includes(p.type)) {
+        const id = requiredString(p.call_id ?? p.id, 'call_id');
+        const step = { id, at, text: commandSummary(p.name ?? 'shell', p.arguments ?? p.input ?? p.action) };
+        pending.set(id, step); // 调用项 status:completed 不等于对应 output 已返回。
+        record.assistantFinished = false;
+        record.sessionEnded = false;
+        addStep(record, { at, text: step.text });
+      } else if (outputs.includes(p.type)) {
+        pending.delete(requiredString(p.call_id ?? p.id, 'call_id'));
+        addStep(record, { at, text: '工具结果已返回' });
+      } else agentMessage(contentText(p.content), p.phase, at);
     }
-    if (!recognized) throw new Error('没有可识别的 Codex 消息');
+    if (!recognized) return null;
     record.pendingTools = [...pending.values()];
     return finishRecord(record);
-  },
+}
+export const codex: SourceComponent = {
+  tool: 'codex', extension: '.jsonl', identifyRow, parseRows,
+  identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
+  parse(text, original) { return parseRows(jsonLines(text), original); },
 };

@@ -35,7 +35,7 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notices_delivered'];
+  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
@@ -45,6 +45,7 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
     if (row.kind === 'push_observed' && !row.push?.sessionId) throw new Error('推送事件结构损坏');
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');
     if (row.kind === 'notice_planned' && !row.notice?.id) throw new Error('发件事件结构损坏');
+    if (row.kind === 'notice_suppressed' && (typeof row.dedupeKey !== 'string' || typeof row.evidenceAt !== 'string')) throw new Error('历史提醒抑制事件结构损坏');
     if (row.kind === 'notices_delivered' && (!Array.isArray(row.ids) || row.ids.some(id => typeof id !== 'string'))) throw new Error('发件确认事件结构损坏');
   }
   return rows;
@@ -62,7 +63,7 @@ export async function writeState(dataDir: string, state: unknown): Promise<void>
   const temporary = join(dataDir, `.state-${randomUUID()}.tmp`);
   const handle = await open(temporary, 'wx', 0o600);
   try {
-    await handle.writeFile(JSON.stringify(state, null, 2) + '\n');
+    await handle.writeFile(JSON.stringify(state) + '\n');
     await handle.sync();
   } finally { await handle.close(); }
   try { await rename(temporary, path); }

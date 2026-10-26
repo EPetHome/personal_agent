@@ -13,6 +13,9 @@ function contains(parent: string, child: string): boolean {
   const diff = relative(parent, child);
   return diff === '' || (diff !== '..' && !diff.startsWith('../') && !isAbsolute(diff));
 }
+export function isIgnoredProject(project: string, config: Config): boolean {
+  return (config.ignoreProjectPrefixes ?? []).some(prefix => contains(prefix, resolve(project)));
+}
 // 即使最终目录还没创建，也解析已有父目录，防止符号链接造成来源/数据重叠。
 async function canonical(path: string, source = false): Promise<string> {
   try { return await realpath(path); }
@@ -29,10 +32,14 @@ export async function validateConfig(value: unknown): Promise<Config> {
   const data = object(value, '配置');
   const sources = object(data.sources, 'sources 配置');
   const commands = object(data.commands, 'commands 配置');
+  if (data.ignoreProjectPrefixes !== undefined && !Array.isArray(data.ignoreProjectPrefixes)) {
+    throw new Error('ignoreProjectPrefixes 必须是绝对目录路径数组');
+  }
   const config: Config = {
     sources: { cc: null, codex: null, pi: null, loop: null },
     inboxDir: data.inboxDir === null ? null : absolute(data.inboxDir, 'inboxDir'),
     dataDir: absolute(data.dataDir, 'dataDir'),
+    ignoreProjectPrefixes: (data.ignoreProjectPrefixes ?? []).map((path: unknown) => absolute(path, 'ignoreProjectPrefixes')),
     commands: {
       cc: requiredString(commands.cc, 'commands.cc'),
       codex: requiredString(commands.codex, 'commands.codex'),

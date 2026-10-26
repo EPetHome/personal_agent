@@ -29,7 +29,7 @@ async function fingerprints(path: string): Promise<Record<string, string>> {
 before(async () => { if (samples) beforeFingerprint = await fingerprints(samples); });
 after(async () => { for (const dir of dirs) await rm(dir, { recursive: true, force: true }); });
 function run(args: string[], cwd?: string) {
-  const result = spawnSync(process.execPath, args, { cwd, encoding: 'utf8' });
+  const result = spawnSync(process.execPath, args, { cwd, encoding: 'utf8', env: { ...process.env, TZ: 'America/New_York' } });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout;
 }

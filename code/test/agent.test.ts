@@ -199,7 +199,7 @@ test('loop 用总结内项目路径，暂停叫你，完成附次数和未完事
   const { root, config } = await fixture(t);
   config.sources.cc = null;
   config.sources.loop = join(root, 'loop');
-  const path = join(config.sources.loop, 'wrong-directory-name', 'run.md');
+  const path = join(config.sources.loop, 'wrong-directory-name', '11111111-1111-4111-8111-111111111111.md');
   await put(path, loopSummary('暂停（开发方需要你决定）'));
   assert.equal((await detect(config, later)).noticesAdded, 1);
   const paused = (await readOutbox(config.dataDir))[0]!;
@@ -334,12 +334,12 @@ test('把文件误配为来源目录不能假装来源为空', async t => {
   assert.match((await readOutbox(config.dataDir))[0]!.text, /不是目录/);
 });
 
-test('loop 总结完全损坏也要报看不见，只有已知总表/说明明确排除', async t => {
+test('loop 合法总结文件完全损坏仍报整体核心不可见，根目录总表不读取', async t => {
   const { root, config } = await fixture(t);
   config.sources.cc = null;
   config.sources.loop = join(root, 'loop');
   await put(join(config.sources.loop, '交付记录.md'), '这是总表，不是某次总结');
-  await put(join(config.sources.loop, 'broken-run.md'), '未知格式');
+  await put(join(config.sources.loop, 'project', '22222222-2222-4222-8222-222222222222.md'), '未知格式');
   assert.equal((await detect(config, later)).noticesAdded, 1);
   assert.match((await readOutbox(config.dataDir))[0]!.text, /loop[\s\S]*无法识别 loop 总结格式/);
 });
