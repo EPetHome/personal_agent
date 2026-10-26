@@ -1,0 +1,12 @@
+{
+  "name": "真机修复-20261026",
+  "branch": "fix/真机修复",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "真机修复": {
+      "prompt": "../../prompt/提示词-真机修复.md",
+      "scope": { "allow": ["code/", "docs/batches/真机修复-20261026/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["真机修复"]]
+}
