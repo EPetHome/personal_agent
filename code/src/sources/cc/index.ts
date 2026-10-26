@@ -51,7 +51,10 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
         pending.set(id, step);
         addStep(record, { at, text: step.text });
       }
-      if (textContent) addStep(record, { at, text: compact(textContent) });
+      if (textContent) {
+        addStep(record, { at, text: compact(textContent) });
+        record.assistantReply = { at, text: compact(textContent, 1200) };
+      }
       record.assistantFinished = message.stop_reason === 'end_turn' && !blocks.some(b => b.type === 'tool_use');
     }
   }

@@ -50,7 +50,7 @@ export function judgeRecords(projection: Projection, now: string): JudgedRecord[
       judged.reason = '部分子会话本轮读不了，保留已知关联；没有全部完成证据，暂不能确认完成';
     } else if (activities.every(a => a.completed)) {
       judged.status = '已完成';
-      judged.reason = activities.length > 1 ? '父会话及子会话均已结束或本轮答完' : activities[0]?.push?.event === 'session_end' || record.sessionEnded ? '会话已结束' : '本轮助手已答完，且没有未返回的工具调用（本批规则判断）';
+      judged.reason = activities.length > 1 ? '父会话及子会话均已结束或本轮答完' : activities[0]?.push?.event === 'session_end' || record.sessionEnded ? '会话已结束' : '本轮助手已答完，且没有未返回的工具调用（规则判断）';
     } else if (Date.parse(now) - Date.parse(judged.lastActivityAt) > THIRTY_MINUTES) {
       judged.status = '停滞';
       judged.reason = '尚未答完，最后一条记录超过 30 分钟，且仍有会话没有结束';
@@ -93,8 +93,9 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     let title = '';
     let summary = '';
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
-    const waitingMember = record.waiting ? membersOf(record).find(member => pushMatchesMember(record.waiting!, member)) : undefined;
-    const last = waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
+    const waitingMember = record.waiting ? membersOf(record).find(member => pushMatchesMember(record.waiting!, member))
+      : record.modelWaiting ? membersOf(record).find(member => member.sessionId === record.modelWaiting!.sessionId) : undefined;
+    const last = (record.modelWaiting ? waitingMember?.assistantReply?.text : undefined) ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
       key = `${kind}:${record.key}:${hash(JSON.stringify(record.loop))}`;
@@ -107,6 +108,16 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
       const scope = child ? `子会话${waitingMember?.project !== record.project ? `（${waitingMember?.project}）` : ''}` : '';
       summary = `${record.project}：${scope}在等你授权 ${last}。${record.waiting.detail}`;
+    } else if (record.status === '在等我' && record.modelWaiting) {
+      kind = 'waiting';
+      key = `model_waiting:${record.key}:${record.modelWaiting.fingerprint}`;
+      title = `${ai} 在等你回复`;
+      summary = `${record.project}：可能在等你回复；${record.modelWaiting.result.reason}。做到哪了：${last}。`;
+    } else if (record.status === '疑似跑偏' && record.drift) {
+      kind = 'drift';
+      key = `drift:${record.key}:${record.drift.fingerprint}`;
+      title = `${ai} 疑似跑偏`;
+      summary = `${record.project}：可能跑偏。意图是「${record.drift.result.intentQuote}」，实际在做「${record.drift.result.stepQuote}」；对不上：${record.drift.result.reason}`;
     } else if (record.status === '停滞') {
       kind = 'stalled';
       key = `stalled:${record.key}`;
@@ -115,15 +126,16 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       summary = `${record.project}：最后在做 ${last}，已经 ${minutes} 分钟没有新记录，按规则判为停滞。`;
     }
     if (!kind) continue;
+    if (kind === 'waiting') summary += ` 意图：${compact(record.intent.initial ?? '原件未提供', 120)}；做到哪了：${compact(last, 160)}；等你做什么：${compact(record.waiting?.detail ?? record.modelWaiting?.result.reason ?? record.reason, 200)}。`;
     const already = projection.notices.some(n => n.dedupeKey === key);
-    const evidenceAt = record.waiting?.at ?? record.lastActivityAt;
+    const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     if (!already && projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK) {
       record.notice = '首次接入历史记录，不补发';
       if (projection.suppressedNotices.get(key) !== evidenceAt) suppressed?.push({ kind: 'notice_suppressed', dedupeKey: key, evidenceAt });
       continue;
     }
     const content: NoticeContent = {
-      title, summary, returnCommand: returnCommand(record, config, record.waiting?.sessionId),
+      title, summary, returnCommand: returnCommand(record, config, record.waiting?.sessionId ?? record.modelWaiting?.sessionId),
       evidence: {
         project: record.project, intentOriginal: record.intent.initial,
         additionalRequirements: record.intent.additions, recentSteps: waitingMember?.recentSteps ?? record.recentSteps,
@@ -132,6 +144,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       },
     };
     const notice = createNotice(record.tool, kind, key, now, content, record.key);
+    if (record.modelWaiting) notice.memberSessionId = record.modelWaiting.sessionId;
     record.notice = projection.deliveredNoticeIds.has(notice.id) ? '已提醒，本轮去重' : '待写发件记录';
     if (!already) candidates.push(notice);
   }
@@ -161,12 +174,18 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   const lines = ['工具 | 项目 | 意图 | 状态 | 最后活动时间 | 提醒'];
   for (const record of records) {
     const intent = [record.intent.initial ?? '总结未提供开工指令', ...record.intent.additions].join('；');
-    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, record.notice ?? '—'].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
+    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, [record.notice ?? '—', ...new Set(record.modelNotes ?? [])].join('；')].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
   }
   if (!records.length) lines.push('暂无会话');
   for (const health of projection.health.values()) {
     if (health.since) lines.push(`盯防异常：${toolNames[health.source]}，从 ${health.since} 起看不见；${projection.notices.some(n => n.kind === 'blind' && n.dedupeKey === `blind:${health.source}:${health.episodeId}` && projection.deliveredNoticeIds.has(n.id)) ? '已提醒，本轮去重' : '待写发件记录'}`);
     else if (health.fileFailures?.count) lines.push(`${toolNames[health.source]} 有 ${health.fileFailures.count} 份会话读不了，其余会话照常显示。`);
   }
+  const day = projection.lastScanAt?.slice(0, 10);
+  if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);
+  const failed = projection.notices.filter(n => projection.channelDeliveries.get(`local:${n.id}`) === false).length;
+  if (failed) lines.push(`本机通知尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
+  const feishuFailed = projection.notices.filter(n => projection.channelDeliveries.get(`feishu:${n.id}`) === false).length;
+  if (feishuFailed) lines.push(`飞书尚未成功：${feishuFailed} 条；已写发件记录，下轮检测重试。`);
   return lines.join('\n');
 }
