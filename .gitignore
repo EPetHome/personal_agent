@@ -8,3 +8,5 @@ logs/
 .pi/
 .DS_Store
 文档/
+# 本机权限设置
+.claude/settings.local.json
