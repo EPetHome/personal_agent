@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
@@ -31,7 +31,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
     const textContent = contentText(message.content);
     if (row.type === 'user') {
       const human = isHuman(textContent, row, message) && (row.origin?.kind === 'human'
-        || (row.origin === undefined && !textContent.trimStart().startsWith('<')));
+        || (row.origin === undefined && !intentText(textContent).trimStart().startsWith('<')));
       if (human) {
         addIntent(record, textContent);
         record.assistantFinished = false;

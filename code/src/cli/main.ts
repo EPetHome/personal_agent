@@ -13,7 +13,7 @@ import { errorMessage, iso } from '../core/utils.ts';
 
 const help = `personal agent（只读盯防、可选模型与渠道）
 用法：node code/src/cli/main.ts <detect|overview|rebuild|stats|feishu-poll|daemon> --config <绝对路径.json> [--now <ISO时间>] [--json]
-      node code/src/cli/main.ts feedback <正确|误报|漏了> [说明] --config <配置> [--id <提醒编号>|--unlinked] [--now <ISO时间>]
+      node code/src/cli/main.ts feedback <正确|误报|漏了|看不懂> [说明] --config <配置> [--id <提醒编号>|--unlinked] [--now <ISO时间>]
       node code/src/cli/main.ts evaluate --samples <样本目录> --config <配置> [--json]
       node code/src/cli/main.ts experience <list|export|confirm|revise|obsolete|revoke> [经验编号] --config <配置> [--countermeasure <对策>] [--layer <归因层>] [--reason <依据>] [--note <说明>] [--json]
       node code/src/cli/main.ts service-install --target <绝对目标目录> --config <绝对配置> [--activate] [--launchctl <可执行文件>]

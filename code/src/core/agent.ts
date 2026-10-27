@@ -7,6 +7,7 @@ import { applyModelChecks, checkModels } from './model-checks.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
 import { event, project, pushIdentity } from './events.ts';
 import { skipAnomaly } from './health.ts';
+import { feedbackSuppressions, isFeedbackSuppressed, readFeedback } from './feedback.ts';
 import { judgeRecords, planNotices } from './judge.ts';
 import { normalize } from './normalize.ts';
 import { perceive } from './perception.ts';
@@ -50,9 +51,19 @@ function activeProjection(projection: Projection, config: Config): Projection {
       && (!notice.content.evidence.project || !isIgnoredProject(notice.content.evidence.project, config))),
   };
 }
-function snapshot(events: AgentEvent[], config: Config, now?: string): Snapshot {
-  const projection = activeProjection(project(events), config);
-  const at = iso(now ?? projection.lastScanAt ?? new Date().toISOString());
+async function feedbackProjection(projection: Projection, config: Config, at: string): Promise<Projection> {
+  // 发件包含旧版未带新字段的记录；事件投影有追溯到的成员/事实身份，优先使用后者。
+  const notices = new Map((await readOutbox(config.dataDir)).map(n => [n.id, n]));
+  for (const notice of projection.notices) notices.set(notice.id, notice);
+  const rows = await readFeedback(config.dataDir);
+  // 检测的 now 是开轮时刻；开轮后收到的反馈也必须马上生效，不等下一轮。
+  const boundary = rows.reduce((last, row) => row.at > last ? row.at : last, at);
+  return { ...projection, feedbackSuppressions: feedbackSuppressions(rows, [...notices.values()], boundary) };
+}
+async function snapshot(events: AgentEvent[], config: Config, now?: string): Promise<Snapshot> {
+  const raw = project(events);
+  const at = iso(now ?? raw.lastScanAt ?? new Date().toISOString());
+  const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
   planNotices(records, projection, config, at);
@@ -65,9 +76,10 @@ function serializedState(view: Snapshot) {
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
 async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>) {
   const previous = project(events);
-  const projection = activeProjection(project([...events, ...added]), config);
-  // 模型等待期间可能已有另一轮感知，不能用旧时间/旧会话覆盖新事实。
-  const at = projection.lastScanAt && projection.lastScanAt > now ? projection.lastScanAt : now;
+  const raw = project([...events, ...added]);
+  // 模型等待期间可能已有另一轮感知/反馈，不能用旧时间/旧会话覆盖新事实。
+  const at = raw.lastScanAt && raw.lastScanAt > now ? raw.lastScanAt : now;
+  const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const add = (payload: EventPayload) => { added.push(event(payload, at)); };
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
@@ -77,7 +89,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   for (const notice of planned) add({ kind: 'notice_planned', notice });
   const queued = activeProjection(project([...events, ...added]), config);
   for (const channel of channels) for (const notice of queued.notices) {
-    if (!accepts(channel, notice)) continue;
+    if (!accepts(channel, notice) || isFeedbackSuppressed(notice, projection.feedbackSuppressions)) continue;
     const key = `${channel.name}:${notice.id}`;
     if (!queued.channelDeliveries.has(key) && !previous.deliveredNoticeIds.has(notice.id)) add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok: false });
   }
@@ -87,26 +99,38 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
     written = added.length;
   };
   await flush();
-  const complete = activeProjection(project([...events, ...added]), config);
-  const known = new Set((await readOutbox(config.dataDir)).map(n => n.id));
+  const completeRaw = project([...events, ...added]);
+  const complete = activeProjection(await feedbackProjection(completeRaw, config, at), config);
+  const deliverable = complete.notices.filter(n => !isFeedbackSuppressed(n, complete.feedbackSuppressions));
+  const outbox = await readOutbox(config.dataDir), lookup = new Map(outbox.map(n => [n.id, n]));
+  for (const notice of completeRaw.notices) lookup.set(notice.id, notice);
+  const suppressionNotices = [...lookup.values()];
+  // 外部发送可能很慢，每笔真实投递前短读反馈；不为已交付历史逐条重放事件/读写日志。
+  const canDeliver = async (notice: Notice) => {
+    const rows = await readFeedback(config.dataDir), boundary = rows.reduce((last, row) => row.at > last ? row.at : last, at);
+    return !isFeedbackSuppressed(notice, feedbackSuppressions(rows, suppressionNotices, boundary));
+  };
+  const known = new Set(outbox.map(n => n.id));
   const file = fileChannel(config.dataDir);
   let noticesAdded = 0;
-  for (const notice of complete.notices) {
+  for (const notice of deliverable) {
+    if (known.has(notice.id) || !await canDeliver(notice)) continue;
     await file.send(notice);
     if (!known.has(notice.id)) { noticesAdded++; known.add(notice.id); }
   }
-  for (const channel of channels) for (const notice of complete.notices) {
+  for (const channel of channels) for (const notice of deliverable) {
     const key = `${channel.name}:${notice.id}`;
     if (!accepts(channel, notice) || complete.channelDeliveries.get(key) !== false || attempted.has(key)) continue;
+    if (!await canDeliver(notice)) continue;
     attempted.add(key);
     let ok = true;
     try { await channel.send(notice); } catch { ok = false; }
     add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok });
     await flush();
   }
-  const unconfirmed = complete.notices.filter(notice => !complete.deliveredNoticeIds.has(notice.id)).map(notice => notice.id);
+  const unconfirmed = deliverable.filter(notice => known.has(notice.id) && !complete.deliveredNoticeIds.has(notice.id)).map(notice => notice.id);
   if (unconfirmed.length) { add({ kind: 'notices_delivered', ids: unconfirmed }); await flush(); }
-  const view = snapshot([...events, ...added], config, at);
+  const view = await snapshot([...events, ...added], config, at);
   await writeState(config.dataDir, serializedState(view));
   return { ...view, noticesAdded };
 }
@@ -234,7 +258,7 @@ export async function overview(configInput: Config, now?: string): Promise<Snaps
 export async function rebuild(configInput: Config, now?: string): Promise<Snapshot> {
   const config = await validateConfig(configInput);
   return withStoreLock(config.dataDir, async () => {
-    const view = snapshot(await readEvents(config.dataDir), config, now);
+    const view = await snapshot(await readEvents(config.dataDir), config, now);
     await writeState(config.dataDir, serializedState(view));
     return view;
   });

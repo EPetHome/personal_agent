@@ -56,6 +56,9 @@ export interface JudgmentResult {
   reason: string;
   intentQuote?: string;
   stepQuote?: string;
+  /** 与本次判断同一次调用顺带起草；缺失/不可用时规则兜底。 */
+  situation?: string;
+  action?: string;
   confidence?: '高' | '中' | '低';
 }
 export interface Judge {
@@ -170,9 +173,10 @@ export interface JudgedRecord extends SessionRecord {
   reason: string;
   waiting?: PushRecord;
   modelWaiting?: ModelFinding;
+  ruleWaiting?: { sessionId: string; evidenceAt: string; reply: string };
   drift?: ModelFinding;
   modelNotes?: string[];
-  notice?: '待写发件记录' | '已提醒，本轮去重' | '首次接入历史记录，不补发';
+  notice?: '待写发件记录' | '已提醒，本轮去重' | '首次接入历史记录，不补发' | '因你的误报没提醒';
 }
 export interface HealthState extends HealthReport {
   since: string | null;
@@ -184,6 +188,8 @@ export interface HealthState extends HealthReport {
 export interface NoticeContent {
   title: string;
   summary: string;
+  situation?: string;
+  action?: string;
   returnCommand: string;
   evidence: {
     project: string | null;
@@ -194,6 +200,8 @@ export interface NoticeContent {
     originals: Original[];
     needs?: string[];
     needsProvided?: boolean;
+    assistantReply?: string;
+    presentation?: { situation: string; action: string };
   };
 }
 export interface Notice {
@@ -206,6 +214,10 @@ export interface Notice {
   level: '现在就要你' | '有空看';
   sessionKey?: string;
   memberSessionId?: string;
+  /** 事实发生时间，独立于提醒生成时间与展示文字；旧日志可由模型判断追溯。 */
+  evidenceAt?: string;
+  /** 健康提醒能定位会话时的反馈作用域；未知会话不得压住整个来源。 */
+  feedbackScope?: string;
   content: NoticeContent;
   text: string;
   reviews?: ReviewItem[];
@@ -252,6 +264,10 @@ export interface Projection {
   startedAt: string | null;
   suppressedNotices: Map<string, string>;
   modelChecks: Map<string, ModelCheck>;
+  /** 所有历史证据的判断索引；由旧/新事件重建，不改写日志。 */
+  modelEvidence: Map<string, ModelCheck>;
+  /** 从只追加反馈现算，非事件事实，也不持久化为跨会话规则。 */
+  feedbackSuppressions: Set<string>;
   modelCalls: Map<string, number>;
   channelDeliveries: Map<string, boolean>;
 }
@@ -269,9 +285,11 @@ export interface Feedback {
   date: string;
   channel: string;
   noticeId: string | null;
-  verdict: '正确' | '误报' | '漏了';
+  verdict: '正确' | '误报' | '漏了' | '看不懂';
   comment: string;
   replyId?: string;
+  originalText?: string;
+  card?: { title: string; firstScreen: string; returnCommand: string; at?: string };
 }
 /** 渠道只发给用户本人，不替用户回复来源工具。编号只在结构化参数内。 */
 export interface Channel {
@@ -279,5 +297,5 @@ export interface Channel {
   /** 省略时兼容段 1：只投「现在就要你」。 */
   levels?: readonly Notice['level'][];
   send(notice: Notice): Promise<void>;
-  receive(reply: ChannelReply): Promise<'已记下'>;
+  receive(reply: ChannelReply): Promise<string>;
 }

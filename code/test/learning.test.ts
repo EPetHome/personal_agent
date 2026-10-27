@@ -122,7 +122,7 @@ test('四种来源收集、四层/未定起草、同类规则不确定才问模�
   let calls = 0;
   const uncertain: ExperienceModel = { async draft() { return { layer: '归因未定', reason: '构造证据不足', countermeasure: '人工核对' }; }, async same() { calls++; return true; } };
   await detect(config, '2026-10-20T10:02:00Z', { experienceModel: uncertain });
-  let state = await readLearning(config.dataDir); assert.deepEqual(new Set(state.problems.map(p => p.type)), new Set(['正确:waiting', '误报', '漏了', 'loop返修']));
+  let state = await readLearning(config.dataDir); assert.deepEqual(new Set(state.problems.map(p => p.type)), new Set(['误报', '漏了', 'loop返修']));
   await receiveFeedback(config.dataDir, 'test', { noticeId: null, content: '漏了 loop 另一个暂停', at: '2026-10-21T10:01:00Z' });
   await detect(config, '2026-10-21T10:02:00Z', { experienceModel: uncertain }); assert.equal(calls, 1);
   state = await readLearning(config.dataDir); assert.equal(state.problems.filter(p => p.type === 'loop返修').length, 1);
@@ -273,11 +273,11 @@ test('经验模型实际子进程边界用Pi替身：只读小上下文、严格
   assert.equal([...((await readLearning(config.dataDir)).experiences.keys())].length, 1);
 });
 
-test('同一提醒重复正确反馈不算再次出现；只补反馈后经验不篡改原始事实', async t => {
+test('同一提醒重复误报反馈不算再次出现；只补反馈后经验不篡改原始事实', async t => {
   const { config } = await fixture(t);
   await withStoreLock(config.dataDir, async () => appendJsonl(join(config.dataDir, 'outbox.jsonl'), [notice('same-occurrence', '2026-10-20T10:00:00.000Z')]));
   for (const at of ['2026-10-20T10:01:00Z', '2026-10-21T10:01:00Z']) {
-    await receiveFeedback(config.dataDir, 'test', { noticeId: 'same-occurrence', content: '正确', at }); await detect(config, at, { experienceModel: model });
+    await receiveFeedback(config.dataDir, 'test', { noticeId: 'same-occurrence', content: '误报', at }); await detect(config, at, { experienceModel: model });
   }
   assert.equal((await readLearning(config.dataDir)).problems.length, 1); assert.ok(!(await readOutbox(config.dataDir)).some(n => n.kind === 'recurrence'));
   const before = await readFile(join(config.dataDir, 'feedback.jsonl'), 'utf8');

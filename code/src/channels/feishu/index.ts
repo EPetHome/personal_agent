@@ -155,8 +155,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       if (!mapped?.noticeId) throw new IncomingFailure('notice_not_found', '找不到这张卡片对应的提醒，请打开最新卡片再试。');
       const notice = (await readOutbox(dir)).find(n => n.id === mapped.noticeId);
       if (!notice) throw new IncomingFailure('notice_not_found', '这条提醒已无法找到，请打开最新卡片再试。');
-      if (value.action === 'feedback' && value.noticeId === notice.id && ['正确', '误报'].includes(value.verdict ?? '') && !['weekly', 'recurrence', 'service_restart'].includes(notice.kind)) {
-        await receiveFeedback(dir, 'feishu', { noticeId: notice.id, content: value.verdict!, at: input.at, replyId: input.id });
+      if (value.action === 'feedback' && value.noticeId === notice.id && ['正确', '误报', '看不懂'].includes(value.verdict ?? '') && (value.verdict === '看不懂' || !['weekly', 'recurrence', 'service_restart'].includes(notice.kind))) {
+        response = await receiveFeedback(dir, 'feishu', { noticeId: notice.id, content: value.verdict!, at: input.at, replyId: input.id });
       } else if (['agree', 'revise'].includes(value.action ?? '')) {
         const review = notice.reviews?.find(item => item.experienceId === value.experienceId);
         if (!review) throw new IncomingFailure('experience_not_found', '这张卡片没有对应的经验，请打开最新复盘再试。');
@@ -169,11 +169,11 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
         }
       } else throw new IncomingFailure('invalid_action', '按钮与这张卡片不匹配，请打开最新卡片再试。');
     } else {
-      if (!/^(正确|误报|漏了)(?:\s|$)/.test(input.text ?? '')) response = '请引用提醒回复「正确 / 误报」，或直接发「漏了 + 一句话」。';
-      else if (input.text!.startsWith('漏了') && !input.ref) await receiveFeedback(dir, 'feishu', { noticeId: null, content: input.text!, at: input.at, replyId: input.id });
+      if (!/^(正确|误报|漏了|看不懂)(?:\s|$)/.test(input.text ?? '')) response = '请引用卡片回复「正确 / 误报 / 看不懂 + 一句话」，或直接发「漏了 + 一句话」。';
+      else if (input.text!.startsWith('漏了') && !input.ref) response = await receiveFeedback(dir, 'feishu', { noticeId: null, content: input.text!, at: input.at, replyId: input.id });
       else if (!mapped?.noticeId) response = '没有找到被引用的提醒，请引用机器人发出的提醒再回复。';
-      else if (['weekly', 'recurrence', 'service_restart'].includes((await readOutbox(dir)).find(n => n.id === mapped.noticeId)?.kind ?? '')) response = '这条不是盯防提醒，请使用卡片按钮或本机 experience 命令。';
-      else await receiveFeedback(dir, 'feishu', { noticeId: mapped.noticeId, content: input.text!, at: input.at, replyId: input.id });
+      else if (!input.text!.startsWith('看不懂') && ['weekly', 'recurrence', 'service_restart'].includes((await readOutbox(dir)).find(n => n.id === mapped.noticeId)?.kind ?? '')) response = '这条不是盯防提醒，请使用「看不懂」按钮或本机 experience 命令。';
+      else response = await receiveFeedback(dir, 'feishu', { noticeId: mapped.noticeId, content: input.text!, at: input.at, replyId: input.id });
     }
     return response;
   }
@@ -189,7 +189,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       // 2.5 秒内不能持久化就拒绝处理器，让 SDK/平台重投，不能先成功确认再丢反馈。
       const saved = ingress.catch(() => {}).then(() => withNamedLock(dir, '.feishu-inbound.lock', async () => {
         await readJsonl(inbox); await appendJsonl(inbox, [input]);
-      }));
+      }, 2000));
       ingress = saved;
       let timer: NodeJS.Timeout | undefined;
       try { await Promise.race([saved, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('入站暂未持久化，请重试')), 2500); })]); }
@@ -198,10 +198,13 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       return {};
     },
     drain(now) {
+      // detect.finish 在数据锁释放后也调用收件；利用这个空档独立重试，
+      // 避免固定整秒重试与连续检测同相而长期抢不到锁。这里只唤醒，不等待写入。
+      if (!stopped && desiredConnection && JSON.stringify(desiredConnection) !== connectionSignature) void flushConnection();
       if (draining) return draining;
       draining = withNamedLock(dir, '.feishu-receive.lock', async () => {
         // 不等待连接状态写入；即使它仍待重试，收件也独立工作。
-        const inputs = await withNamedLock(dir, '.feishu-inbound.lock', () => readJsonl<unknown>(inbox));
+        const inputs = await withNamedLock(dir, '.feishu-inbound.lock', () => readJsonl<unknown>(inbox), 2000);
         const receiptsPath = join(dir, 'feishu-receipts.jsonl');
         const receipts = new Map<string, Receipt>();
         for (const row of await readJsonl<Receipt>(receiptsPath)) receipts.set(row.id, { ...receipts.get(row.id), ...row });

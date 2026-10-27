@@ -73,7 +73,7 @@ test('反馈 A1/A2：常驻检测实际持数据锁35秒，按钮、飞书文字
     await channel.capture(text('text-during-lock'));
     const configPath = join(f.root, 'config.json'); await put(configPath, JSON.stringify(f.config));
     const cli = await exec(process.execPath, [join(import.meta.dirname, '../src/cli/main.ts'), 'feedback', '误报', '--id', newNotice.id, '--config', configPath], { timeout: 5000, env: { ...process.env, HOME: f.root } });
-    assert.equal(cli.stdout.trim(), '已记下'); assert.equal(cli.stderr, '');
+    assert.match(cli.stdout.trim(), /^已记下：这个会话之后不会再/); assert.equal(cli.stderr, '');
     await waitFor(async () => (await f.sent()).filter(m => m.type === 'text').length === 2);
     const rows = await readFeedback(f.config.dataDir);
     assert.equal(rows.length, 3);
@@ -133,7 +133,7 @@ test('反馈读取和提醒核对都只看完整追加，真正的坏行仍保�
   const receiving = receiveFeedback(f.config.dataDir, 'test', { content: '误报', at, noticeId: notice.id }).then(result => { received = true; return result; });
   try { await delay(80); assert.equal(received, false); await appendFile(outbox, noticeText.slice(40)); }
   finally { await releaseOutbox(); }
-  assert.equal(await receiving, '已记下');
+  assert.match(await receiving, /^已记下：这个会话之后不会再/);
   assert.equal((await readFeedback(f.config.dataDir)).at(-1)!.noticeId, notice.id);
   await appendFile(path, '{"broken":'); const before = await readFile(path, 'utf8');
   await assert.rejects(receiveFeedback(f.config.dataDir, 'test', { content: '漏了', at }), /损坏|未完整提交/);

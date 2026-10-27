@@ -12,7 +12,7 @@ export function localDate(value: Date | string): string {
 }
 export function weekStart(now: string): string { const date = new Date(now); date.setDate(date.getDate() - 7); return date.toISOString(); }
 export interface StatisticCell {
-  tool: string; kind: string; sent: number; correct: number; falsePositive: number; missed: number; responded: number;
+  tool: string; kind: string; sent: number; correct: number; falsePositive: number; missed: number; unreadable: number; responded: number;
   accuracy: number | null; responseRate: number | null; perDay: number; daily: Record<string, number>; sufficient: boolean;
 }
 export interface Statistics { from: string; to: string; cells: StatisticCell[] }
@@ -33,13 +33,17 @@ export function calculateStatistics(notices: Notice[], feedback: Feedback[], now
   const days = Math.max(1, (Date.UTC(endDate.getFullYear(), endDate.getMonth(), endDate.getDate()) - Date.UTC(startDate.getFullYear(), startDate.getMonth(), startDate.getDate())) / 86400000);
   function get(tool: string, kind: string) {
     const key = `${tool}:${kind}`;
-    if (!cells.has(key)) cells.set(key, { tool, kind, sent: 0, correct: 0, falsePositive: 0, missed: 0, responded: 0, accuracy: null, responseRate: null, perDay: 0, daily: {}, sufficient: false });
+    if (!cells.has(key)) cells.set(key, { tool, kind, sent: 0, correct: 0, falsePositive: 0, missed: 0, unreadable: 0, responded: 0, accuracy: null, responseRate: null, perDay: 0, daily: {}, sufficient: false });
     return cells.get(key)!;
   }
   const inPeriod = (at: string) => Date.parse(at) >= Date.parse(from) && Date.parse(at) <= Date.parse(now);
   const latest = new Map<string, Feedback>();
   for (const row of feedback.filter(f => Date.parse(f.at) <= Date.parse(now)).sort((a, b) => Date.parse(a.at) - Date.parse(b.at))) {
-    if (row.noticeId && row.verdict !== '漏了') latest.set(row.noticeId, row);
+    if (row.noticeId && (row.verdict === '正确' || row.verdict === '误报')) latest.set(row.noticeId, row);
+    if (row.verdict === '看不懂' && inPeriod(row.at) && row.noticeId && lookup.has(row.noticeId)) {
+      const category = feedbackCategory(row, row.noticeId ? lookup.get(row.noticeId) : undefined);
+      get(category.tool, category.kind).unreadable++;
+    }
     if (row.verdict === '漏了' && inPeriod(row.at)) {
       const category = feedbackCategory(row, row.noticeId ? lookup.get(row.noticeId) : undefined);
       get(category.tool, category.kind).missed++;
@@ -51,7 +55,7 @@ export function calculateStatistics(notices: Notice[], feedback: Feedback[], now
     const date = localDate(notice.at); cell.daily[date] = (cell.daily[date] ?? 0) + 1;
     const response = latest.get(notice.id);
     if (response) { cell.responded++; if (response.verdict === '正确') cell.correct++; else cell.falsePositive++; }
-    else if (feedback.some(f => f.noticeId === notice.id && Date.parse(f.at) <= Date.parse(now) && f.verdict === '漏了')) cell.responded++;
+    else if (feedback.some(f => f.noticeId === notice.id && Date.parse(f.at) <= Date.parse(now))) cell.responded++;
   }
   for (const cell of cells.values()) {
     const classified = cell.correct + cell.falsePositive;
@@ -66,5 +70,5 @@ export async function statistics(dataDir: string, now = new Date().toISOString()
 }
 export function renderStatistics(stats: Statistics): string {
   const percent = (n: number | null) => n === null ? '—' : `${(n * 100).toFixed(1)}%`;
-  return [`反馈统计（${localTime(stats.from, stats.to)} ～ ${localTime(stats.to, stats.to)}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈'])].join('\n');
+  return [`反馈统计（${localTime(stats.from, stats.to)} ～ ${localTime(stats.to, stats.to)}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 看不懂 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${c.unreadable} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈'])].join('\n');
 }

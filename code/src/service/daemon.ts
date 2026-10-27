@@ -47,10 +47,10 @@ export async function runService(configInput: Config, signal: AbortSignal, compo
     const alerted = history.some(e => e.kind === 'alerted' && Date.parse(e.at) >= windowStart);
     if (crashes.length >= (config.service?.restartThreshold ?? 3) && !alerted) {
       const notice = agentNotice('service_restart', `restarts:${crashes[0]!.runId}`, at, 'personal agent 短时间内反复重启',
-        firstScreen('personal agent，负责替你盯住 AI 的值班程序', `短时间内 ${crashes.length} 次异常退出后重新启动，盯防可能不连续。`, '请检查本机值班程序是否稳定；不会替你停止或启动任何 AI。'),
+        firstScreen(`盯住 AI 的值班程序短时间内 ${crashes.length} 次异常退出后重启，盯防可能不连续`, '请检查本机值班程序是否稳定；不会替你停止或启动任何 AI'),
         'node code/src/cli/main.ts overview --config <你运行时使用的配置文件>');
       notice.content.evidence.reason = `异常重启记录：${runsPath}；运行日志：${logPath}`;
-      notice.text = renderNotice(notice.content);
+      notice.text = renderNotice(notice.content, at);
       await publishNotices(config, [notice], at, channels);
       await appendJsonl(runsPath, [{ kind: 'alerted', at, runId } satisfies RunEvent]);
     }

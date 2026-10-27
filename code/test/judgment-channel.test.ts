@@ -59,7 +59,8 @@ test('A6 可核对的意图与新步骤才发可能跑偏；10分钟、新动静
   assert.equal(first.records[0]?.status, '疑似跑偏');
   const notice = (await readOutbox(config.dataDir))[0]!;
   assert.equal(notice.kind, 'drift'); assert.equal(notice.level, '现在就要你');
-  assert.match(notice.content.summary, /可能.*意图.*只改 A 文件.*实际.*B 模块.*对不上/);
+  assert.match(notice.content.summary, /这件事：只改 A 文件.*实际.*B 模块.*可能偏离/);
+  assert.match(notice.content.evidence.reason, /只改 A 文件.*修改不相关的 B 模块/);
   await detect(config, '2026-10-20T10:02:00Z', { judge });
   assert.equal(calls.length, 1);
   await appendFile(transcript, JSON.stringify(ccCall('2026-10-20T10:05:00Z', 'b2', '修改不相关的 B 模块的测试')) + '\n');
@@ -101,7 +102,7 @@ test('A8 助手答完的问句模型是→等待，否→完成；新用户要�
     assert.equal(view.records[0]?.status, waiting ? '在等我' : '已完成');
     const notices = await readOutbox(config.dataDir);
     assert.equal(notices.length, waiting ? 1 : 0);
-    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary.split('\n')[2], '要不要你管：使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
+    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary.split('\n')[2], '要你做：使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
     await detect(config, '2026-10-20T10:02:00Z', { judge }); assert.equal(calls.length, 2);
     await appendFile(transcript, JSON.stringify(ccUser('选 A，继续', '2026-10-20T10:03:00Z')) + '\n');
     assert.equal((await detect(config, '2026-10-20T10:04:00Z', { judge })).records[0]?.status, '进行中');
@@ -170,14 +171,14 @@ test('本机通知失败不丢发件，明示失败，下轮重试，成功后�
   assert.equal(await readFile(log, 'utf8'), 'called\n');
 });
 
-test('A9 反馈 CLI 默认最近提醒，日期与编号落盘，人类输出只有已记下；漏了可无提醒', async t => {
+test('A9 反馈 CLI 默认最近提醒，日期与编号落盘，回话写明误报的效果；漏了可无提醒', async t => {
   const { root, config, transcript } = await fixture(t);
   config.judge = null;
   await put(transcript, [ccUser(), ccCall()]); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
   await detect(config, '2026-10-20T10:01:00Z');
   const path = join(root, 'config.json'); await put(path, JSON.stringify(config));
   const cli = spawnSync(process.execPath, [resolve(import.meta.dirname, '../src/cli/main.ts'), 'feedback', '误报', '我不需要处理', '--config', path, '--now', '2026-10-20T10:02:00Z'], { encoding: 'utf8' });
-  assert.equal(cli.status, 0, cli.stderr); assert.equal(cli.stdout.trim(), '已记下');
+  assert.equal(cli.status, 0, cli.stderr); assert.match(cli.stdout.trim(), /^已记下：这个会话之后不会再因为等你回复或授权叫你/);
   const row = (await readJsonl<Feedback>(join(config.dataDir, 'feedback.jsonl')))[0]!;
   assert.equal(row.date, '2026-10-20'); assert.equal(row.verdict, '误报'); assert.equal(row.comment, '我不需要处理');
   assert.equal(row.noticeId, (await readOutbox(config.dataDir))[0]!.id);

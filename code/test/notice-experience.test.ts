@@ -5,7 +5,7 @@ import { chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { detect, rebuild } from '../src/core/agent.ts';
 import { readLearning } from '../src/core/learning.ts';
-import { localTime } from '../src/core/notice-text.ts';
+import { localNoticeText, localTime } from '../src/core/notice-text.ts';
 import { readJsonl, readOutbox } from '../src/core/store.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { ccAnswer, ccUser, codexEvent, codexMeta, loopSummary, put, sandbox } from './fixtures.ts';
@@ -26,7 +26,7 @@ function front(value: unknown): string {
 }
 function assertLayout(body: string) {
   let previous = -1;
-  for (const label of ['谁：', '出了什么事：', '要不要你管：', '回去看：']) {
+  for (const label of ['**这件事**：', '**要你做**：', '**时间 / 回去看**：']) {
     const index = body.indexOf(label); assert.ok(index > previous, label); previous = index;
   }
   assert.doesNotMatch(body, /\d{4}-\d\d-\d\dT|transcript|推送|对账|来源|第\s*\d+\s*行|learning\.jsonl|feishu-.*\.jsonl/);
@@ -50,13 +50,14 @@ test('飞书 A4：Claude Code 等回复卡片四件事，shop/意图/原问题/�
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
   assert.match(notice.content.title, /shop 的 Claude Code.*在等你/);
   const body = front(await sent(f.config.dataDir, notice.id)); assertLayout(body);
-  assert.match(body, /谁：shop 的 Claude Code：给商品列表加缓存/);
-  assert.match(body, /要不要你管：请你选择缓存保留五分钟还是十分钟？/);
+  assert.match(body, /shop 的 Claude Code/);
+  assert.match(body, /\*\*这件事\*\*：给商品列表加缓存/);
+  assert.match(body, /\*\*要你做\*\*：请你选择缓存保留五分钟还是十分钟？/);
   assert.match(body, /claude --resume demo-cc/);
   assert.ok(!body.includes(f.config.dataDir)); assert.doesNotMatch(body, /SYNTHETIC_REASON/);
   const local = (await readJsonl<string[]>(calls))[0]!;
   assert.equal(local.at(-2), notice.content.title);
-  assert.equal(local.at(-1), `${notice.content.summary}\n回去看：${notice.content.returnCommand}`);
+  assert.equal(local.at(-1), localNoticeText(notice));
 });
 
 test('飞书 A5：单个Codex报信核对失败写清项目/会话/影响，只给该会话的恢复命令', async t => {
@@ -69,8 +70,9 @@ test('飞书 A5：单个Codex报信核对失败写清项目/会话/影响，只�
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'blind')!;
   assert.match(notice.content.title, /shop 的 Codex/);
   const body = front(await sent(f.config.dataDir, notice.id)); assertLayout(body);
-  assert.match(body, /谁：shop 的 Codex：检查商品缓存/);
-  assert.match(body, /这个会话.*Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/); assert.match(body, /要不要你管：请回去看看/);
+  assert.match(body, /shop 的 Codex/); assert.match(body, /\*\*这件事\*\*：检查商品缓存/);
+  assert.match(body, /这个会话.*核对/); assert.match(body, /\*\*要你做\*\*：请回去看看/);
+  assert.match(notice.content.evidence.reason, /Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/);
   assert.match(notice.content.returnCommand, /resume synthetic-codex-session$/);
   assert.ok(!notice.content.returnCommand.includes(f.config.sources.codex)); assert.ok(!body.includes(f.config.dataDir));
   assert.match(notice.content.evidence.reason, /第 1 行推送与已读取会话对不上/);
@@ -97,9 +99,9 @@ test('飞书 A6：首次五份历史返修只计数，新一批推一张复盘�
   const review = reviews[0]!; assert.equal(review.reviews![0]!.count, 6);
   assert.match(review.content.title, /shop 的 loop.*商品缓存第6批.*返修 2 次/);
   const body = front(await sent(f.config.dataDir, review.id)); assertLayout(body);
-  assert.match(body, /谁：shop 的 loop，商品缓存第6批，已评审 3 轮/);
-  assert.match(body, /返修 2 次/); assert.match(body, /为什么算同类：同种工具出现同样的问题事实/);
-  assert.match(body, /只会将这条经验记为已确认/);
+  assert.match(body, /\*\*这件事\*\*：shop 的 loop · 商品缓存第6批/);
+  assert.match(body, /返修 2 次/); assert.match(review.content.evidence.reason, /为什么算同类：同种工具出现同样的问题事实/);
+  assert.match(body, /只确认经验/);
   assert.equal(review.content.returnCommand, `open ${summaryPath}`);
   assert.ok(!review.content.returnCommand.includes('learning.jsonl'));
   assert.ok((await readFile(join(f.config.dataDir, 'learning.jsonl'), 'utf8')).startsWith(before));

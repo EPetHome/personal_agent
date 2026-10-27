@@ -8,10 +8,10 @@ import { event, project } from './events.ts';
 import { piReadOnly } from './model.ts';
 import { feedbackCategory, kindNames } from './statistics.ts';
 import { compact, hash, iso, shellQuote, truncateText } from './utils.ts';
-import { firstScreen, humanText, localTime } from './notice-text.ts';
+import { firstScreen, humanText, localTime, noticeSections, presentNotice } from './notice-text.ts';
 import { renderNotice } from './judge.ts';
 import { toolNames } from './types.ts';
-import type { Config, Notice, ReviewItem } from './types.ts';
+import type { Config, Feedback, Notice, ReviewItem } from './types.ts';
 
 export const layers = ['意图没说清', 'AI 执行偏了', '工具与环境', '盯防自身', '归因未定'] as const;
 export type Layer = typeof layers[number];
@@ -22,6 +22,10 @@ export interface Problem {
   fact: string; locations: string[]; layer: Layer; reason: string; countermeasure: string; experienceId: string;
   returnCommand?: string;
   sameReason?: string;
+  noticeKind?: Notice['kind'];
+  /** 新反馈随问题一起保留原卡片与原话；旧问题缺字段仍可读。 */
+  card?: Feedback['card'];
+  originalText?: string;
   loop?: { batch: string; repairs: number; reviews: number };
 }
 export interface Experience {
@@ -51,11 +55,12 @@ export async function readLearning(dataDir: string) {
     if (row.kind === 'problem') {
       const p = row.problem;
       if (!p?.id || !p.source || !p.experienceId || !layers.includes(p.layer) || typeof p.fact !== 'string' || !Number.isFinite(Date.parse(p.at))) throw new Error('问题记录结构损坏，保留现场');
-      if (!seen.has(p.id)) { problems.push(p); seen.add(p.id); }
+      // 已有误收的「正确」原件保留在 events，不再进入问题/复盘投影。
+      if (!seen.has(p.id) && !p.type.startsWith('正确')) { problems.push(p); seen.add(p.id); }
     } else if (row.kind === 'experience') {
       const e = row.experience;
       if (!e?.id || !memoryStatuses.includes(e.status) || !layers.includes(e.layer) || !Array.isArray(e.sources) || typeof e.countermeasure !== 'string' || (e.reviewRevision !== undefined && (typeof e.reviewRevision !== 'string' || !e.reviewRevision))) throw new Error('经验记录结构损坏，保留现场');
-      experiences.set(e.id, e);
+      if (!e.type.startsWith('正确')) experiences.set(e.id, e);
     } else throw new Error('不支持的经验事件，保留现场');
   }
   return { events, problems, experiences };
@@ -112,9 +117,10 @@ export function piExperienceModel(config: NonNullable<Config['judge']>): Experie
   };
 }
 export function agentNotice(kind: 'weekly' | 'recurrence' | 'service_restart', key: string, at: string, title: string, summary: string, command: string, reviews?: ReviewItem[]): Notice {
-  return { version: 1, id: hash(key), dedupeKey: key, at, tool: 'agent', kind, level: '有空看',
-    content: { title, summary, returnCommand: command, evidence: { project: null, intentOriginal: null, additionalRequirements: [], recentSteps: [], reason: summary, originals: [] } },
-    text: `${title}\n${summary}\n回去看：${command}`, ...(reviews ? { reviews } : {}) };
+  const raw = { title, summary, returnCommand: command, evidence: { project: null, intentOriginal: null, additionalRequirements: [], recentSteps: [], reason: summary, originals: [] } };
+  const sections = noticeSections(raw), content = presentNotice(raw, sections.situation, sections.action, at);
+  return { version: 1, id: hash(key), dedupeKey: key, at, tool: 'agent', kind, level: '有空看', content,
+    text: renderNotice(content, at), ...(reviews ? { reviews } : {}) };
 }
 export function reviewItems(problems: Problem[], experiences: Map<string, Experience>, from: string, to: string): ReviewItem[] {
   const result: ReviewItem[] = [];
@@ -128,7 +134,7 @@ export function reviewItems(problems: Problem[], experiences: Map<string, Experi
     const previousCountermeasure = previous && latest.countermeasure ? latest.countermeasure : '';
     const ai = `${latest.project ? `${basename(latest.project)} 的 ` : ''}${toolNames[latest.tool as keyof typeof toolNames] ?? latest.tool}`;
     const fact = latest.loop ? `${latest.loop.batch}，已评审 ${latest.loop.reviews} 轮、返修 ${latest.loop.repairs} 次`
-      : `${kindNames[latest.type.replace(/^正确:/, '') as Notice['kind']] ?? latest.type}：${compact(latest.fact, 180)}`;
+      : `${latest.noticeKind ? `${kindNames[latest.noticeKind]}提醒，` : ''}${compact(latest.fact, 80)}`;
     const title = humanText(`${ai}：${fact}；第 ${all.length} 次${previous ? `，上次${localTime(previous.at, to)}；为什么算同类：${latest.sameReason ?? '同种问题、同种工具，已有记录将它们归在同一类'}` : ''}${previousCountermeasure ? `，上次对策：${previousCountermeasure}（有对策却又出现）` : ''}；归因：${experience.layer}（${experience.status}）；建议对策：${experience.countermeasure || '还没定，请补充或修改后确认'}`, latest.project ?? '', to);
     result.push({ experienceId: experience.id, experienceRevision: experienceRevision(experience), title, count: all.length, previousAt: previous?.at ?? null, previousCountermeasure, layer: experience.layer, countermeasure: experience.countermeasure, status: experience.status });
   }
@@ -146,17 +152,20 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
     const lookup = new Map(input.outbox.map(n => [n.id, n]));
     const candidates: Omit<Problem, 'layer' | 'reason' | 'countermeasure' | 'experienceId'>[] = [];
     for (const [index, feedback] of input.feedback.entries()) {
-      if (feedback.at > now) continue;
+      if (feedback.at > now || feedback.verdict === '正确') continue;
       const notice = feedback.noticeId ? lookup.get(feedback.noticeId) : undefined;
-      if (notice && ['weekly', 'recurrence', 'service_restart'].includes(notice.kind)) continue;
+      if (notice && ['weekly', 'recurrence', 'service_restart'].includes(notice.kind) && feedback.verdict !== '看不懂') continue;
       const category = feedbackCategory(feedback, notice);
       const source = `feedback:${index}:${hash(JSON.stringify(feedback))}`;
       // 同一条提醒的重复评价仍留原始反馈，但不冒充第二次问题出现。
-      const occurrence = notice && feedback.verdict !== '漏了' ? `notice:${notice.id}:${feedback.verdict}` : source;
-      candidates.push({ id: hash(occurrence), source, at: feedback.at, type: feedback.verdict === '正确' ? `正确:${category.kind}` : feedback.verdict,
+      const occurrence = notice && feedback.verdict === '误报' ? `notice:${notice.id}:${feedback.verdict}` : source;
+      candidates.push({ id: hash(occurrence), source, at: feedback.at, type: feedback.verdict,
         tool: category.tool, project: notice?.content.evidence.project ?? null,
-        fact: truncateText([feedback.verdict, feedback.comment, notice?.content.summary].filter(Boolean).join('；'), 4000), locations: notice?.content.evidence.originals.map(o => o.path) ?? [],
-        ...(notice ? { returnCommand: notice.content.returnCommand } : {}) });
+        fact: truncateText(`${feedback.verdict}：${feedback.comment || `${kindNames[category.kind as Notice['kind']] ?? '盯防'}${feedback.verdict === '看不懂' ? '卡片读不懂' : feedback.verdict === '误报' ? '提醒不该叫我' : '没有提醒到我'}`}`, 4000),
+        locations: notice?.content.evidence.originals.map(o => o.path) ?? [],
+        originalText: feedback.originalText ?? [feedback.verdict, feedback.comment].filter(Boolean).join(' '),
+        ...(feedback.card ? { card: feedback.card } : notice ? { card: { title: notice.content.title, firstScreen: notice.content.summary, returnCommand: notice.content.returnCommand, at: notice.at } } : {}),
+        ...(notice ? { returnCommand: notice.content.returnCommand, noticeKind: notice.kind } : {}) });
     }
     for (const record of project(input.events).sessions.values()) {
       if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || !record.loop || record.lastActivityAt > now || (record.loop.repairs < 2 && !/上限|达到.{0,8}限/.test(record.loop.conclusion))) continue;
@@ -225,15 +234,17 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
       const item = reviewItems(prior, state.experiences, problem.at, problem.at).find(r => r.experienceId === problem.experienceId);
       if (!item || input.events.some(e => e.kind === 'notice_planned' && e.notice.dedupeKey === `recurrence:${problem.id}`)) continue;
       const ai = `${problem.project ? `${basename(problem.project)} 的 ` : ''}${toolNames[problem.tool as keyof typeof toolNames] ?? problem.tool}`;
-      const who = humanText(`${ai}${problem.loop ? `，${problem.loop.batch}，已评审 ${problem.loop.reviews} 轮` : '，你反馈过的问题'}`, problem.project ?? '', now);
+      const situation = problem.loop ? `${ai} · ${problem.loop.batch}：返修 ${problem.loop.repairs} 次，同类第 ${count} 次`
+        : `${ai}：${problem.noticeKind ? `${kindNames[problem.noticeKind]}提醒，` : ''}${compact(problem.fact, 40)}（同类第 ${count} 次）`;
       const title = `${ai}${problem.loop ? `（${humanText(problem.loop.batch, problem.project ?? '', now)}）返修 ${problem.loop.repairs} 次` : ' 的同类问题又出现了'}，请确认经验`;
       const notice = agentNotice('recurrence', `recurrence:${problem.id}`, now, title,
-        firstScreen(who, item.title, '请看归因和建议对策，点「同意」只会将这条经验记为已确认；点「改一下」退回待确认，不会自动执行或修改项目规则。'),
+        firstScreen(situation, '请打开证据确认归因和对策；「同意」只确认经验，不会自动执行'),
         problem.returnCommand ?? '暂时没有可恢复的会话，请查看你反馈的那条提醒。', [item]);
       notice.content.evidence = { project: problem.project, intentOriginal: null, additionalRequirements: [],
         recentSteps: prior.filter(p => p.experienceId === problem.experienceId).map(p => ({ at: p.at, text: p.fact })),
-        reason: `${problem.reason}\n同类依据：${problem.sameReason ?? '已有归类'}`, originals: problem.locations.map(path => ({ path, fingerprint: '' })) };
-      notice.text = renderNotice(notice.content);
+        reason: `${item.title}\n${problem.reason}\n同类依据：${problem.sameReason ?? '已有归类'}`, originals: problem.locations.map(path => ({ path, fingerprint: '' })),
+        presentation: { situation, action: '请看归因和建议对策；「同意」只确认经验，「改一下」退回待确认，不会自动执行或修改项目规则。' } };
+      notice.text = renderNotice(notice.content, now);
       notices.push(notice);
     }
     return notices;

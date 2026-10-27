@@ -56,7 +56,7 @@ test('返修2-2 11个无关会话模型持续超时：规则先交付、反馈�
   assert.ok(notifiedAt - start < 2000, '构造样本的规则通知应快速交付，而非等待11个模型超时');
   assert.equal((await readOutbox(config.dataDir)).length, 1);
   const feedbackStart = performance.now();
-  assert.equal(await receiveFeedback(config.dataDir, 'local', { content: '误报 构造反馈', at: now }), '已记下');
+  assert.match(await receiveFeedback(config.dataDir, 'local', { content: '误报 构造反馈', at: now }), /^已记下：这个会话之后不会再/);
   const feedbackMs = performance.now() - feedbackStart;
   assert.ok(feedbackMs < 500, '模型等待期间不能一直占着数据锁');
   const view = await within(running);

@@ -30,7 +30,7 @@ async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
   return { ...f, transcript };
 }
 
-test('真机 A1：失败下一轮重试并提醒，失败类别落盘；成功后去重、每日上限仍生效', async t => {
+test('真机 A1（本批兜底更新）：失败先按明确问题提醒，下一轮重试不重发；失败类别、每日上限保留', async t => {
   const { config } = await fixture(t);
   let waitingCalls = 0;
   const judge: Judge = { async judge(request) {
@@ -39,13 +39,13 @@ test('真机 A1：失败下一轮重试并提醒，失败类别落盘；成功�
     return { answer: '是', reason: '需要选择才能继续' };
   } };
   const first = await detect(config, now, { judge });
-  assert.equal(first.noticesAdded, 0);
+  assert.equal(first.noticesAdded, 1);
   const failed = (await readEvents(config.dataDir)).find(e => e.kind === 'model_checked' && e.check.task === 'waiting');
   assert.ok(failed?.kind === 'model_checked');
   assert.deepEqual(failed.check.failure, { category: 'exit', detail: '命令退出码 17' });
   const prefix = await readFile(join(config.dataDir, 'events.jsonl'), 'utf8');
   const second = await detect(config, '2026-10-20T10:02:00Z', { judge });
-  assert.equal(second.records[0]?.status, '在等我'); assert.equal(second.noticesAdded, 1);
+  assert.equal(second.records[0]?.status, '在等我'); assert.equal(second.noticesAdded, 0);
   await detect(config, '2026-10-20T10:03:00Z', { judge });
   assert.equal(waitingCalls, 2); assert.equal((await readOutbox(config.dataDir)).length, 1);
   assert.ok((await readFile(join(config.dataDir, 'events.jsonl'), 'utf8')).startsWith(prefix));
@@ -190,11 +190,11 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长
   await detect(config, now, { judge: { async judge(r) { return r.task === 'waiting' ? { answer: '是', reason: 'MODEL_REASON_EVIDENCE_ONLY' } : no; } } });
   const calls = await readJsonl<string[]>(log); assert.equal(calls.length, 1);
   const body = calls[0]!.at(-1)!;
-  assert.match(body.split('\n')[0]!, /^谁：/);
-  assert.equal(body.split('\n')[2], `要不要你管：${question}`);
+  assert.match(body.split('\n')[0]!, /^这件事：/);
+  assert.equal(body.split('\n')[2], `要你做：${question}`);
   assert.equal(body.split(question).length - 1, 1);
-  assert.match(body.split('\n')[3]!, /^回去看：/);
-  assert.ok(!/\/sample|\||MODEL_REASON|。。/.test(body.split('\n回去看：')[0]!));
+  assert.match(body.split('\n')[4]!, /^时间 \/ 回去看：/);
+  assert.ok(!/\/sample|\||MODEL_REASON|。。/.test(body.split('\n时间 / 回去看：')[0]!));
   assert.ok((await readOutbox(config.dataDir))[0]?.content.evidence.reason.includes('MODEL_REASON_EVIDENCE_ONLY'));
 });
 
@@ -214,7 +214,7 @@ test('真机 A9（反馈与卡片批更新）：检测持锁时实际 feedback C
   t.after(() => { if (!exited) child.kill('SIGKILL'); finish(); });
   try {
     assert.equal(await Promise.race([done, delay(5000).then(() => 'timeout')]), 0, stderr);
-    assert.equal(stdout.trim(), '已记下'); assert.equal(stderr, '');
+    assert.match(stdout.trim(), /^已记下：这个会话之后不会再/); assert.equal(stderr, '');
     assert.equal((await readJsonl(join(config.dataDir, 'feedback.jsonl'))).length, 1);
     assert.ok(await readFile(join(config.dataDir, '.detect.lock/owner.json'), 'utf8'));
   } finally { finish(); await running; }
@@ -304,8 +304,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`返修1-1：${tool} 有
   assert.ok([...waiting[0]!.assistantReply].length <= 1200);
   assert.equal(view.records[0]?.status, '在等我');
   assert.equal(view.records[0]?.modelWaiting?.evidenceAt, push!.at);
-  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1)?.split('\n')[2], `要不要你管：${question}`, '通知不能退化为默认占位话');
-  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary.split('\n')[2], `要不要你管：${question}`);
+  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1)?.split('\n')[2], `要你做：${question}`, '通知不能退化为默认占位话');
+  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary.split('\n')[2], `要你做：${question}`);
   await detect(config, new Date().toISOString());
   assert.equal((await readJsonl(modelLog)).length, contexts.length, '成功判断空跑不重调');
   assert.equal((await readJsonl(notifications)).length, 1, '同一条提醒继续去重');

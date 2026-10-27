@@ -92,14 +92,21 @@ export function commandSummary(name: string, value: unknown): string {
   if (typeof args.input === 'string') return compact(`${name}：${args.input.split('\n').slice(0, 3).join(' ')}`);
   return compact(name);
 }
+/** 只看用户内容顶层的已知图片块，不读取图片载荷，也不递归扫描工具结果。 */
+function hasInputImage(content: unknown): boolean {
+  return Array.isArray(content) && content.some(block => block && typeof block === 'object' && ['image', 'input_image'].includes(block.type));
+}
 export function isHuman(text: string, ...metadata: JsonObject[]): boolean {
   for (const data of metadata) {
     if (data.origin?.kind && data.origin.kind !== 'human') return false;
     if (data.source && ['system', 'extension', 'loop', 'task-notification'].includes(data.source)) return false;
     if (data.promptSource === 'system' || data.isSynthetic === true || data.is_meta === true) return false;
   }
-  if (metadata.some(data => data.origin?.kind === 'human')) return !!text.trim();
-  return !!text.trim() && !/^\s*(?:<task-notification[\s>]|<\/?autoreview[\s>]|\[loop\]|\[自动评审返修\])/.test(text);
+  // 文字可被 contentText/注入清理清空，但结构化图片仍是新输入；元数据拒绝规则优先。
+  const humanText = withoutInjectedContext(text).trim();
+  const hasContent = !!humanText || metadata.some(data => hasInputImage(data.content) || hasInputImage(data.message));
+  if (metadata.some(data => data.origin?.kind === 'human')) return hasContent;
+  return hasContent && !/^\s*(?:<task-notification[\s>]|<\/?autoreview[\s>]|\[loop\]|\[自动评审返修\])/.test(humanText);
 }
 export function emptyRecord(tool: Tool, sessionId: string, project: string, at: string, original: Original): SessionRecord {
   return {
@@ -115,9 +122,16 @@ export function observeCwd(record: SessionRecord, cwd: unknown): void {
   const history = record.cwdHistory[0]!;
   if (!history.cwds.includes(cwd)) history.cwds.push(cwd);
 }
-/** 媒体块已由 contentText 排除；再跳过工具写进 text 的图片/附件占位，保留同条消息里的真人文字。 */
+/** 只剥离已知 IDE/系统注入块；与意图提取共用，但不把媒体输入一起抹掉。 */
+export function withoutInjectedContext(text: string): string {
+  const tags = 'ide_opened_file|ide_selection|system-reminder|system_reminder|environment_context|environment_details|environment|editor_context|current_date|available_tools';
+  return text.replace(new RegExp(`<(?:(?:${tags}))\\b[^>]*\\/\\s*>`, 'gi'), '')
+    .replace(new RegExp(`<(${tags})\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>`, 'gi'), '')
+    .replace(new RegExp(`<(?:${tags})\\b[^>]*>[\\s\\S]*$`, 'gi'), '');
+}
+/** 媒体占位、IDE/系统注入块不是用户意图；块后真人文字仍保留。 */
 export function intentText(text: string): string {
-  return text.replace(/!\[[^\]\r\n]*\]\([^\r\n)]*\)/g, '')
+  return withoutInjectedContext(text).replace(/!\[[^\]\r\n]*\]\([^\r\n)]*\)/g, '')
     .replace(/\[(?:image|attachment|file|attached\s+(?:image|file)|图片|截图|附件)(?:\s*:[^\]\r\n]*|\s*：[^\]\r\n]*|\s*#?\d+)?\]/gi, '').trim();
 }
 export function addIntent(record: SessionRecord, text: string): void {
