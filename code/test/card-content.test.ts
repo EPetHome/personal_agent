@@ -6,7 +6,7 @@ import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { detect } from '../src/core/agent.ts';
 import { readJsonl, readOutbox } from '../src/core/store.ts';
-import { humanText, requestedAction } from '../src/core/notice-text.ts';
+import { humanText, noticeTimeAndReturn, requestedAction } from '../src/core/notice-text.ts';
 import { intentText } from '../src/core/utils.ts';
 import { agentNotice } from '../src/core/learning.ts';
 import { noticeCard } from '../src/channels/feishu/card.ts';
@@ -50,9 +50,10 @@ for (const tool of ['cc', 'codex', 'pi'] as const) for (const onlyImages of [fal
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
   const message = (await readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl'))).find(m => m.noticeId === notice.id)!;
   const body = front(message.content);
-  assert.match(body, onlyImages ? /谁：shop 的 .*：意图不明/ : /谁：shop 的 .*：给商品列表加缓存/);
+  assert.match(body, /shop 的 .*可能在等你回复/);
+  assert.match(body, onlyImages ? /\*\*这件事\*\*：意图不明/ : /\*\*这件事\*\*：给商品列表加缓存/);
   assert.doesNotMatch(body, /\[Image|\[Attachment|SYNTHETIC_IMAGE|screenshot\.png/);
-  assert.match(body, /\d\d:\d\d 答完后/);
+  assert.match(body, /\*\*时间 \/ 回去看\*\*：.*\d\d:\d\d/);
 });
 
 test('媒体和真人文字在同一消息时只除占位；Pi限长前先排除超长占位', async t => {
@@ -72,7 +73,7 @@ test('卡片 A6/A7：实际检测保留冒号后三项列表，时间后有空�
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
   const action = notice.content.summary.split('\n')[2]!;
   for (const item of ['等你核销：', '在飞书点几张卡片的按钮', '看新卡片是不是一眼能懂', '确认这一周反馈都留得下来']) assert.ok(action.includes(item));
-  assert.match(notice.content.summary, /\d\d:\d\d 答完后/);
+  assert.match(noticeTimeAndReturn(notice), /\d\d:\d\d/);
   assert.ok(!action.endsWith('：'));
 });
 
@@ -91,10 +92,11 @@ test('卡片 A8：单独复盘、周报多项复盘标题均只出现一次，�
   const item = (n: number): ReviewItem => ({ experienceId: `experience-${n}`, experienceRevision: `revision-${n}`, title: `构造复盘标题${n}：需要确认归因与对策`, count: 2, previousAt: now, previousCountermeasure: '', layer: '归因未定', countermeasure: '', status: '待确认' });
   const reviews = [item(1), item(2)];
   for (const kind of ['recurrence', 'weekly'] as const) {
-    const notice = agentNotice(kind, kind, now, '复盘卡片', kind === 'recurrence' ? `谁：shop 的 loop\n出了什么事：${reviews.map(r => r.title).join('；')}\n要不要你管：请确认` : '本周小结，以下两条需要确认', 'open /synthetic/summary.md', reviews);
+    const notice = agentNotice(kind, kind, now, '复盘卡片', '这件事：本周发现两类提醒问题\n\n要你做：请打开证据确认归因和对策', 'open /synthetic/summary.md', reviews);
     const card = noticeCard(notice), body = front(card);
-    for (const review of reviews) assert.equal(body.split(review.title).length - 1, 1);
+    for (const review of reviews) assert.ok(!body.includes(review.title), '长复盘只放证据');
     const json = JSON.stringify(card);
+    for (const review of reviews) assert.equal(json.split(review.title).length - 1, 1);
     assert.equal((json.match(/"action":"agree"/g) ?? []).length, 2);
     assert.equal((json.match(/"action":"revise"/g) ?? []).length, 2);
   }

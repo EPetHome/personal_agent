@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString, withoutInjectedContext } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
@@ -13,7 +13,7 @@ function completedItem(row: JsonObject): JsonObject | undefined {
 }
 function humanMessage(item: JsonObject, row: JsonObject): string | null {
   const text = contentText(item.content ?? item.message);
-  return !text.trimStart().startsWith('<') && isHuman(text, row, item) ? text : null;
+  return !intentText(text).trimStart().startsWith('<') && isHuman(text, row, item) ? text : null;
 }
 
 function identifyRow(row: JsonObject): SessionIdentity | null {
@@ -32,10 +32,12 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     const parent = meta.parent_session_id ?? meta.source?.subagent?.thread_spawn?.parent_thread_id;
     if (typeof parent === 'string' && parent) record.parentSessionId = parent;
     const pending = new Map<string, { id: string; at: string; text: string }>();
-    // 两代事件同时出现时只取新版本人消息；response_item user 是重复副本，始终忽略。
+    // 两代同时出现时，新版真人文字优先；无文字的真实图片只重开状态，不能遮蔽旧文字意图。
+    // response_item user 是重复副本，始终忽略；带媒体文本占位的既有输入仍按原代际选择。
     const hasNewUsers = findRow(rows, row => {
       const item = completedItem(row);
-      return item?.type === 'UserMessage' && humanMessage(item, row) !== null;
+      const text = item?.type === 'UserMessage' ? humanMessage(item, row) : null;
+      return text !== null && !!withoutInjectedContext(text).trim();
     }) !== undefined;
     let recognized = 0;
     let lastAgent: { text: string; phase?: string } | undefined;

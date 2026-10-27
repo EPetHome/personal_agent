@@ -1,4 +1,6 @@
 import { membersOf, pushMatchesMember } from './sessions.ts';
+import { modelEvidenceKey } from './evidence.ts';
+import { requestedAction } from './notice-text.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
 import { compact, hash } from './utils.ts';
 import { ComponentFailure, safeFailure } from './process.ts';
@@ -62,11 +64,14 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     .sort((a, b) => b.item.evidenceAt.localeCompare(a.item.evidenceAt)
       || (a.item.task === b.item.task ? 0 : a.item.task === 'waiting' ? -1 : 1) || a.item.key.localeCompare(b.item.key));
   for (const { record, item } of queue) {
-    const previous = projection.modelChecks.get(item.key);
+    const evidence = projection.modelEvidence.get(modelEvidenceKey({ ...item, recordKey: record.key }));
+    // 同一事实已有成功的是/否答案，改提取方式、文案或模型配置都不重新花额度。
+    if (evidence?.result && !evidence.error) continue;
+    const previous = evidence ?? projection.modelChecks.get(item.key);
     const deferred = previous?.error === DEFERRED;
     const retry = deferred || previous?.error === '调用失败，仅规则判断'
       || (previous?.error === '每日额度用完，仅规则判断' && previous.at.slice(0, 10) !== day);
-    if (previous?.fingerprint === item.fingerprint && !retry) continue;
+    if (evidence && !retry) continue;
     // 首次接入的旧完成记录也不是新动静，不能先耗尽额度再轮到当前任务。
     if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY
       || (projection.startedAt && Date.parse(item.evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK)) continue;
@@ -101,22 +106,33 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     }
     await persist({ kind: 'model_checked', check });
     projection.modelChecks.set(item.key, check);
+    projection.modelEvidence.set(modelEvidenceKey(check), check);
     checked++;
   }
   return checked;
 }
-/** 纯投影：overview/rebuild 不调模型，仅使用仍与当前证据一致的已记录答案。 */
+function ruleWaiting(record: JudgedRecord, item: Candidate, now: string): void {
+  if (item.task !== 'waiting' || Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY) return;
+  const question = requestedAction(item.context.assistantReply, record.project, '');
+  if (!question || !/[？?]|(?:请|需要你|等你).*(?:确认|选择|授权|回复|提供|核销)|是否/.test(question)) return;
+  record.ruleWaiting = { sessionId: item.sessionId, evidenceAt: item.evidenceAt, reply: item.context.assistantReply };
+  record.status = '在等我';
+  record.reason = '判断模型不可用，仅按助手最后一个明确问题兜底；尚需你回复或确认';
+}
+/** 纯投影：overview/rebuild 不调模型；无模型/调用失败时用最后的明确问题兜底。 */
 export function applyModelChecks(records: JudgedRecord[], projection: Projection, config: Config, now: string): void {
   for (const record of records) {
     for (const item of candidates(record, projection, config, now)) {
-      const check = projection.modelChecks.get(item.key);
-      if (check?.fingerprint !== item.fingerprint) {
-        if (item.task === 'drift' && check && Date.parse(now) - Date.parse(check.at) < TEN_MINUTES) (record.modelNotes ??= []).push('跑偏检查间隔未到，本轮仅规则判断');
+      const check = projection.modelEvidence.get(modelEvidenceKey({ ...item, recordKey: record.key }));
+      if (!check) {
+        const previous = projection.modelChecks.get(item.key);
+        if (item.task === 'drift' && previous && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES) (record.modelNotes ??= []).push('跑偏检查间隔未到，本轮仅规则判断');
         continue;
       }
       if (check.error) {
         (record.modelNotes ??= []).push(check.error);
         if (check.failure) record.modelNotes.push(`${check.failure.category}：${check.failure.detail}`);
+        ruleWaiting(record, item, now);
         continue;
       }
       if (check.result?.answer !== '是') continue;
@@ -132,7 +148,7 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
         record.modelWaiting = finding;
         record.status = '在等我';
         record.reason = `模型判断可能在等你回复：${check.result.reason}`;
-      } else if (!record.modelWaiting && !record.waiting) {
+      } else if (!record.modelWaiting && !record.ruleWaiting && !record.waiting) {
         record.drift = finding;
         record.status = '疑似跑偏';
         record.reason = `可能偏离意图「${check.result.intentQuote}」；实际步骤「${check.result.stepQuote}」；${check.result.reason}`;

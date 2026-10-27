@@ -45,7 +45,7 @@ test('段2 A1/A2：两级飞书卡片；本机只收紧急级；同证据与重�
     const card: any = messages[0]!.content;
     assert.equal(card.header.title.content, notice.content.title);
     const display = visibleStrings(card);
-    assert.ok(display.includes(notice.content.summary)); assert.ok(display.includes(notice.content.returnCommand));
+    assert.ok(display.includes(notice.content.situation!)); assert.ok(display.includes(notice.content.action!)); assert.ok(display.includes(notice.content.returnCommand));
     assert.ok(display.includes('正确')); assert.ok(display.includes('误报')); assert.ok(display.includes('collapsible_panel'));
     assert.ok(!display.includes(notice.id));
     assert.equal(await readFile(calls, 'utf8').catch(() => ''), urgent ? 'called\n' : '');
@@ -68,7 +68,9 @@ test('段2 A3/A4：按钮和引用准确关联，直接漏了不关联；重投�
   await channel.drain(); await channel.drain();
   feedback = await readFeedback(config.dataDir); assert.equal(feedback.length, 3); assert.equal(feedback[2]!.noticeId, notice.id);
   const replies = (await sent()).filter(m => m.type === 'text'); assert.equal(replies.length, 3);
-  for (const reply of replies) assert.deepEqual(reply.content, { text: '已记下' });
+  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:click-1')!.content), /这个会话之后不会再因为等你回复或授权叫你/);
+  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:miss-1')!.content), /这条进了本周的问题汇总/);
+  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:quote-1')!.content), /提醒对你有用，不会记成问题/);
 });
 
 test('飞书私聊授权：陌生人、群聊、伪造按钮、未知引用不落反馈；不退回最近提醒', async t => {

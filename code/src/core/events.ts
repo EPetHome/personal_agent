@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hash } from './utils.ts';
+import { modelEvidenceKey } from './evidence.ts';
 import { findPushTarget, membersOf } from './sessions.ts';
 import { learnSkipBaseline } from './health.ts';
 import type { AgentEvent, EventPayload, Projection, PushRecord } from './types.ts';
@@ -16,7 +17,8 @@ export function event(payload: EventPayload, at: string): AgentEvent {
   return { ...payload, version: 1, at, id };
 }
 export function project(events: AgentEvent[]): Projection {
-  const result: Projection = { sessions: new Map(), seenSessions: new Set(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelCalls: new Map(), channelDeliveries: new Map() };
+  const result: Projection = { sessions: new Map(), seenSessions: new Set(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelEvidence: new Map(), feedbackSuppressions: new Set(), modelCalls: new Map(), channelDeliveries: new Map() };
+  const checksByFingerprint = new Map<string, import('./types.ts').ModelCheck>();
   const rawPushes = new Map<string, PushRecord>();
   const pushes = new Set<string>();
   const notices = new Set<string>();
@@ -68,12 +70,32 @@ export function project(events: AgentEvent[]): Projection {
         result.modelCalls.set(day, (result.modelCalls.get(day) ?? 0) + 1);
         break;
       }
-      case 'model_checked': result.modelChecks.set(entry.check.key, entry.check); break;
+      case 'model_checked': {
+        const check = entry.check;
+        result.modelChecks.set(check.key, check);
+        const evidenceKey = modelEvidenceKey(check), previous = result.modelEvidence.get(evidenceKey);
+        // 旧版可能因提取变化再次调用失败；失败不能抹掉同一事实已有的成功答案。
+        if ((!check.error && check.result) || !previous?.result || previous.error) result.modelEvidence.set(evidenceKey, check);
+        checksByFingerprint.set(`${check.recordKey}:${check.fingerprint}`, check);
+        break;
+      }
       case 'channel_delivery': result.channelDeliveries.set(`${entry.channel}:${entry.noticeId}`, entry.ok); break;
       case 'feishu_connection': result.feishuConnection = { ...entry.connection, at: entry.at }; break;
       case 'push_empty':
       case 'push_cursor': break;
     }
   }
+  // 老版提醒把提取指纹放在去重键里。只在投影中追溯其事实身份，磁盘原件不动。
+  result.notices = result.notices.map(notice => {
+    if (notice.evidenceAt || !notice.sessionKey) return notice;
+    if (notice.dedupeKey.startsWith('waiting:')) {
+      const push = result.pushes.find(p => p.recordKey === notice.sessionKey && notice.dedupeKey === `waiting:${p.recordKey}:${pushIdentity(p)}`);
+      return push ? { ...notice, evidenceAt: push.at, memberSessionId: push.sessionId } : notice;
+    }
+    if (!/^(?:model_waiting|drift):/.test(notice.dedupeKey)) return notice;
+    const fingerprint = notice.dedupeKey.slice(notice.dedupeKey.lastIndexOf(':') + 1);
+    const check = checksByFingerprint.get(`${notice.sessionKey}:${fingerprint}`);
+    return check ? { ...notice, evidenceAt: check.evidenceAt, memberSessionId: check.sessionId } : notice;
+  });
   return result;
 }

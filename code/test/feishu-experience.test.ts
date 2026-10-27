@@ -4,13 +4,13 @@ import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
+import { setImmediate as yieldIO, setTimeout as delay } from 'node:timers/promises';
 import { detect, overview } from '../src/core/agent.ts';
 import { renderOverview } from '../src/core/judge.ts';
 import { feishuChannel, normalizeIncoming } from '../src/channels/feishu/index.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { readFeedback } from '../src/core/feedback.ts';
-import { appendJsonl, readJsonl, readOutbox } from '../src/core/store.ts';
+import { appendJsonl, readEvents, readJsonl, readOutbox, withStoreLock } from '../src/core/store.ts';
 import { runService } from '../src/service/daemon.ts';
 import type { FeishuConnection } from '../src/core/types.ts';
 import { ccCall, ccUser, put, pushed, sandbox } from './fixtures.ts';
@@ -106,6 +106,32 @@ test('确认发送失败只重试回话；已核销旧点击和原始收件/反�
   assert.doesNotMatch(await readFile(receipts, 'utf8'), /SYNTHETIC_PRIVATE_UPSTREAM/);
 });
 
+test('门禁返修1：固定重试钟未到时，检测释放锁后的 drain 独立唤醒连接状态写回，收件不等检测锁', async t => {
+  const f = await fixture(t); f.config.sources.cc = null;
+  const channel = feishuChannel(f.config, { async send() { return 'om_stub'; }, start(_handlers, report) { report?.({ state: 'connected' }); } });
+  // 冻结定时重试，不改真实 I/O；用确定性场景暴露只能等整秒抢锁的饥饿。
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await withStoreLock(f.config.dataDir, async () => {
+      await channel.start(); // 握手回调已到，但数据锁仍被检测占用。
+      const began = performance.now();
+      await channel.drain();
+      assert.ok(performance.now() - began < 500, '收件不能等待状态写入或检测锁');
+      assert.ok(!(await readEvents(f.config.dataDir)).some(e => e.kind === 'feishu_connection' && e.connection.state === 'connected'));
+    });
+    await channel.drain(); // 与 detect.finish 相同，在检测释放数据锁后调用。
+    const deadline = performance.now() + 2000;
+    let connected = false;
+    while (performance.now() < deadline) {
+      connected = (await readEvents(f.config.dataDir)).some(e => e.kind === 'feishu_connection' && e.connection.state === 'connected');
+      if (connected) break;
+      await yieldIO();
+    }
+    assert.ok(connected, '没有推进固定重试钟；检测后的收件调用也应唤醒待写的已连接状态');
+    assert.equal((await overview(f.config)).projection.feishuConnection?.state, 'connected');
+  } finally { await channel.stop(); t.mock.timers.reset(); }
+});
+
 test('飞书 A3：检测持锁超过30秒时连接状态独立重试，收件/后续检测继续且总览已连上', { timeout: 50000 }, async t => {
   const f = await fixture(t), now = new Date().toISOString();
   f.config.service = { intervalMs: 100, restartWindowMs: 1000, restartThreshold: 3 };
@@ -129,7 +155,12 @@ test('飞书 A3：检测持锁超过30秒时连接状态独立重试，收件/�
     await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).some(r => r.kind === 'scan_completed'));
     await channel.capture(text('after-lock'));
     await waitFor(async () => (await readFeedback(f.config.dataDir)).length === 1);
-    await waitFor(async () => (await overview(f.config)).projection.feishuConnection?.state === 'connected');
+    try {
+      await waitFor(async () => (await overview(f.config)).projection.feishuConnection?.state === 'connected');
+    } catch (error) {
+      t.diagnostic(`连接状态未恢复时的构造服务日志：${JSON.stringify(await readJsonl(join(f.config.dataDir, 'service.log.jsonl')))}`);
+      throw error;
+    }
     await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length >= 2);
     const view = await overview(f.config);
     assert.match(renderOverview(view.records, view.projection), /飞书长连接：已连接/);
