@@ -1,9 +1,11 @@
 import { constants } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { lstat, open, rename, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertRegularFile } from './config.ts';
 import { acquireLock } from './locks.ts';
+import { OperationFailure } from './failures.ts';
 import type { AgentEvent, Notice } from './types.ts';
 
 async function exists(path: string): Promise<boolean> {
@@ -20,9 +22,9 @@ export async function readJsonl<T>(path: string): Promise<T[]> {
   for (const [index, line] of text.split('\n').entries()) {
     if (!line.trim()) continue;
     try { rows.push(JSON.parse(line)); }
-    catch { throw new Error(`${path} 第 ${index + 1} 行损坏；保留现场，请先备份再人工恢复，未覆盖事实记录`); }
+    catch { throw new OperationFailure('data_corrupt', `${path} 第 ${index + 1} 行损坏；保留现场，请先备份再人工恢复，未覆盖事实记录`); }
   }
-  if (text && !text.endsWith('\n')) throw new Error(`${path} 末行未完整提交；请先备份再恢复，未追加或覆盖`);
+  if (text && !text.endsWith('\n')) throw new OperationFailure('data_corrupt', `${path} 末行未完整提交；请先备份再恢复，未追加或覆盖`);
   return rows;
 }
 export async function appendJsonl(path: string, rows: unknown[]): Promise<void> {
@@ -58,12 +60,26 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   }
   return rows;
 }
-export async function readOutbox(dataDir: string): Promise<Notice[]> {
+async function readOutboxUnlocked(dataDir: string): Promise<Notice[]> {
   const rows = await readJsonl<Notice>(join(dataDir, 'outbox.jsonl'));
   if (rows.some(row => !row || row.version !== 1 || typeof row.id !== 'string' || typeof row.text !== 'string')) {
-    throw new Error('outbox.jsonl 结构损坏；未改写，请先备份再恢复');
+    throw new OperationFailure('data_corrupt', 'outbox.jsonl 结构损坏；未改写，请先备份再恢复');
   }
   return rows;
+}
+/** 发件的短锁只覆盖读写 JSONL，不包含通知/API，供反馈安全核对提醒。 */
+async function withOutboxLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T> {
+  const release = await acquireLock(dataDir, '.outbox.lock', 30000);
+  try { return await operation(); } finally { await release(); }
+}
+export async function readOutbox(dataDir: string): Promise<Notice[]> {
+  return withOutboxLock(dataDir, () => readOutboxUnlocked(dataDir));
+}
+export async function appendOutbox(dataDir: string, notice: Notice): Promise<void> {
+  return withOutboxLock(dataDir, async () => {
+    if (!(await readOutboxUnlocked(dataDir)).some(row => row.id === notice.id))
+      await appendJsonl(join(dataDir, 'outbox.jsonl'), [notice]);
+  });
 }
 export async function writeState(dataDir: string, state: unknown): Promise<void> {
   const path = join(dataDir, 'state.json');
@@ -85,14 +101,28 @@ export async function withModelLock<T>(dataDir: string, operation: () => Promise
   try { return await operation(); }
   finally { await release(); }
 }
+/** 按异步检测轮次汇总实际持锁时间（含初始化/释放，不含等锁和模型等待），不改变加锁范围。 */
+const storeLockTiming = new AsyncLocalStorage<{ active: boolean; value: { heldMs: number } }>();
+export async function measureStoreLocks<T>(operation: () => Promise<T>, value: { heldMs: number }): Promise<T> {
+  const timing = { active: true, value };
+  try { return await storeLockTiming.run(timing, operation); }
+  finally { timing.active = false; }
+}
 export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>, waitMs = 0): Promise<T> {
   const release = await acquireLock(dataDir, '.detect.lock', waitMs);
+  const began = performance.now(), timing = storeLockTiming.getStore();
   try {
     for (const name of ['events.jsonl', 'outbox.jsonl', 'feedback.jsonl']) {
       const path = join(dataDir, name);
       if (await exists(path)) await assertRegularFile(path);
-      else { const handle = await open(path, 'ax', 0o600); await handle.close(); }
+      else {
+        try { const handle = await open(path, 'ax', 0o600); await handle.close(); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; await assertRegularFile(path); }
+      }
     }
     return await operation();
-  } finally { await release(); }
+  } finally {
+    try { await release(); }
+    finally { if (timing?.active) timing.value.heldMs += performance.now() - began; }
+  }
 }

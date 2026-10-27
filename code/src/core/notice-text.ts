@@ -15,6 +15,7 @@ export function localTime(at: string, now: string): string {
 export function humanText(text: string, project: string, now: string): string {
   return readableLines(text, project).join('；')
     .replace(/[+]?[0-9]{4,6}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z/g, at => localTime(at, now))
+    .replace(/(\d\d:\d\d)(?=[\p{L}\p{N}])/gu, '$1 ')
     .replace(/(?:~\/|\/)[^\s，；。！？、'"<>]+/g, '相关文件')
     .replace(/[A-Za-z0-9_.-]+\.(?:jsonl|json|[cm]?[jt]sx?|md|txt|log|lock)\b(?::\d+(?::\d+)?)?/g, '相关文件').replace(/第\s*\d+\s*行/g, '')
     .replace(/\b(?:Read|read)[:：]?\s*/g, '查看文件：').replace(/\b(?:Edit|Write|edit|write)[:：]?\s*/g, '修改文件：').replace(/\b(?:Bash|bash)[:：]?\s*/g, '运行命令：')
@@ -46,8 +47,31 @@ export function readableLines(text: string, project = ''): string[] {
 }
 /** 先挑真正的问题/要做的事，不拿模型解释代替助手的话。 */
 export function requestedAction(reply: string, project: string, fallback = '请回到会话确认下一步。'): string {
-  const sentences = readableLines(reply, project).flatMap(line => line.split(/(?<=[。！？!?])\s*/)).map(s => s.trim()).filter(Boolean);
-  const question = sentences.findLast(s => /[？?]/.test(s));
-  const action = question ?? sentences.findLast(s => /请|需要你|等你|是否|允许|授权|你(?:要|想|选|希望)/.test(s));
-  return compact(action ?? fallback, 240);
+  const raw = reply.split(/\r?\n/), candidates: { text: string; items?: string[] }[] = [];
+  let fence = '';
+  for (let i = 0; i < raw.length; i++) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(raw[i]!)?.[1];
+    if (marker) { if (!fence) fence = marker[0]!; else if (marker[0] === fence) fence = ''; continue; }
+    if (fence) continue;
+    const line = readableLines(raw[i]!, project)[0];
+    if (!line) continue;
+    const items: string[] = [];
+    let end = i + 1;
+    if (/[:：]$/.test(line)) {
+      while (end < raw.length) {
+        if (!raw[end]!.trim()) { end++; continue; }
+        const match = /^\s*(?:[-+*]\s+|\d+[.)、]\s+)(?:\[[ xX]\]\s*)?(.+)$/.exec(raw[end]!);
+        if (!match) break;
+        items.push(...readableLines(match[1]!, project)); end++;
+      }
+    }
+    // 引子和列表是同一个动作；列表里的「请/需要你/问号」不能把它拆成只剩最后一项。
+    if (items.length) { candidates.push({ text: line, items }); i = end - 1; }
+    else for (const text of line.split(/(?<=[。！？!?])\s*/).map(s => s.trim()).filter(Boolean)) candidates.push({ text });
+  }
+  const whole = (candidate: typeof candidates[number]) => [candidate.text, ...(candidate.items ?? [])].join('；');
+  const action = candidates.findLast(s => /[？?]/.test(whole(s)))
+    ?? candidates.findLast(s => /请|需要你|等你|是否|允许|授权|你(?:要|想|选|希望)/.test(whole(s)));
+  if (action?.items) return compact(`${compact(action.text, 100)} ${action.items.join('；')}`, 240);
+  return compact(action?.text ?? fallback, 240);
 }

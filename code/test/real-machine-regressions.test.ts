@@ -198,7 +198,7 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长
   assert.ok((await readOutbox(config.dataDir))[0]?.content.evidence.reason.includes('MODEL_REASON_EVIDENCE_ONLY'));
 });
 
-test('真机 A9：检测持锁时实际 feedback CLI 等待，检测结束后输出已记下且只追加一次', async t => {
+test('真机 A9（反馈与卡片批更新）：检测持锁时实际 feedback CLI 已记下，不再等检测结束', async t => {
   const { root, config, transcript } = await fixture(t); config.judge = null;
   await put(transcript, [ccUser(), ccCall()]); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
   let started!: () => void, finish!: () => void;
@@ -212,22 +212,24 @@ test('真机 A9：检测持锁时实际 feedback CLI 等待，检测结束后输
   child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
   const done = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', code => { exited = true; resolve(code); }); });
   t.after(() => { if (!exited) child.kill('SIGKILL'); finish(); });
-  try { await delay(300); assert.equal(exited, false); assert.equal((await readJsonl(join(config.dataDir, 'feedback.jsonl'))).length, 0); }
-  finally { finish(); }
-  await running;
-  assert.equal(await done, 0, stderr); assert.equal(stdout.trim(), '已记下'); assert.equal(stderr, '');
+  try {
+    assert.equal(await Promise.race([done, delay(5000).then(() => 'timeout')]), 0, stderr);
+    assert.equal(stdout.trim(), '已记下'); assert.equal(stderr, '');
+    assert.equal((await readJsonl(join(config.dataDir, 'feedback.jsonl'))).length, 1);
+    assert.ok(await readFile(join(config.dataDir, '.detect.lock/owner.json'), 'utf8'));
+  } finally { finish(); await running; }
   assert.equal((await readJsonl(join(config.dataDir, 'feedback.jsonl'))).length, 1);
 });
 
-test('真机 A9：有界等待超时只给易懂提示，不清活锁/未知锁、不假称记下', async t => {
+test('真机 A9（反馈与卡片批更新）：反馈专锁异常占用仍不清活锁/未知锁、不假称记下', async t => {
   const { config } = await fixture(t);
-  const release = await acquireLock(config.dataDir, '.detect.lock');
+  const release = await acquireLock(config.dataDir, '.feedback.lock');
   try {
     await assert.rejects(receiveFeedback(config.dataDir, 'local', { content: '漏了 构造反馈', at: now }, 80), error => {
-      assert.match((error as Error).message, /尚未记下.*稍后再试/); assert.ok(!(error as Error).message.includes('人工恢复')); return true;
+      assert.match((error as Error).message, /尚未记下.*检查本机服务/); assert.ok(!(error as Error).message.includes('人工恢复')); return true;
     });
     assert.equal((await readJsonl(join(config.dataDir, 'feedback.jsonl'))).length, 0);
-    assert.ok(await readFile(join(config.dataDir, '.detect.lock/owner.json'), 'utf8'));
+    assert.ok(await readFile(join(config.dataDir, '.feedback.lock/owner.json'), 'utf8'));
   } finally { await release(); }
 });
 

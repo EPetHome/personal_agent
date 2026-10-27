@@ -101,7 +101,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const last = record.loop?.phase ?? modelReply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
     const batch = record.loop ? humanText(record.loop.batch ?? '批次名暂未记录', record.project, now) : '';
     const identity = record.loop ? `${ai}，${batch}，${record.loop.phase ?? '开发'}（已评审 ${record.loop.reviews} 轮）`
-      : `${ai}：${compact(humanText(record.intent.initial ?? '任务意图暂未记录', record.project, now), 140)}`;
+      : `${ai}：${compact(humanText(record.intent.initial ?? '意图不明', record.project, now), 140)}`;
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
       // 展示用的批名/当前步骤/关联会话不改变旧版去重键，升级不能重发已交代的总结。
@@ -115,13 +115,13 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
       const child = record.waiting.sessionId !== record.sessionId;
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-      summary = `${localTime(record.waiting.at, now)}停下来等你授权${child ? '，等的是这个子会话' : ''}。`;
+      summary = `${localTime(record.waiting.at, now)} 停下来等你授权${child ? '，等的是这个子会话' : ''}。`;
       action = requestedAction(record.waiting.detail || last, record.project, `请回到${child ? '子' : ''}会话确认是否授权。`);
     } else if (record.status === '在等我' && record.modelWaiting) {
       kind = 'waiting';
       key = `model_waiting:${record.key}:${record.modelWaiting.fingerprint}`;
       title = `${ai} 可能在等你回复`;
-      summary = `${localTime(record.modelWaiting.evidenceAt, now)}答完后留下了一个需要你回复的问题。`;
+      summary = `${localTime(record.modelWaiting.evidenceAt, now)} 答完后留下了一个需要你回复的问题。`;
       action = requestedAction(last, record.project);
     } else if (record.status === '疑似跑偏' && record.drift) {
       kind = 'drift';
@@ -175,9 +175,11 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const ai = affected ? `${basename(affected.project)} 的 ${toolNames[health.source]}` : `${toolNames[health.source]}（项目和会话暂时无法辨认）`;
     const mismatch = health.errors.some(error => /推送与已读取会话对不上/.test(error));
     const since = localTime((kind === 'blind' ? health.since : health.fileFailureSince) ?? now, now);
-    const what = mismatch ? `从${since}起，这个会话的报信和记录没能核对上，暂时不能确认它现在在做什么；其他会话继续检测。`
-      : kind === 'blind' ? `从${since}起，暂时读不了${affected ? '这个会话的记录' : `${toolNames[health.source]} 的会话记录`}，当前进度不能确认；其他工具继续检测。`
-        : `从${since}起发现 ${failures!.count} 份会话读不了；其余会话照常判断和显示。`;
+    const scope = health.source === 'inbox' ? '所有 AI 工具会话的当前状态都暂时不能确认；loop 仍继续检测。'
+      : `${toolNames[health.source]} 的所有会话当前状态都暂时不能确认；其他工具继续检测。`;
+    const what = mismatch ? `从 ${since} 起，这个会话的报信和记录没能核对上；${scope}`
+      : kind === 'blind' ? `从 ${since} 起，暂时读不了${affected ? '这个会话的记录' : `${toolNames[health.source]} 的会话记录`}；${scope}`
+        : `从 ${since} 起发现 ${failures!.count} 份会话读不了；其余会话照常判断和显示。`;
     const command = affected && health.source !== 'inbox'
       ? health.source === 'loop' && 'originals' in affected ? `open ${shellQuote(affected.originals[0]!.path)}`
         : health.source !== 'loop' ? `${shellQuote(config.commands[health.source])} ${health.source === 'cc' ? '--resume' : health.source === 'codex' ? 'resume' : '--session'} ${shellQuote(affected.sessionId)}` : '暂时无法定位总结，请打开 loop 检查。'
@@ -185,7 +187,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const content: NoticeContent = {
       title: kind === 'blind' ? `${affected ? ai : toolNames[health.source]} 的盯防看不见了`
         : `${affected ? ai : toolNames[health.source]} 有 ${failures!.count} 份会话读不了`,
-      summary: firstScreen(`${ai}：${compact(humanText(intent ?? '任务意图暂未记录', affected?.project ?? '', now), 140)}`,
+      summary: firstScreen(`${ai}：${compact(humanText(intent ?? '意图不明', affected?.project ?? '', now), 140)}`,
         what, affected ? '请回去看看这个会话是否仍在工作；若工作正常，可以回「误报」，我会记下。' : '请检查这个工具的会话记录是否能正常打开；若工具工作正常，可以回「误报」。'),
       returnCommand: command,
       evidence: {

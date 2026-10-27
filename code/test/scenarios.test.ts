@@ -98,7 +98,7 @@ test('A3 协调场景：Codex 看不见，Claude Code 正常显示已完成', op
   assert.equal(notice?.tool, 'codex');
   assert.match(notice!.content.title, /Codex.*看不见了/);
   assert.equal(notice!.at, '2026-10-20T12:00:00.000Z');
-  assert.match(notice!.content.summary, /从今天上午 08:00起/);
+  assert.match(notice!.content.summary, /从 今天上午 08:00 起/);
   assert.doesNotMatch(notice!.content.summary, /\d{4}-\d\d-\d\dT/);
   assert.match(s.overview(), /Claude Code.*已完成/);
 });

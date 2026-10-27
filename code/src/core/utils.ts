@@ -115,8 +115,15 @@ export function observeCwd(record: SessionRecord, cwd: unknown): void {
   const history = record.cwdHistory[0]!;
   if (!history.cwds.includes(cwd)) history.cwds.push(cwd);
 }
+/** 媒体块已由 contentText 排除；再跳过工具写进 text 的图片/附件占位，保留同条消息里的真人文字。 */
+export function intentText(text: string): string {
+  return text.replace(/!\[[^\]\r\n]*\]\([^\r\n)]*\)/g, '')
+    .replace(/\[(?:image|attachment|file|attached\s+(?:image|file)|图片|截图|附件)(?:\s*:[^\]\r\n]*|\s*：[^\]\r\n]*|\s*#?\d+)?\]/gi, '').trim();
+}
 export function addIntent(record: SessionRecord, text: string): void {
-  const bounded = truncateText(text, 1000);
+  const meaningful = intentText(text);
+  if (!meaningful) return;
+  const bounded = truncateText(meaningful, 1000);
   if (record.intent.initial === null) record.intent.initial = bounded;
   else record.intent.additions.push(bounded);
 }
