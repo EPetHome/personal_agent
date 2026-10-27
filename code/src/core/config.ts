@@ -2,6 +2,7 @@ import { readFile, realpath, lstat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { object, requiredString } from './utils.ts';
 import { tools } from './types.ts';
+import { OperationFailure } from './failures.ts';
 import type { Config } from './types.ts';
 
 function absolute(value: unknown, label: string): string {
@@ -107,5 +108,5 @@ export async function loadConfig(path: string | undefined): Promise<Config> {
 }
 export async function assertRegularFile(path: string): Promise<void> {
   const stat = await lstat(path);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new Error(`拒绝访问非普通文件或链接：${path}`);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new OperationFailure('unsafe_file', `拒绝访问非普通文件或链接：${path}`);
 }

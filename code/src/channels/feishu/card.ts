@@ -14,7 +14,7 @@ export function noticeCard(notice: Notice) {
   const elements: unknown[] = [markdown(notice.content.summary), markdown(`回去看：\n${notice.content.returnCommand}`)];
   if (!['weekly', 'recurrence', 'service_restart'].includes(notice.kind)) elements.push(buttons(['正确', '误报'].map(verdict => button(verdict, { action: 'feedback', verdict, noticeId: notice.id }))));
   for (const item of notice.reviews ?? []) {
-    elements.push(markdown(item.title));
+    if (!notice.content.summary.includes(item.title) && notice.content.title !== item.title) elements.push(markdown(item.title));
     if (item.experienceRevision) elements.push(buttons([button('同意', { action: 'agree', experienceId: item.experienceId, experienceRevision: item.experienceRevision }), button('改一下', { action: 'revise', experienceId: item.experienceId, experienceRevision: item.experienceRevision })]));
     else elements.push(markdown('这份复盘未绑定审阅版本，请查看最新复盘或用本机 experience 命令确认。'));
   }

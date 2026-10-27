@@ -1,5 +1,4 @@
-import { join } from 'node:path';
-import { appendJsonl, readOutbox } from '../../core/store.ts';
+import { appendOutbox, readOutbox } from '../../core/store.ts';
 import { receiveFeedback } from '../../core/feedback.ts';
 import type { Channel, Notice } from '../../core/types.ts';
 
@@ -11,7 +10,7 @@ export function fileChannel(dataDir: string): Channel {
     async send(notice: Notice) {
       known ??= new Set((await readOutbox(dataDir)).map(row => row.id));
       if (!known.has(notice.id)) {
-        await appendJsonl(join(dataDir, 'outbox.jsonl'), [notice]);
+        await appendOutbox(dataDir, notice);
         known.add(notice.id);
       }
     },

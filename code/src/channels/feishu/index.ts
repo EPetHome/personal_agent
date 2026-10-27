@@ -3,6 +3,7 @@ import { noticeCard } from './card.ts';
 import { feishuFailure, realTransport, safeFeishuFailure } from './transport.ts';
 import type { FeishuTransport } from './transport.ts';
 import { receiveFeedback } from '../../core/feedback.ts';
+import { safeProcessingFailure } from '../../core/failures.ts';
 import { changeExperience } from '../../core/learning.ts';
 import { event } from '../../core/events.ts';
 import { withNamedLock } from '../../core/locks.ts';
@@ -17,7 +18,7 @@ export interface Incoming {
 }
 interface Receipt {
   id: string; at: string; status?: 'processed' | 'failed'; category?: string;
-  response?: string; reply?: 'sent' | 'pending'; timeNote?: string;
+  response?: string; reply?: 'sent' | 'pending'; replyCategory?: 'reply_delivery'; timeNote?: string;
 }
 class IncomingFailure extends Error {
   readonly category: string;
@@ -123,9 +124,11 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
     desiredConnection = { state, ...(input.failure ? { failure: feishuFailure(input.failure.category) } : {}) };
     return flushConnection();
   }
+  const readSent = () => withNamedLock(dir, '.feishu-sent.lock', () => readJsonl<SentMessage>(sentPath), 30000);
   async function send(type: 'interactive' | 'text', content: unknown, key: string, noticeId?: string) {
-    await withNamedLock(dir, '.feishu-send.lock', async () => {
-      const history = await readJsonl<SentMessage>(sentPath);
+    // 卡片 API 慢时，反馈确认不排在它后面；共享映射仅在落盘时短锁保护。
+    await withNamedLock(dir, type === 'text' ? '.feishu-reply-send.lock' : '.feishu-send.lock', async () => {
+      const history = await readSent();
       if (history.some(row => row.key === key)) return;
       const requestKey = hash(key);
       let messageId: string;
@@ -136,12 +139,15 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
         catch { throw new Error('飞书投递失败或超时（凭证不输出）'); }
         finally { clearTimeout(timer); }
       }
-      await appendJsonl(sentPath, [{ key, messageId, at: new Date().toISOString(), type, ...(noticeId ? { noticeId } : {}), ...(options!.mode === 'fake' ? { content } : {}) } satisfies SentMessage]);
+      await withNamedLock(dir, '.feishu-sent.lock', async () => {
+        await readJsonl(sentPath);
+        await appendJsonl(sentPath, [{ key, messageId, at: new Date().toISOString(), type, ...(noticeId ? { noticeId } : {}), ...(options!.mode === 'fake' ? { content } : {}) } satisfies SentMessage]);
+      }, 30000);
     });
   }
   async function handle(input: Incoming) {
     if (input.actor !== options!.receiverId || (input.type === 'text' && input.chatType !== 'p2p')) return;
-    const sent = await readJsonl<SentMessage>(sentPath);
+    const sent = await readSent();
     const mapped = sent.find(row => row.messageId === (input.type === 'action' ? input.messageId : input.ref));
     let response = '已记下';
     if (input.type === 'action') {
@@ -208,8 +214,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
             const at = now ?? new Date().toISOString();
             try { receipt = { id: input.id, at, status: 'processed', response: await handle(input) }; }
             catch (error) {
-              const category = error instanceof IncomingFailure ? error.category : 'processing';
-              const reason = error instanceof IncomingFailure ? error.message : '记录暂时写不进去，请稍后重新发一条。';
+              const { category, reason } = error instanceof IncomingFailure ? { category: error.category, reason: error.message } : safeProcessingFailure(error);
               receipt = { id: input.id, at, status: 'failed', category, response: `这条没处理成，原因：${reason}` };
             }
             if (input.timeNote) receipt.timeNote = input.timeNote;
@@ -224,7 +229,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
             receipt = { ...receipt, reply: 'sent' };
             await appendJsonl(receiptsPath, [{ id: input.id, at: now ?? new Date().toISOString(), reply: 'sent' }]);
           } catch {
-            if (receipt.reply !== 'pending') await appendJsonl(receiptsPath, [{ id: input.id, at: now ?? new Date().toISOString(), reply: 'pending', category: 'reply_delivery' }]);
+            if (receipt.reply !== 'pending') await appendJsonl(receiptsPath, [{ id: input.id, at: now ?? new Date().toISOString(), reply: 'pending', replyCategory: 'reply_delivery' }]);
             receipt = { ...receipt, reply: 'pending' };
           }
           receipts.set(input.id, receipt);

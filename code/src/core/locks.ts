@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, readdir, rmdir, unlink, writeFile } from 'node:
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { OperationFailure } from './failures.ts';
 
 /** 只恢复带本程序 owner 的锁，且须由内核确认原 PID 已退出。未知/活锁绝不清。 */
 export async function recoverDeadLock(dataDir: string, name: string): Promise<void> {
@@ -32,9 +33,9 @@ export async function acquireLock(dataDir: string, name: string, waitMs = 0): Pr
     try { await mkdir(path, { mode: 0o700 }); break; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (waitMs <= 0) throw new Error(`数据目录正被占用：${path}；未知锁须确认没有相关进程后人工恢复`);
+      if (waitMs <= 0) throw new OperationFailure('lock_busy', `数据目录正被占用：${path}；未知锁须确认没有相关进程后人工恢复`);
       const remaining = deadline - performance.now();
-      if (remaining <= 0) throw new Error('值班程序还没忙完，这次反馈尚未记下，请稍后再试。');
+      if (remaining <= 0) throw new OperationFailure('lock_timeout', '记录文件正忙，这次反馈尚未记下，请检查本机服务后再试。');
       // 只等，不删除/猜测锁的主人；也不重试已经开始写入的操作。
       await delay(Math.min(50, remaining));
     }
@@ -48,7 +49,7 @@ export async function acquireLock(dataDir: string, name: string, waitMs = 0): Pr
     await unlink(owner); await rmdir(path);
   };
 }
-export async function withNamedLock<T>(dataDir: string, name: string, operation: () => Promise<T>): Promise<T> {
-  const release = await acquireLock(dataDir, name);
+export async function withNamedLock<T>(dataDir: string, name: string, operation: () => Promise<T>, waitMs = 0): Promise<T> {
+  const release = await acquireLock(dataDir, name, waitMs);
   try { return await operation(); } finally { await release(); }
 }

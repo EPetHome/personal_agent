@@ -70,7 +70,7 @@ test('飞书 A5：单个Codex报信核对失败写清项目/会话/影响，只�
   assert.match(notice.content.title, /shop 的 Codex/);
   const body = front(await sent(f.config.dataDir, notice.id)); assertLayout(body);
   assert.match(body, /谁：shop 的 Codex：检查商品缓存/);
-  assert.match(body, /这个会话.*其他会话继续检测/); assert.match(body, /要不要你管：请回去看看/);
+  assert.match(body, /这个会话.*Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/); assert.match(body, /要不要你管：请回去看看/);
   assert.match(notice.content.returnCommand, /resume synthetic-codex-session$/);
   assert.ok(!notice.content.returnCommand.includes(f.config.sources.codex)); assert.ok(!body.includes(f.config.dataDir));
   assert.match(notice.content.evidence.reason, /第 1 行推送与已读取会话对不上/);

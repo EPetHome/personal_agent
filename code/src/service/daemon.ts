@@ -5,7 +5,7 @@ import { detect, publishNotices } from '../core/agent.ts';
 import { validateConfig } from '../core/config.ts';
 import { acquireLock, recoverDeadLock } from '../core/locks.ts';
 import { agentNotice } from '../core/learning.ts';
-import { appendJsonl, readJsonl } from '../core/store.ts';
+import { appendJsonl, measureStoreLocks, readJsonl } from '../core/store.ts';
 import { firstScreen } from '../core/notice-text.ts';
 import { renderNotice } from '../core/judge.ts';
 import type { Channel, Config } from '../core/types.ts';
@@ -37,7 +37,7 @@ export async function runService(configInput: Config, signal: AbortSignal, compo
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
   try {
-    for (const name of ['.detect.lock', '.model.lock', '.learning.lock', '.feishu-send.lock', '.feishu-receive.lock', '.feishu-inbound.lock']) await recoverDeadLock(dir, name);
+    for (const name of ['.detect.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock']) await recoverDeadLock(dir, name);
     const history = await readJsonl<RunEvent>(runsPath);
     const at = new Date().toISOString();
     await appendJsonl(runsPath, [{ kind: 'start', at, runId, pid: process.pid } satisfies RunEvent]);
@@ -67,12 +67,16 @@ export async function runService(configInput: Config, signal: AbortSignal, compo
     // 为异步轮询安装拒绝处理器，错误由下面 await 统一处理，不留 unhandled rejection。
     void poll.catch(() => shutdown.abort());
     while (!shutdown.signal.aborted) {
-      const began = Date.now();
+      const began = performance.now(), timing = { heldMs: 0 };
+      let kind = 'scan_completed', result: Record<string, unknown>;
       try {
-        const view = await detect(config, new Date().toISOString(), { channels });
-        await log('scan_completed', { noticesAdded: view.noticesAdded });
-      } catch { await log('scan_failed', { message: '检测未完成，保留事实与现场；下轮重试' }); }
-      await pause(Math.max(1, interval - (Date.now() - began)), shutdown.signal);
+        const view = await measureStoreLocks(() => detect(config, new Date().toISOString(), { channels }), timing);
+        result = { noticesAdded: view.noticesAdded };
+      } catch {
+        kind = 'scan_failed'; result = { message: '检测未完成，保留事实与现场；下轮重试' };
+      }
+      await log(kind, { ...result, durationMs: Math.round(performance.now() - began), storeLockHeldMs: Math.round(timing.heldMs) });
+      await pause(Math.max(1, interval - (performance.now() - began)), shutdown.signal);
     }
     await poll;
     normalExit = true;

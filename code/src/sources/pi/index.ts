@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString, truncateText } from '../../core/utils.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, requiredString, truncateText } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
@@ -16,7 +16,7 @@ function node(row: JsonObject): JsonObject {
   const message = row.message;
   if (message?.role === 'user') {
     const text = contentText(message.content);
-    result.message = { role: 'user', content: truncateText(text, 1000), human: isHuman(text, row, message) };
+    result.message = { role: 'user', content: truncateText(intentText(text), 1000), human: isHuman(text, row, message) };
   } else if (message?.role === 'assistant') {
     const blocks: JsonObject[] = [];
     const text = contentText(message.content);
