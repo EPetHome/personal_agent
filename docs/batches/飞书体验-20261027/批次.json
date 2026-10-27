@@ -1,0 +1,12 @@
+{
+  "name": "飞书体验-20261027",
+  "branch": "fix/飞书体验",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "飞书体验": {
+      "prompt": "../../prompt/提示词-飞书体验.md",
+      "scope": { "allow": ["code/", "docs/batches/飞书体验-20261027/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["飞书体验"]]
+}
