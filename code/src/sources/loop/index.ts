@@ -61,7 +61,7 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   const record = emptyRecord('loop', sessionId ?? basename(original.path, '.md'), actualProject, at, original);
   record.type = 'loop_run';
   const reviews = Number(counts[1]);
-  record.loop = { status, conclusion: actualConclusion, reviews, repairs: Number(counts[2]), needs, needsProvided: true,
+  record.loop = { status, conclusion: actualConclusion, ...(lastConclusion ? { summary: compact(lastConclusion.replace(/^结论[：:]\s*/, ''), 600) } : {}), reviews, repairs: Number(counts[2]), needs, needsProvided: true,
     ...(batch ? { batch } : {}), phase: phase ?? (status === '完成' ? '已完成' : /需返修|不通过/.test(lastConclusion) || !reviews ? '开发' : /通过/.test(lastConclusion) ? '验收' : `评审第 ${reviews + 1} 轮`),
     sessions: { development: record.sessionId, review: reviewSession ?? `autoreview-rev-${record.sessionId}`,
       acceptance: [...acceptanceSessions, `autoreview-acc-${record.sessionId}`, `autoreview-acc-strong-${record.sessionId}`] },

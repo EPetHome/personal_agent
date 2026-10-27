@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
+import { addIntent, addReply, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
@@ -33,7 +33,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
       const human = isHuman(textContent, row, message) && (row.origin?.kind === 'human'
         || (row.origin === undefined && !intentText(textContent).trimStart().startsWith('<')));
       if (human) {
-        addIntent(record, textContent);
+        addIntent(record, textContent, at);
         record.assistantFinished = false;
         record.sessionEnded = false;
       }
@@ -54,7 +54,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
       }
       if (textContent) {
         addStep(record, { at, text: compact(textContent) });
-        record.assistantReply = { at, text: replyExcerpt(textContent) };
+        addReply(record, { at, text: replyExcerpt(textContent) });
       }
       record.assistantFinished = message.stop_reason === 'end_turn' && !blocks.some(b => b.type === 'tool_use');
     }

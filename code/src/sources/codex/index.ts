@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString, withoutInjectedContext } from '../../core/utils.ts';
+import { addIntent, addReply, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, observeCwd, requiredString, withoutInjectedContext } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
@@ -46,7 +46,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message) });
       const actualPhase = phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
       record.assistantFinished = actualPhase !== 'commentary';
-      if (message) record.assistantReply = { at, text: replyExcerpt(message) };
+      if (message) addReply(record, { at, text: replyExcerpt(message) });
       lastAgent = { text: message, phase: actualPhase };
     }
     for (const row of rows) {
@@ -66,7 +66,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
         if (item.type === 'UserMessage') {
           const userText = humanMessage(item, row);
           if (userText !== null) {
-            addIntent(record, userText);
+            addIntent(record, userText, at);
             turnCompleted = false;
             record.assistantFinished = false;
             record.sessionEnded = false;
@@ -96,7 +96,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           if (!hasNewUsers) {
             const userText = humanMessage(p, row);
             if (userText !== null) {
-              addIntent(record, userText);
+              addIntent(record, userText, at);
               turnCompleted = false;
               record.assistantFinished = false;
               record.sessionEnded = false;
@@ -113,7 +113,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           pending.clear();
           if (typeof p.last_agent_message === 'string') {
             addStep(record, { at, text: compact(p.last_agent_message) });
-            record.assistantReply = { at, text: replyExcerpt(p.last_agent_message) };
+            addReply(record, { at, text: replyExcerpt(p.last_agent_message) });
           }
         } else if (p.type === 'session_end') record.sessionEnded = true;
         else if (p.type === 'turn_aborted') {

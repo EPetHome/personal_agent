@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, requiredString, truncateText } from '../../core/utils.ts';
+import { addIntent, addReply, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, intentText, isHuman, iso, jsonLines, requiredString, truncateText } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
@@ -95,7 +95,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     const at = iso(row.timestamp);
     record.lastActivityAt = at > record.lastActivityAt ? at : record.lastActivityAt;
     if (message.role === 'user') {
-      if (message.human) addIntent(record, message.content);
+      if (message.human) addIntent(record, message.content, at);
       record.assistantFinished = false;
       record.sessionEnded = false;
     } else if (message.role === 'assistant') {
@@ -111,7 +111,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       const text = contentText(message.content);
       if (text) {
         addStep(record, { at, text: compact(text) });
-        record.assistantReply = { at, text };
+        addReply(record, { at, text });
       }
       record.assistantFinished = message.stopReason === 'stop' && !message.content.some((b: JsonObject) => b.type === 'toolCall');
     } else {

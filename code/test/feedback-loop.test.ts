@@ -200,7 +200,7 @@ for (const first of ['合入。', '[Image: source: /synthetic/screenshot.png]'])
   f.config.localChannel = { executable, timeoutMs: 5000 };
   const situation = '给商品列表加缓存：接口层已改完，卡在旧缓存怎么处理', action = '请确认旧缓存是保留还是删除';
   let calls = 0;
-  await detect(f.config, now, { judge: { async judge(request) { calls++; return { answer: request.task === 'waiting' ? '是' : '否', reason: 'SYNTHETIC_PRIVATE_REASON', situation, action }; } } });
+  await detect(f.config, now, { judge: { async judge(request) { calls++; return { answer: request.task === 'waiting' ? '是' : '否', reason: 'SYNTHETIC_PRIVATE_REASON', situation, action, actionType: '做个决定' }; } } });
   assert.equal(calls, 2, '写卡片不能额外调用模型');
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
   assert.equal(notice.content.situation, situation); assert.equal(notice.content.action, action);
@@ -393,7 +393,9 @@ test('A9：loop交代有项目/批次/结论、还欠3项，验收原文只在�
   const result = validateJudgment({ answer: '是', reason: '构造', situation: '任务概述'.repeat(50), action: '需要动作'.repeat(50) }, request);
   const content = { ...notice.content, situation: result.situation!, action: result.action! };
   const card = noticeCard({ ...notice, content });
-  for (const block of card.body.elements.slice(0, 2) as { content: string }[]) assert.ok([...block.content].length < 80);
+  const blocks = card.body.elements.slice(0, 2) as { content: string }[];
+  assert.ok([...blocks[0]!.content].length < 112, '这件事按D32放宽到约100字');
+  assert.ok([...blocks[1]!.content].length < 80, '要你做保持原限长');
   assert.match(judgmentPrompt(request), /situation.*action/);
 });
 

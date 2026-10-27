@@ -50,6 +50,12 @@ export interface JudgmentRequest {
   task: JudgmentTask;
   context: JudgmentContext;
   format: 'binary' | 'confidence';
+  /** 等待起草只读这四项；跑偏正常检测用下方按步骤对齐的材料。 */
+  snapshotInput?: TaskSnapshotInput;
+  /** 跑偏同一次调用先选核验步骤，再仅用该索引的四项材料起草；最多8项。 */
+  snapshotInputsByStep?: TaskSnapshotInput[];
+  /** 已发卡片后的原判断失败重试，不再起草或改旧文案。 */
+  draftSnapshot?: boolean;
 }
 export interface JudgmentResult {
   answer: '是' | '否';
@@ -59,10 +65,26 @@ export interface JudgmentResult {
   /** 与本次判断同一次调用顺带起草；缺失/不可用时规则兜底。 */
   situation?: string;
   action?: string;
+  actionType?: TaskActionType;
   confidence?: '高' | '中' | '低';
 }
+export type TaskActionType = '回答问题' | '做个决定' | '去看一眼' | '不用管';
+export interface TaskSnapshotInput {
+  goal: string | null;
+  currentTask: string | null;
+  lastOutput: string;
+  factualStatus: '在等你' | '跑偏' | '停滞' | 'loop 完成' | 'loop 暂停' | '看不见了';
+}
+export interface TaskSnapshotDraft {
+  situation: string;
+  action: string;
+  actionType: TaskActionType;
+}
+export interface TaskSnapshot extends TaskSnapshotInput, TaskSnapshotDraft { source: '模型' | '规则' }
 export interface Judge {
   judge(request: JudgmentRequest, options?: { signal?: AbortSignal }): Promise<JudgmentResult>;
+  /** 替身省略此方法即只做规则兜底，不偷偷调用真实模型。 */
+  writeSnapshot?(input: TaskSnapshotInput, options?: { signal?: AbortSignal }): Promise<TaskSnapshotDraft>;
 }
 export interface ModelCheck {
   key: string;
@@ -75,15 +97,25 @@ export interface ModelCheck {
   stepIds: string[];
   summary: string;
   result?: JudgmentResult;
+  snapshot?: TaskSnapshot;
+  /** 区分旧版判断，升级不重试已交代的旧事实。 */
+  snapshotVersion?: 1;
   error?: '调用失败，仅规则判断' | '每日额度用完，仅规则判断' | '本轮模型时限用完，仅规则判断';
   failure?: { category: import('./process.ts').FailureCategory; detail: string };
 }
 export interface ModelFinding extends ModelCheck { result: JudgmentResult }
 export interface Original { path: string; fingerprint: string }
-export interface Step { at: string; text: string }
+export interface Step {
+  at: string;
+  text: string;
+  /** 仅有界的最近8步保存当时要求索引，不复制正文，也不送入判断步骤。 */
+  requestRef?: RequestRef | null;
+}
 export interface PendingTool extends Step { id: string }
 export interface LoopFacts {
   conclusion: string;
+  /** 最后总结结论，只用于快照，不参与旧版事实去重。 */
+  summary?: string;
   status: '完成' | '暂停' | '进行中';
   reviews: number;
   repairs: number;
@@ -92,6 +124,14 @@ export interface LoopFacts {
   batch?: string;
   phase?: string;
   sessions?: { development: string; review: string; acceptance: string[] };
+}
+/** 指向已有 intent 字符串；只加固定数量的时间/索引，不复制真人要求正文。 */
+export interface RequestRef { index: number; at: string; sessionId?: string }
+export interface RequestRefs {
+  goal: RequestRef | null;
+  latest: RequestRef | null;
+  beforeStep: RequestRef | null;
+  beforeReply: RequestRef | null;
 }
 /** 来源组件和后续步骤唯一的会话交换格式。不保存整份会话/工具返回正文。 */
 export interface SessionRecord {
@@ -104,6 +144,7 @@ export interface SessionRecord {
   /** 每份原件实际出现过的目录；只用于推送对账，不改变起始项目。旧记录可省略。 */
   cwdHistory?: { path: string; cwds: string[] }[];
   intent: { initial: string | null; additions: string[] };
+  requestRefs?: RequestRefs;
   lastActivityAt: string;
   recentSteps: Step[];
   pendingTools: PendingTool[];
@@ -218,6 +259,7 @@ export interface Notice {
   evidenceAt?: string;
   /** 健康提醒能定位会话时的反馈作用域；未知会话不得压住整个来源。 */
   feedbackScope?: string;
+  snapshot?: TaskSnapshot;
   content: NoticeContent;
   text: string;
   reviews?: ReviewItem[];
@@ -247,13 +289,16 @@ export type EventPayload =
   | { kind: 'notice_planned'; notice: Notice }
   | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string }
   | { kind: 'notices_delivered'; ids: string[] }
-  | { kind: 'model_call_started'; task: JudgmentTask | 'attribution' | 'same_problem'; key: string }
+  | { kind: 'model_call_started'; task: JudgmentTask | 'snapshot' | 'attribution' | 'same_problem'; key: string }
+  | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot }
   | { kind: 'model_checked'; check: ModelCheck }
   | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean }
   | { kind: 'feishu_connection'; connection: FeishuConnection };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
 export interface Projection {
   sessions: Map<string, SessionRecord>;
+  /** 内存中的最后可见事实，供读取故障卡片使用，不复活成当前正常会话。 */
+  snapshotSessions?: ReadonlyMap<string, SessionRecord>;
   seenSessions: Set<string>;
   feishuConnection?: FeishuConnection & { at: string };
   pushes: ValidatedPushRecord[];
@@ -266,6 +311,7 @@ export interface Projection {
   modelChecks: Map<string, ModelCheck>;
   /** 所有历史证据的判断索引；由旧/新事件重建，不改写日志。 */
   modelEvidence: Map<string, ModelCheck>;
+  noticeSnapshots: Map<string, TaskSnapshot>;
   /** 从只追加反馈现算，非事件事实，也不持久化为跨会话规则。 */
   feedbackSuppressions: Set<string>;
   modelCalls: Map<string, number>;
