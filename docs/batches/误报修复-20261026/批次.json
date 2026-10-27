@@ -1,0 +1,12 @@
+{
+  "name": "误报修复-20261026",
+  "branch": "fix/误报修复",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "误报修复": {
+      "prompt": "../../prompt/提示词-误报修复.md",
+      "scope": { "allow": ["code/", "docs/batches/误报修复-20261026/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["误报修复"]]
+}
