@@ -1,12 +1,13 @@
 import { basename } from 'node:path';
-import { currentTask, humanText, localTime, presentNotice, requestedAction, waitingSituation } from './notice-text.ts';
+import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { modelEvidenceKey } from './evidence.ts';
+import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
 import { toolNames } from './types.ts';
 import { membersOf, pushMatchesMember } from './sessions.ts';
-import type { Config, EventPayload, JudgedRecord, Notice, NoticeContent, Projection, PushRecord, SessionRecord } from './types.ts';
+import type { Config, EventPayload, JudgedRecord, Notice, NoticeContent, Projection, PushRecord, SessionRecord, TaskSnapshot, TaskSnapshotInput } from './types.ts';
 
 const THIRTY_MINUTES = 30 * 60 * 1000;
 const ONE_DAY = 24 * 60 * 60 * 1000;
@@ -89,6 +90,15 @@ function createNotice(tool: Notice['tool'], kind: Notice['kind'], dedupeKey: str
     text: kind === 'blind' || kind === 'unreadable' ? truncateUtf8(renderNotice(content, at, evidenceAt), 4096) : renderNotice(content, at, evidenceAt),
   };
 }
+function attachSnapshot(notice: Notice, value: TaskSnapshot, projection: Projection): Notice {
+  const snapshot = projection.noticeSnapshots.get(noticeSnapshotKey(notice)) ?? value;
+  notice.snapshot = snapshot;
+  notice.content = presentNotice({ ...notice.content, evidence: { ...notice.content.evidence,
+    presentation: { situation: snapshot.situation, action: snapshot.action } } }, snapshot.situation, snapshot.action, notice.at);
+  notice.text = notice.kind === 'blind' || notice.kind === 'unreadable'
+    ? truncateUtf8(renderNotice(notice.content, notice.at, notice.evidenceAt), 4096) : renderNotice(notice.content, notice.at, notice.evidenceAt);
+  return notice;
+}
 export function planNotices(records: JudgedRecord[], projection: Projection, config: Config, now: string, suppressed?: EventPayload[]): Notice[] {
   const candidates: Notice[] = [];
   for (const record of records) {
@@ -96,7 +106,6 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     let kind: Notice['kind'] | undefined;
     let key = '';
     let title = '';
-    let summary = '', action = '';
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
     const waitingId = record.waiting?.sessionId ?? record.modelWaiting?.sessionId ?? record.ruleWaiting?.sessionId;
     const waitingMember = waitingId ? membersOf(record).find(member => member.sessionId === waitingId) : undefined;
@@ -104,44 +113,30 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
     const last = record.loop?.phase ?? modelReply ?? record.ruleWaiting?.reply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
     const batch = record.loop ? humanText(record.loop.batch ?? '批次名暂未记录', record.project, now) : '';
-    const task = currentTask(record);
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
       // 展示用的批名/当前步骤/关联会话不改变旧版去重键，升级不能重发已交代的总结。
-      const { batch: _batch, phase: _phase, sessions: _sessions, ...facts } = record.loop;
+      const { batch: _batch, phase: _phase, sessions: _sessions, summary: _summary, ...facts } = record.loop;
       key = `${kind}:${record.key}:${hash(JSON.stringify(facts))}`;
       title = `${ai}（${batch}）${record.loop.status === '暂停' ? '停下了，需要你决定' : '做完了，给你一份交代'}`;
-      summary = `${basename(record.project)} · ${batch}：${record.loop.conclusion}`;
-      action = record.loop.needs.length ? `还欠 ${record.loop.needs.length} 项，${record.loop.status === '暂停' ? '请打开总结决定下一步' : '请有空打开总结核销'}`
-        : record.loop.status === '暂停' ? '请打开总结，决定接下来怎么做'
-          : record.loop.needsProvided === false ? '总结没写还欠什么，请有空打开确认' : '不用管，只是告诉你；还欠什么：无';
     } else if (record.status === '在等我' && record.waiting) {
       kind = 'waiting';
       key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
       const child = record.waiting.sessionId !== record.sessionId;
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-      summary = waitingSituation(record, record.waiting.detail || last);
-      action = requestedAction(record.waiting.detail || last, record.project, `请回到${child ? '子' : ''}会话确认是否授权。`);
     } else if (record.status === '在等我' && (record.modelWaiting || record.ruleWaiting)) {
       kind = 'waiting';
       const fact = record.modelWaiting ?? { ...record.ruleWaiting!, recordKey: record.key, task: 'waiting' as const };
       key = `model_waiting:${record.key}:${modelEvidenceKey(fact)}`;
       title = `${ai} 可能在等你回复`;
-      summary = record.modelWaiting?.result.situation ?? waitingSituation(record, last);
-      action = record.modelWaiting?.result.action ?? requestedAction(last, record.project);
     } else if (record.status === '疑似跑偏' && record.drift) {
       kind = 'drift';
       key = `drift:${record.key}:${modelEvidenceKey(record.drift)}`;
       title = `${ai} 疑似跑偏`;
-      summary = record.drift.result.situation ?? `${task}：实际在做「${record.drift.result.stepQuote}」，可能偏离要求`;
-      action = record.drift.result.action ?? '请回到会话核对是否偏离要求';
     } else if (record.status === '停滞') {
       kind = 'stalled';
       key = `stalled:${record.key}`;
       title = `${ai}${record.loop ? `（${batch}）` : ''} 干到一半没动静了`;
-      const minutes = Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000);
-      summary = `${record.loop ? `${basename(record.project)} · ${batch}` : task}：最后在做 ${compact(last, 100)}，已 ${minutes} 分钟没动静`;
-      action = '请有空回去看看是否卡住；这里只提醒，不会替你启动或停止它。';
     }
     if (!kind) continue;
     const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
@@ -163,7 +158,8 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       if (projection.suppressedNotices.get(key) !== evidenceAt) suppressed?.push({ kind: 'notice_suppressed', dedupeKey: key, evidenceAt });
       continue;
     }
-    const content = presentNotice({
+    if (already) { record.notice = projection.deliveredNoticeIds.has(existing.id) ? '已提醒，本轮去重' : '待写发件记录'; continue; }
+    const content: NoticeContent = {
       title, summary: '', returnCommand: returnCommand(record, config, waitingId),
       evidence: {
         project: waitingMember?.project ?? record.project, intentOriginal: record.intent.initial,
@@ -172,11 +168,23 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
         assistantReply: modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text,
         ...(record.loop ? { needs: record.loop.needs, needsProvided: record.loop.needsProvided } : {}),
       },
-    }, summary, action, now);
+    };
     const notice = createNotice(record.tool, kind, key, now, content, record.key, evidenceAt);
+    const finding = record.modelWaiting ?? record.drift;
+    const factualStatus: TaskSnapshotInput['factualStatus'] = kind === 'waiting' ? '在等你' : kind === 'drift' ? '跑偏'
+      : kind === 'stalled' ? '停滞' : kind === 'loop_paused' ? 'loop 暂停' : 'loop 完成';
+    const lastOutput = record.loop && kind !== 'stalled'
+      ? `${basename(record.project)} · ${batch}：${record.loop.conclusion}${record.loop.summary ? `；${record.loop.summary}` : ''}；还欠 ${record.loop.needs.length} 项${record.loop.needsProvided === false ? '；总结没写还欠什么' : ''}`
+      : kind === 'stalled' ? `${record.loop ? `${basename(record.project)} · ${batch}，` : ''}最后在做 ${record.loop?.phase ?? record.recentSteps.at(-1)?.text ?? last}；已 ${Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000)} 分钟没动静`
+        : kind === 'drift' ? record.drift!.result.stepQuote ?? last : modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text ?? last;
+    const quotedStep = kind === 'drift' ? record.recentSteps.findLast(step => step.text.includes(record.drift!.result.stepQuote!)) : undefined;
+    const input = quotedStep ? stepSnapshotInput(record, quotedStep) : snapshotInput(record, lastOutput, factualStatus,
+      record.assistantReply && kind === 'waiting' && !record.waiting ? record.assistantReply.at : evidenceAt,
+      kind === 'waiting' && !record.waiting ? 'reply' : 'step');
+    attachSnapshot(notice, finding?.snapshot?.factualStatus === factualStatus ? finding.snapshot : ruleSnapshot(input, record.project, now), projection);
     notice.memberSessionId = memberId;
-    record.notice = projection.deliveredNoticeIds.has(existing?.id ?? notice.id) ? '已提醒，本轮去重' : '待写发件记录';
-    if (!already) candidates.push(notice);
+    record.notice = '待写发件记录';
+    candidates.push(notice);
   }
   for (const health of projection.health.values()) {
     const kind = health.since ? 'blind' : health.fileFailures?.count ? 'unreadable' : null;
@@ -193,7 +201,9 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       continue;
     }
     if (projection.notices.some(n => n.dedupeKey === key)) continue;
-    const intent = affected && ('intentOriginal' in affected ? affected.intentOriginal : 'intent' in affected ? affected.intent.initial : null);
+    const affectedRecord = affected && [...(projection.snapshotSessions ?? projection.sessions).values()].find(r => r.tool === health.source
+      && membersOf(r).some(m => m.sessionId === affected.sessionId));
+    const intent = affectedRecord?.intent.initial ?? (affected && ('intentOriginal' in affected ? affected.intentOriginal : 'intent' in affected ? affected.intent.initial : null));
     const ai = affected ? `${basename(affected.project)} 的 ${toolNames[health.source]}` : `${toolNames[health.source]}（项目和会话暂时无法辨认）`;
     const mismatch = health.errors.some(error => /推送与已读取会话对不上/.test(error));
     const since = localTime((kind === 'blind' ? health.since : health.fileFailureSince) ?? now, now);
@@ -206,7 +216,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       ? health.source === 'loop' && 'originals' in affected ? `open ${shellQuote(affected.originals[0]!.path)}`
         : health.source !== 'loop' ? `${shellQuote(config.commands[health.source])} ${health.source === 'cc' ? '--resume' : health.source === 'codex' ? 'resume' : '--session'} ${shellQuote(affected.sessionId)}` : '暂时无法定位总结，请打开 loop 检查。'
       : `暂时无法定位具体会话，请打开 ${toolNames[health.source]} 检查。`;
-    const content = presentNotice({
+    const content: NoticeContent = {
       title: kind === 'blind' ? `${affected ? ai : toolNames[health.source]} 的盯防看不见了`
         : `${affected ? ai : toolNames[health.source]} 有 ${failures!.count} 份会话读不了`,
       summary: '',
@@ -216,9 +226,14 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
         reason: [what, ...(kind === 'blind' ? health.errors.slice(0, 3) : []), ...(failures?.examples.slice(0, 3) ?? [])]
           .map(error => compact(error, 240)).join('\n'), originals: [],
       },
-    }, `${intent ? `${humanText(intent, affected?.project ?? '', now)}：` : ''}${mismatch ? '这个会话报信与记录未核对上' : kind === 'blind' ? '会话记录暂时读不了' : `${failures!.count} 份会话读不了`}；${kind === 'blind' ? scope : '其他会话继续检测'}`,
-    affected ? '请回去看看这个会话是否仍在工作；正常可回「误报」' : '请检查这个工具的会话记录是否能正常打开', now);
-    candidates.push({ ...createNotice(health.source, kind, key, now, content, undefined, (kind === 'blind' ? health.since : health.fileFailureSince) ?? now), ...(feedbackScope ? { feedbackScope } : {}) });
+    };
+    const notice = { ...createNotice(health.source, kind, key, now, content, undefined, (kind === 'blind' ? health.since : health.fileFailureSince) ?? now), ...(feedbackScope ? { feedbackScope } : {}) };
+    const seen = affectedRecord?.assistantReply?.text ?? affectedRecord?.recentSteps.at(-1)?.text;
+    const unreadable = `${mismatch ? '这个会话报信与记录未核对上' : kind === 'blind' ? '会话记录暂时读不了' : `${failures!.count} 份会话读不了`}；${kind === 'blind' ? scope : '其他会话继续检测'}`;
+    const lastOutput = [unreadable, seen ? `最后看到：${seen}` : '', what, failureDetails].filter(Boolean).join('\n');
+    const input: TaskSnapshotInput = affectedRecord ? snapshotInput(affectedRecord, lastOutput, '看不见了', notice.evidenceAt!)
+      : { goal: intent ?? null, currentTask: null, lastOutput: compact(lastOutput, 1200), factualStatus: '看不见了' };
+    candidates.push(attachSnapshot(notice, ruleSnapshot(input, affected?.project ?? '', now), projection));
   }
   return candidates;
 }

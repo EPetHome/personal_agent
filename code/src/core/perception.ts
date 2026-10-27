@@ -96,7 +96,7 @@ export async function perceive(config: Config): Promise<Perception> {
   const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set(), presentPaths: new Set(), seenSessions: [] };
   const reports = new Map<HealthSource, HealthReport>();
   const ignoredSessions = new Set<string>();
-  const activity = new Map<string, { at: string; intent: string | null }>();
+  const activity = new Map<string, { at: string; intent: string | null; record: SessionRecord | null }>();
   const summaryWrites = new Map<string, string>();
   function report(source: HealthSource): HealthReport {
     if (!reports.has(source)) reports.set(source, { source, errors: [], paths: [] });
@@ -120,7 +120,7 @@ export async function perceive(config: Config): Promise<Perception> {
         if (observed.identity) identities.push(observed.identity);
         if (!observed.error && observed.identity && observed.lastRecordAt) {
           const previous = activity.get(observed.identity.sessionId);
-          if (!previous || observed.lastRecordAt > previous.at) activity.set(observed.identity.sessionId, { at: observed.lastRecordAt, intent: observed.record?.intent.initial ?? null });
+          if (!previous || observed.lastRecordAt > previous.at) activity.set(observed.identity.sessionId, { at: observed.lastRecordAt, intent: observed.record?.intent.initial ?? null, record: observed.record });
         }
         if ((observed.identity && isInternalSession(component.tool, observed.identity.sessionId, observed.identity.project))
           || (observed.sessionIds.size && [...observed.sessionIds].every(id => isInternalSession(component.tool, id)))) { health.fileStats.total--; continue; }
@@ -172,7 +172,12 @@ export async function perceive(config: Config): Promise<Perception> {
               if (id !== sessions.review || observed.at > (summaryWrites.get(record.key) ?? summaryAt)) record.loop.phase = phase;
             }
           }
-          const intent = activity.get(sessions.development)?.intent;
+          const development = activity.get(sessions.development);
+          const intent = development?.intent;
+          if (development?.record) {
+            record.intent = development.record.intent;
+            record.requestRefs = development.record.requestRefs;
+          }
           // 总结不带批名时，只取开发任务明确写出的批名/提示词标题，不读它提到的文件。
           record.loop.batch ??= intent?.match(/批次[：:]\s*([^\n<]+)/)?.[1]?.trim()
             ?? intent?.match(/(?:提示词[-：:]\s*)([^\n<>"/]+?)(?:\.md|（|\(|\n|$)/)?.[1]?.trim();

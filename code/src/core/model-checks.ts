@@ -1,26 +1,33 @@
 import { membersOf, pushMatchesMember } from './sessions.ts';
 import { modelEvidenceKey } from './evidence.ts';
 import { requestedAction } from './notice-text.ts';
+import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
 import { compact, hash } from './utils.ts';
 import { ComponentFailure, safeFailure } from './process.ts';
-import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, Projection, SessionMember, SessionRecord } from './types.ts';
+import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, Projection, SessionMember, SessionRecord, TaskSnapshotInput } from './types.ts';
 
 const TEN_MINUTES = 10 * 60 * 1000;
 const ONE_DAY = 24 * 60 * 60 * 1000;
 const FIRST_LOOKBACK = 60 * 60 * 1000;
-interface Candidate { key: string; task: 'waiting' | 'drift'; sessionId: string; evidenceAt: string; fingerprint: string; context: JudgmentContext; stepIds: string[] }
-function stepId(step: { at: string; text: string }): string { return hash(JSON.stringify(step)); }
+interface Candidate { key: string; task: 'waiting' | 'drift'; sessionId: string; evidenceAt: string; fingerprint: string; context: JudgmentContext; stepIds: string[]; snapshotInput: TaskSnapshotInput; snapshotInputsByStep?: TaskSnapshotInput[] }
+function stepId(step: { at: string; text: string }): string { return hash(JSON.stringify({ at: step.at, text: step.text })); }
 function candidate(record: SessionRecord, member: SessionMember, task: Candidate['task'], reply: string, at: string, projection: Projection, config: Config): Candidate {
   const key = `${task}:${record.key}${task === 'waiting' ? `:${member.sessionId}` : ''}`;
   const previous = projection.modelChecks.get(key);
   const stepIds = member.recentSteps.map(stepId);
+  const newSteps = member.recentSteps.filter(step => (previous?.error === '调用失败，仅规则判断' && !previous.failure)
+    || !previous?.stepIds.includes(stepId(step))).slice(-8);
   const context = boundedContext({
     intentOriginal: record.intent.initial, additionalRequirements: record.intent.additions,
     previousSummary: previous?.summary ?? '',
-    newSteps: member.recentSteps.filter(step => (previous?.error === '调用失败，仅规则判断' && !previous.failure) || !previous?.stepIds.includes(stepId(step))), assistantReply: reply,
+    newSteps, assistantReply: reply,
   });
   return { key, task, sessionId: member.sessionId, evidenceAt: at, context, stepIds,
+    snapshotInput: snapshotInput(record, task === 'waiting' ? reply : context.newSteps.at(-1)?.text ?? member.recentSteps.at(-1)?.text ?? '',
+      task === 'waiting' ? '在等你' : '跑偏', task === 'waiting' ? member.assistantReply?.at ?? at : at, task === 'waiting' ? 'reply' : 'step'),
+    ...(task === 'drift' ? { snapshotInputsByStep: context.newSteps.map((step, index) => stepSnapshotInput(record,
+      { ...step, requestRef: newSteps[index]!.requestRef })) } : {}),
     fingerprint: hash(JSON.stringify([config.judge?.executable, config.judge?.model, record.intent, member.recentSteps, reply, at])) };
 }
 function candidates(record: JudgedRecord, projection: Projection, config: Config, now: string): Candidate[] {
@@ -42,13 +49,13 @@ function candidates(record: JudgedRecord, projection: Projection, config: Config
   return result;
 }
 const DEFERRED = '本轮模型时限用完，仅规则判断' as const;
-async function timedJudgment(judge: Judge, request: JudgmentRequest, milliseconds: number) {
+export async function timedModel<T>(call: (signal: AbortSignal) => Promise<T>, milliseconds: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => { reject(new ComponentFailure('timeout', '模型调用或本轮等待超时')); controller.abort(); }, Math.max(1, milliseconds));
   });
-  try { return await Promise.race([Promise.resolve().then(() => judge.judge(request, { signal: controller.signal })), timeout]); }
+  try { return await Promise.race([Promise.resolve().then(() => call(controller.signal)), timeout]); }
   finally { clearTimeout(timer!); }
 }
 /** 模型等待必须在数据锁外；persist 只短暂持锁，预留额度返回 false 表示当前额度已用完。 */
@@ -67,6 +74,12 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     const evidence = projection.modelEvidence.get(modelEvidenceKey({ ...item, recordKey: record.key }));
     // 同一事实已有成功的是/否答案，改提取方式、文案或模型配置都不重新花额度。
     if (evidence?.result && !evidence.error) continue;
+    // 升级抑制可看各类已交代事实；文案复用只能看本次判断的同类别。
+    const announced = projection.notices.filter(n => n.sessionKey === record.key
+      && ['waiting', 'drift', 'stalled'].includes(n.kind) && (n.memberSessionId ?? record.sessionId) === item.sessionId
+      && Date.parse(n.evidenceAt ?? '') === Date.parse(item.evidenceAt));
+    if (announced.length && evidence && evidence.snapshotVersion !== 1) continue;
+    const sameKind = announced.find(n => n.kind === item.task);
     const previous = evidence ?? projection.modelChecks.get(item.key);
     const deferred = previous?.error === DEFERRED;
     const retry = deferred || previous?.error === '调用失败，仅规则判断'
@@ -77,7 +90,7 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
       || (projection.startedAt && Date.parse(item.evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK)) continue;
     if (item.task === 'drift' && (!item.context.newSteps.length || (previous && !retry && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES))) continue;
     const check: ModelCheck = { key: item.key, recordKey: record.key, sessionId: item.sessionId, task: item.task,
-      at: now, evidenceAt: item.evidenceAt, fingerprint: item.fingerprint, stepIds: item.stepIds,
+      at: now, evidenceAt: item.evidenceAt, fingerprint: item.fingerprint, stepIds: item.stepIds, snapshotVersion: 1,
       summary: compact([...([previous?.summary ?? '', ...item.context.newSteps.map(s => s.text)].filter(Boolean).join('；'))].slice(-500).join(''), 500) };
     const used = projection.modelCalls.get(day) ?? 0;
     if (used >= config.judge.dailyLimit) check.error = '每日额度用完，仅规则判断';
@@ -90,11 +103,22 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
       check.error = '每日额度用完，仅规则判断';
     } else {
       projection.modelCalls.set(day, used + 1);
-      const request: JudgmentRequest = { task: item.task, format: 'binary', context: item.context };
+      const context = item.task === 'waiting' ? { ...item.context, intentOriginal: item.snapshotInput.goal,
+        additionalRequirements: item.snapshotInput.currentTask ? [item.snapshotInput.currentTask] : [], previousSummary: '', newSteps: [] } : item.context;
+      const request: JudgmentRequest = { task: item.task, format: 'binary', context,
+        ...(item.task === 'drift' ? { snapshotInputsByStep: item.snapshotInputsByStep } : { snapshotInput: item.snapshotInput }), draftSnapshot: !sameKind };
       try {
-        const answer = await timedJudgment(judge, request, Math.min(config.judge.timeoutMs, deadline - performance.now()));
+        const answer = await timedModel(signal => judge.judge(request, { signal }), Math.min(config.judge.timeoutMs, deadline - performance.now()));
         try { check.result = validateJudgment(answer, request); }
         catch { throw new ComponentFailure('invalid_answer', '答案缺少约定的是非或依据字段'); }
+        if (check.result.answer === '是') {
+          // validateJudgment 已核验引文；选其对应步骤/当时要求，不用末步或本轮最后活动代替。
+          const index = item.task === 'drift' ? context.newSteps.findLastIndex(step => step.text.includes(check.result!.stepQuote!)) : -1;
+          const input = item.snapshotInputsByStep?.[index] ?? item.snapshotInput;
+          check.snapshot = (sameKind?.snapshot?.factualStatus === input.factualStatus ? sameKind.snapshot : null)
+            ?? (sameKind ? null : modelSnapshot(input, check.result, record.project, now))
+            ?? ruleSnapshot(input, record.project, now);
+        }
       } catch (error) {
         check.error = '调用失败，仅规则判断'; check.failure = safeFailure(error);
       }

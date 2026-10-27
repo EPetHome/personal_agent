@@ -17,8 +17,10 @@ export function humanText(text: string, project: string, now: string): string {
   return readableLines(text, project).join('；')
     .replace(/[+]?[0-9]{4,6}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)/g, at => localTime(at, now))
     .replace(/(\d\d:\d\d)(?=[\p{L}\p{N}])/gu, '$1 ')
-    .replace(/(?:~\/|\/)[^\s，；。！？、'"<>]+/g, '相关文件')
-    .replace(/[A-Za-z0-9_.-]+\.(?:jsonl|json|[cm]?[jt]sx?|md|txt|log|lock)\b(?::\d+(?::\d+)?)?/g, '相关文件').replace(/第\s*\d+\s*行/g, '')
+    .replace(/(?:第\s*\d+\s*行|\b(?:line\s*\d+|L\d+(?:-L?\d+)?))/gi, '')
+    .replace(/(?:[A-Za-z]:\\|(?:\.{1,2}|~)?\/)[^\s，；。！？、：'"<>]+/g, '相关文件')
+    .replace(/\b[\w.-]+(?:\/[\w.-]+)+(?::\d+(?::\d+)?)?/g, '相关文件')
+    .replace(/[A-Za-z0-9_.-]+\.(?:jsonl|json|[cm]?[jt]sx?|md|txt|log|lock)\b(?::\d+(?::\d+)?)?/g, '相关文件')
     .replace(/\b(?:Read|read)[:：]?\s*/g, '查看文件：').replace(/\b(?:Edit|Write|edit|write)[:：]?\s*/g, '修改文件：').replace(/\b(?:Bash|bash)[:：]?\s*/g, '运行命令：')
     .replace(/transcript(?:_path)?/gi, '会话记录').replace(/推送/g, '报信').replace(/对账/g, '核对').replace(/来源/g, '记录');
 }
@@ -34,10 +36,12 @@ export function noticeSections(content: NoticeContent): { situation: string; act
 }
 export function presentNotice(content: NoticeContent, situation: string, action: string, now: string): NoticeContent {
   const project = content.evidence.project ?? '';
-  const short = (text: string) => compact(humanText(text, project, now).replace(/^(?:这件事|要你做)[:：]\s*/, ''), 58);
+  const short = (text: string, limit: number) => compact(humanText(text, project, now).replace(/^(?:这件事|要你做)[:：]\s*/, ''), limit);
+  const what = short(situation, 100) || '这件事暂时说不清，请回会话查看';
+  const todo = short(action, 58) || '请回到会话确认下一步';
   return { ...content, title: compact(humanText(content.title, project, now), 72),
-    situation: short(situation) || '这件事暂时说不清，请回会话查看', action: short(action) || '请回到会话确认下一步',
-    summary: firstScreen(short(situation) || '这件事暂时说不清，请回会话查看', short(action) || '请回到会话确认下一步'),
+    situation: what, action: todo,
+    summary: firstScreen(what, todo),
     evidence: { ...content.evidence, presentation: content.evidence.presentation ?? { situation, action } } };
 }
 export function noticeTimeAndReturn(notice: Notice): string {

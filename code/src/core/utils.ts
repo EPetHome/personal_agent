@@ -124,7 +124,7 @@ export function observeCwd(record: SessionRecord, cwd: unknown): void {
 }
 /** 只剥离已知 IDE/系统注入块；与意图提取共用，但不把媒体输入一起抹掉。 */
 export function withoutInjectedContext(text: string): string {
-  const tags = 'ide_opened_file|ide_selection|system-reminder|system_reminder|environment_context|environment_details|environment|editor_context|current_date|available_tools';
+  const tags = 'ide_opened_file|ide_selection|system-reminder|system_reminder|environment_context|environment_details|environment|editor_context|current_date|available_tools|file';
   return text.replace(new RegExp(`<(?:(?:${tags}))\\b[^>]*\\/\\s*>`, 'gi'), '')
     .replace(new RegExp(`<(${tags})\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>`, 'gi'), '')
     .replace(new RegExp(`<(?:${tags})\\b[^>]*>[\\s\\S]*$`, 'gi'), '');
@@ -134,15 +134,30 @@ export function intentText(text: string): string {
   return withoutInjectedContext(text).replace(/!\[[^\]\r\n]*\]\([^\r\n)]*\)/g, '')
     .replace(/\[(?:image|attachment|file|attached\s+(?:image|file)|图片|截图|附件)(?:\s*:[^\]\r\n]*|\s*：[^\]\r\n]*|\s*#?\d+)?\]/gi, '').trim();
 }
-export function addIntent(record: SessionRecord, text: string): void {
+export function meaningfulRequest(text: string): string {
+  const value = intentText(text);
+  return /^(?:合入|继续|好的?|可以|同意|收到|开始|确认|是|否|行|没问题|继续吧|你来做|开始吧|执行|提交|推送)[。.!！\s]*$/.test(value) ? '' : value;
+}
+export function addIntent(record: SessionRecord, text: string, at?: string): void {
   const meaningful = intentText(text);
   if (!meaningful) return;
   const bounded = truncateText(meaningful, 1000);
   if (record.intent.initial === null) record.intent.initial = bounded;
   else record.intent.additions.push(bounded);
+  if (at && meaningfulRequest(bounded)) {
+    const refs = record.requestRefs ??= { goal: null, latest: null, beforeStep: null, beforeReply: null };
+    const ref = { index: record.intent.additions.length, at };
+    refs.goal ??= ref;
+    refs.latest = ref;
+  }
+}
+export function addReply(record: SessionRecord, reply: { at: string; text: string }): void {
+  record.assistantReply = reply;
+  if (record.requestRefs) record.requestRefs.beforeReply = record.requestRefs.latest;
 }
 export function addStep(record: SessionRecord, step: { at: string; text: string }): void {
-  record.recentSteps.push(step);
+  if (record.requestRefs) record.requestRefs.beforeStep = record.requestRefs.latest;
+  record.recentSteps.push({ ...step, requestRef: record.requestRefs?.latest ? { ...record.requestRefs.latest, sessionId: record.sessionId } : null });
   if (record.recentSteps.length > 8) record.recentSteps.shift();
 }
 export function finishRecord(record: SessionRecord): SessionRecord {

@@ -4,6 +4,8 @@ import { accepts, configuredChannels } from '../channels/index.ts';
 import { maintain } from './maintenance.ts';
 import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
+import { checkSnapshotModels } from './snapshot-model.ts';
+import { noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
 import { event, project, pushIdentity } from './events.ts';
 import { skipAnomaly } from './health.ts';
@@ -38,6 +40,8 @@ function activeProjection(projection: Projection, config: Config): Projection {
   const waitingKeys = new Set(pushes.map(push => `waiting:${push.recordKey}:${pushIdentity(push)}`));
   return {
     ...projection, sessions, pushes,
+    snapshotSessions: new Map([...projection.sessions].filter(([, r]) => config.sources[r.tool] !== null
+      && !isIgnoredProject(r.project, config) && !isInternalSession(r.tool, r.sessionId, r.project))),
     feishuConnection: config.feishu ? projection.feishuConnection ?? { state: config.feishu.mode === 'fake' ? 'fake' : 'stopped', at: projection.lastScanAt ?? '' } : undefined,
     health: new Map([...projection.health].filter(([source]) => source === 'inbox' ? config.inboxDir !== null : config.sources[source] !== null)),
     notices: projection.notices.filter(notice => (notice.tool === 'agent' || (notice.tool === 'inbox' ? config.inboxDir !== null : config.sources[notice.tool] !== null))
@@ -74,7 +78,7 @@ function serializedState(view: Snapshot) {
   return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}) };
 }
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
-async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>) {
+async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>, deferSnapshots = false) {
   const previous = project(events);
   const raw = project([...events, ...added]);
   // 模型等待期间可能已有另一轮感知/反馈，不能用旧时间/旧会话覆盖新事实。
@@ -84,7 +88,8 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
   const suppressed: EventPayload[] = [];
-  const planned = planNotices(records, projection, config, at, suppressed);
+  const planned = planNotices(records, projection, config, at, suppressed).filter(n => !deferSnapshots || !standaloneSnapshot(n)
+    || projection.noticeSnapshots.has(noticeSnapshotKey(n)));
   for (const decision of suppressed) add(decision);
   for (const notice of planned) add({ kind: 'notice_planned', notice });
   const queued = activeProjection(project([...events, ...added]), config);
@@ -147,6 +152,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
   const channels = components.channels ?? configuredChannels(config);
   const attempted = new Set<string>();
   let modelDeadline = Infinity;
+  const deferSnapshots = !!config.judge && (!components.judge || !!components.judge.writeSnapshot);
   const finish = async (view: Snapshot & { noticesAdded: number }) => {
     for (const channel of channels) if ('drain' in channel && typeof channel.drain === 'function') await channel.drain(now);
     // 归因与普通判断共用单轮模型预算，避免常驻被两段各60秒串行拖住。
@@ -230,14 +236,17 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     }
     add({ kind: 'scan_completed' });
     // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。
-    return settle(config, events, added, now, channels, attempted);
+    return settle(config, events, added, now, channels, attempted, deferSnapshots);
   });
   if (!config.judge) return finish(ruleView);
   modelDeadline = Date.now() + (config.judge.cycleTimeoutMs ?? 60000);
   const modelView = await withModelLock(config.dataDir, async () => {
-    const projection = await withStoreLock(config.dataDir, async () => activeProjection(project(await readEvents(config.dataDir)), config));
-    const records = judgeRecords(projection, now);
-    const changed = await checkModels(records, projection, config, now, payload => withStoreLock(config.dataDir, async () => {
+    const load = () => withStoreLock(config.dataDir, async () => activeProjection(await feedbackProjection(project(await readEvents(config.dataDir)), config, now), config));
+    let projection = await load();
+    let records = judgeRecords(projection, now);
+    applyModelChecks(records, projection, config, now);
+    const pending = planNotices(records, projection, config, now);
+    const persist = (payload: EventPayload) => withStoreLock(config.dataDir, async () => {
       if (payload.kind === 'model_call_started') {
         // 短锁内按最新日志原子预留；不能拿模型阶段开始时的旧额度覆盖并发用量。
         const used = project(await readEvents(config.dataDir)).modelCalls.get(now.slice(0, 10)) ?? 0;
@@ -245,9 +254,16 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       }
       await appendJsonl(join(config.dataDir, 'events.jsonl'), [event(payload, now)]);
       return true;
-    }), components.judge);
-    if (!changed) return null;
-    return withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
+    });
+    const snapshots = await checkSnapshotModels(pending, projection, config, now, persist, components.judge, modelDeadline);
+    const early = snapshots ? await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted, true)) : null;
+    projection = await load();
+    records = judgeRecords(projection, now);
+    const remainingConfig = { ...config, judge: { ...config.judge!, cycleTimeoutMs: Math.max(0, modelDeadline - Date.now()) } };
+    const changed = await checkModels(records, projection, remainingConfig, now, persist, components.judge);
+    if (!changed) return early;
+    const final = await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
+    return { ...final, noticesAdded: (early?.noticesAdded ?? 0) + final.noticesAdded };
   });
   return finish(modelView ? { ...modelView, noticesAdded: ruleView.noticesAdded + modelView.noticesAdded } : ruleView);
 }
