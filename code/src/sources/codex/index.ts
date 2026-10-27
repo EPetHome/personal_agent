@@ -1,5 +1,6 @@
 import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
+import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 
 const events = ['user_message', 'task_started', 'agent_message', 'task_complete', 'session_end', 'turn_aborted'];
@@ -43,7 +44,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message) });
       const actualPhase = phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
       record.assistantFinished = actualPhase !== 'commentary';
-      if (message) record.assistantReply = { at, text: compact(message, 1200) };
+      if (message) record.assistantReply = { at, text: replyExcerpt(message) };
       lastAgent = { text: message, phase: actualPhase };
     }
     for (const row of rows) {
@@ -108,7 +109,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           pending.clear();
           if (typeof p.last_agent_message === 'string') {
             addStep(record, { at, text: compact(p.last_agent_message) });
-            record.assistantReply = { at, text: compact(p.last_agent_message, 1200) };
+            record.assistantReply = { at, text: replyExcerpt(p.last_agent_message) };
           }
         } else if (p.type === 'session_end') record.sessionEnded = true;
         else if (p.type === 'turn_aborted') {

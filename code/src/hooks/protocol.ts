@@ -13,6 +13,11 @@ export interface HookPayload {
   message?: string;
   last_assistant_message?: string;
 }
+/** 钩子回复统一限长：保留首尾与换行；重复处理不再截掉尾部问题。 */
+export function pushReplyExcerpt(text: string): string {
+  const chars = [...text];
+  return chars.length <= 4000 ? text : chars.slice(0, 1600).join('') + '\n…\n' + chars.slice(-2390).join('');
+}
 /** 通知专用：只读取事件参数，只向显式目录追加，不读会话、不连网。所有错误吞掉。 */
 export function emitPush(tool: HookTool, payload: HookPayload, inboxDir: string): void {
   let fd: number | undefined;
@@ -29,7 +34,7 @@ export function emitPush(tool: HookTool, payload: HookPayload, inboxDir: string)
       ? new Date(payload.at).toISOString() : new Date().toISOString();
     const detail = event === 'turn_end' ? payload.last_assistant_message ?? payload.detail ?? '' : payload.detail ?? payload.message ?? '';
     const row = { tool, event, session_id: payload.session_id, cwd: payload.cwd, transcript_path: payload.transcript_path, at,
-      detail: typeof detail === 'string' ? [...detail].slice(0, 4000).join('') : '' };
+      detail: typeof detail !== 'string' ? '' : event === 'turn_end' ? pushReplyExcerpt(detail) : [...detail].slice(0, 4000).join('') };
     mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
     const dir = lstatSync(inboxDir);
     if (!dir.isDirectory() || dir.isSymbolicLink() || !(dir.mode & 0o222)) return;

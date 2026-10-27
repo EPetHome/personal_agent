@@ -36,7 +36,7 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'channel_delivery'];
+  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'channel_delivery'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
@@ -45,6 +45,7 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
     if (row.kind === 'source_health' && !Array.isArray(row.report?.errors)) throw new Error('来源健康事件结构损坏');
     if (row.kind === 'push_observed' && !row.push?.sessionId) throw new Error('推送事件结构损坏');
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');
+    if (row.kind === 'push_deferred' && (typeof row.pushId !== 'string' || !Number.isInteger(row.rounds) || row.rounds < 1 || row.rounds > 2)) throw new Error('推送宽限事件结构损坏');
     if (row.kind === 'notice_planned' && !row.notice?.id) throw new Error('发件事件结构损坏');
     if (row.kind === 'notice_suppressed' && (typeof row.dedupeKey !== 'string' || typeof row.evidenceAt !== 'string')) throw new Error('历史提醒抑制事件结构损坏');
     if (row.kind === 'model_call_started' && (typeof row.key !== 'string' || !['drift', 'waiting', 'attribution', 'same_problem'].includes(row.task))) throw new Error('模型用量事件结构损坏');
@@ -81,8 +82,8 @@ export async function withModelLock<T>(dataDir: string, operation: () => Promise
   try { return await operation(); }
   finally { await release(); }
 }
-export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>): Promise<T> {
-  const release = await acquireLock(dataDir, '.detect.lock');
+export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>, waitMs = 0): Promise<T> {
+  const release = await acquireLock(dataDir, '.detect.lock', waitMs);
   try {
     for (const name of ['events.jsonl', 'outbox.jsonl', 'feedback.jsonl']) {
       const path = join(dataDir, name);

@@ -1,6 +1,7 @@
 import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 import type { JsonObject } from '../../core/utils.ts';
+import { replyExcerpt } from '../../core/notice-text.ts';
 
 function identifyRow(row: JsonObject): SessionIdentity | null {
   return ['user', 'assistant'].includes(row.type) && row.isSidechain !== true
@@ -53,7 +54,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
       }
       if (textContent) {
         addStep(record, { at, text: compact(textContent) });
-        record.assistantReply = { at, text: compact(textContent, 1200) };
+        record.assistantReply = { at, text: replyExcerpt(textContent) };
       }
       record.assistantFinished = message.stop_reason === 'end_turn' && !blocks.some(b => b.type === 'tool_use');
     }

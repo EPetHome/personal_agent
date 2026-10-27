@@ -22,6 +22,8 @@ export interface Perception {
   failedSessions: FailedSessionIdentity[];
   /** 本轮读取/归并失败的原件或目录，供推送保守隔离；只在内存中使用。 */
   failedPaths: Set<string>;
+  /** 已列到但尚无会话内容的文件，与真正解析失败分开，推送对账有界等待。 */
+  unwrittenPaths: Set<string>;
 }
 function permissionDenied(error: unknown): boolean {
   return ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '');
@@ -88,7 +90,7 @@ function parsePush(value: unknown, path: string, line: number, fingerprint: stri
   };
 }
 export async function perceive(config: Config): Promise<Perception> {
-  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set() };
+  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set() };
   const reports = new Map<HealthSource, HealthReport>();
   const ignoredSessions = new Set<string>();
   function report(source: HealthSource): HealthReport {
@@ -114,6 +116,7 @@ export async function perceive(config: Config): Promise<Perception> {
           health.fileStats.skipped++;
           // 空/非会话记录不能给推送对账，也不能把过去已知子任务误当完成。
           result.failedPaths.add(`${component.tool}:${path}`);
+          result.unwrittenPaths.add(`${component.tool}:${path}`);
         }
       } catch (error) {
         if (component.tool === 'loop' && permissionDenied(error)) continue;

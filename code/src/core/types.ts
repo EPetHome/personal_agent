@@ -68,6 +68,7 @@ export interface ModelCheck {
   summary: string;
   result?: JudgmentResult;
   error?: '调用失败，仅规则判断' | '每日额度用完，仅规则判断' | '本轮模型时限用完，仅规则判断';
+  failure?: { category: import('./process.ts').FailureCategory; detail: string };
 }
 export interface ModelFinding extends ModelCheck { result: JudgmentResult }
 export interface Original { path: string; fingerprint: string }
@@ -209,6 +210,7 @@ export type EventPayload =
   | { kind: 'session_observed'; record: SessionRecord }
   | { kind: 'push_observed'; push: PushRecord }
   | { kind: 'push_validated'; pushId: string; recordKey: string }
+  | { kind: 'push_deferred'; pushId: string; rounds: number }
   | { kind: 'push_cursor'; path: string; lines: number; fingerprint: string }
   | { kind: 'source_health'; report: HealthReport }
   | { kind: 'scan_completed' }

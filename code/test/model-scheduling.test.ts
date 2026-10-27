@@ -72,7 +72,8 @@ test('返修2-2 11个无关会话模型持续超时：规则先交付、反馈�
   config.judge!.cycleTimeoutMs = 5000;
   const healthy: Judge = { async judge(request) { resumed++; assert.ok(request.context.newSteps.length); return no; } };
   await detect(config, '2026-10-20T10:02:00Z', { judge: healthy, channels: [channel] });
-  assert.equal(resumed + completedCalls, 11, '延期任务未吞掉新步骤，失败过的调用不因空跑反复重试');
+  assert.equal(resumed, 11, '延期任务与失败调用均须下一轮续查，不能吞掉新步骤');
+  assert.ok(completedCalls > 0);
   assert.equal(sent.length, 1, '规则通知与文件交付必须仍然幂等');
   assert.equal((await readOutbox(config.dataDir)).length, 1);
   const before = (await readEvents(config.dataDir)).filter(e => e.kind === 'model_call_started').length;

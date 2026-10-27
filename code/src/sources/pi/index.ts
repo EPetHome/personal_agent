@@ -1,5 +1,6 @@
 import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString, truncateText } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
+import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 
 const metadataNodes = new Set(['branch_summary', 'compaction', 'model_change', 'thinking_level_change', 'custom', 'custom_message', 'session_info', 'context_edit']);
@@ -19,7 +20,7 @@ function node(row: JsonObject): JsonObject {
   } else if (message?.role === 'assistant') {
     const blocks: JsonObject[] = [];
     const text = contentText(message.content);
-    if (text) blocks.push({ type: 'text', text: compact(text, 1200) });
+    if (text) blocks.push({ type: 'text', text: replyExcerpt(text) });
     for (const b of Array.isArray(message.content) ? message.content : []) {
       if (b?.type === 'toolCall' && !['error', 'aborted'].includes(message.stopReason)) blocks.push({ type: b.type, id: b.id, name: b.name,
         summary: typeof b.name === 'string' ? commandSummary(b.name, b.arguments) : '' });
@@ -36,9 +37,12 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
   const entries = new Map<string, JsonObject>();
   let leaf: JsonObject | undefined;
   let messages = 0;
+  let prior: JsonObject | undefined;
+  const bridges = new Map<string, string>();
   for (const source of rows) {
     if (source.type === 'session') continue;
     const row = node(source);
+    const predecessor = prior; prior = row;
     const coreMessage = row.type === 'message' && messageRoles.has(row.message?.role);
     if (coreMessage) messages++;
     const meaningful = coreMessage || metadataNodes.has(row.type);
@@ -52,9 +56,22 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       if (metadataNodes.has(previous.type) || (previous.type === 'message' && messageRoles.has(previous.message?.role))) throw new Error('Pi 树节点 id 重复');
     }
     entries.set(row.id, row);
+    if (row.type === 'message' && row.message?.role === 'assistant' && typeof predecessor?.id === 'string'
+      && (predecessor.type === 'context_edit' || (predecessor.type === 'message' && predecessor.message?.role === 'toolResult'))) {
+      bridges.set(row.id, predecessor.id);
+    }
     if (meaningful) leaf = row;
   }
   if (!messages) return null;
+  const broken = [...entries.values()].filter(row => row.parentId !== null && !entries.has(row.parentId)
+    && (metadataNodes.has(row.type) || (row.type === 'message' && messageRoles.has(row.message?.role))));
+  if (broken.length) {
+    const orphan = broken[0]!;
+    const parent = bridges.get(orphan.id);
+    // 已拍板的单一格式缺口：只有一条助手消息，且紧邻前行是工具结果/context_edit。
+    if (broken.length !== 1 || !parent || !entries.has(parent)) throw new Error('Pi 当前分支缺少父节点');
+    orphan.parentId = parent;
+  }
   const record = emptyRecord('pi', requiredString(header.id, '会话 id'), requiredString(header.cwd, 'cwd'), iso(header.timestamp), original);
   const branch: JsonObject[] = [];
   const seen = new Set<string>();

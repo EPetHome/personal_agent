@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -22,9 +22,24 @@ const home = process.env.HOME; const a = process.argv.slice(2);
 if (!home || process.env.CLAUDE_CONFIG_DIR !== path.join(home,'.claude') || process.env.CODEX_HOME !== path.join(home,'.codex')) process.exit(9);
 const tool = process.env.PA_FAKE_UNUSED || (fs.existsSync(path.join(home,'use-codex')) ? '.codex' : '.claude');
 const dir = path.join(home, tool, 'plugins'); fs.mkdirSync(dir,{recursive:true});
-fs.writeFileSync(path.join(dir,'registered.json'),JSON.stringify(a));
-if (tool === '.claude') fs.writeFileSync(path.join(home,tool,'settings.json'),JSON.stringify({enabledPlugins:{'message-listener@personal-agent-local':true}}));
-else fs.writeFileSync(path.join(home,tool,'config.toml'),'[plugins."message-listener@personal-agent-local"]\nenabled = true\n');
+const read = file => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file,'utf8')) : {};
+const json = (file,value) => fs.writeFileSync(file,JSON.stringify(value,null,2)+'\n');
+const market = 'personal-agent-local', plugin = 'message-listener@'+market;
+if (tool === '.claude') {
+ const settings = path.join(home,tool,'settings.json'), value = read(settings);
+ if (a[1] === 'marketplace') {
+  value.extraKnownMarketplaces = {...value.extraKnownMarketplaces,[market]:{source:{source:'directory',path:a[3]}}};
+  const known = path.join(dir,'known_marketplaces.json'); json(known,{...read(known),[market]:{installLocation:a[3]}});
+ } else {
+  value.enabledPlugins = {...value.enabledPlugins,[plugin]:true};
+  const installed = path.join(dir,'installed_plugins.json'), registry = read(installed);
+  json(installed,{...registry,version:2,plugins:{...registry.plugins,[plugin]:[{scope:'user',version:'1.0.0'}]}});
+ }
+ json(settings,value);
+} else {
+ const config = path.join(home,tool,'config.toml');
+ fs.appendFileSync(config,a[1]==='marketplace' ? '\n[marketplaces.personal-agent-local]\nsource_type = "local"\nsource = '+JSON.stringify(a[3])+'\n' : '\n[plugins."message-listener@personal-agent-local"]\nenabled = true\n');
+}
 `}`);
   await chmod(command, 0o700);
   return { home, inbox, command };
@@ -110,7 +125,7 @@ test('A3 不可写目录时三个钩子均静默成功且 <1 秒；损坏输入/
   assert.equal(malformed.status, 0); assert.equal(malformed.stderr, '');
 });
 
-test('A4 三个装卸恢复精确字节和权限，登记消失，原备份保留；重复卸载成功', async t => {
+test('A4 三个装卸只删自有登记、保留原设置和权限；原字节备份留存、重复卸载成功', async t => {
   for (const tool of ['cc', 'codex', 'pi'] as HookTool[]) {
     const { home, inbox, command } = await fixture(t);
     const configPath = join(home, tool === 'cc' ? '.claude/settings.json' : tool === 'codex' ? '.codex/config.toml' : '.pi/agent/settings.json');
@@ -121,7 +136,9 @@ test('A4 三个装卸恢复精确字节和权限，登记消失，原备份保�
     const backup = JSON.parse(await readFile(backupPath, 'utf8'));
     assert.equal(Buffer.from(backup.before.find((f: { path: string }) => f.path === configPath.slice(home.length + 1)).data, 'base64').toString(), content);
     await uninstallListener({ home, tool, command });
-    assert.equal(await readFile(configPath, 'utf8'), content);
+    const remaining = await readFile(configPath, 'utf8');
+    if (tool === 'codex') assert.equal(remaining.trim(), content.trim());
+    else assert.deepEqual(JSON.parse(remaining), JSON.parse(content));
     assert.equal((await stat(configPath)).mode & 0o777, 0o640);
     const retainedBackup = await readFile(`${backupPath}.removed`, 'utf8');
     if (tool === 'pi') {
@@ -129,18 +146,21 @@ test('A4 三个装卸恢复精确字节和权限，登记消失，原备份保�
       await uninstallListener({ home, tool });
       assert.equal(await readFile(`${backupPath}.removed`, 'utf8'), retainedBackup);
     }
-    if (tool !== 'pi') await assert.rejects(readFile(join(home, tool === 'cc' ? '.claude/plugins/registered.json' : '.codex/plugins/registered.json')), { code: 'ENOENT' });
+    if (tool === 'cc') for (const file of ['known_marketplaces.json', 'installed_plugins.json'])
+      await assert.rejects(readFile(join(home, '.claude/plugins', file)), { code: 'ENOENT' });
     await assert.rejects(readFile(join(home, '.message-listener', tool, 'message-listener.ts')), { code: 'ENOENT' });
     await uninstallListener({ home, tool, command });
   }
 });
 
-test('装后配置另有变化则拒绝覆盖；插件 CLI 失败恢复原配置', async t => {
+test('装后其他配置变化仍可卸载；插件 CLI 无改动失败则保留原配置', async t => {
   const { home, inbox, command } = await fixture(t);
   await installListener({ home, inboxDir: inbox, tool: 'pi' });
   const settings = join(home, '.pi/agent/settings.json');
   await writeFile(settings, '{"newUserSetting":true}\n');
-  await assert.rejects(uninstallListener({ home, tool: 'pi' }), /另有变化/);
+  const cli = spawnSync(process.execPath, [resolve(import.meta.dirname, '../src/hooks/main.ts'), 'uninstall', '--tool', 'pi', '--home', home], { encoding: 'utf8', timeout: 5000 });
+  assert.equal(cli.status, 0, cli.stderr); assert.match(cli.stdout, /只移除本程序条目.*保留你的其他设置/);
+  assert.ok(!cli.stdout.includes('恢复到安装前备份'));
   assert.equal(await readFile(settings, 'utf8'), '{"newUserSetting":true}\n');
   await writeFile(command, `#!${process.execPath}\nprocess.exit(1);\n`);
   const original = '{ "keep": true }\n';
@@ -157,9 +177,12 @@ test('返修2-1 安装失败→回滚→用户改配置/安装其他插件→清
     await mkdir(join(dir, 'plugins'), { recursive: true });
     await writeFile(settings, tool === 'cc' ? '{ "keep": true }\n' : '# keep\n');
     const original = await readFile(settings, 'utf8');
-    await writeFile(command, `#!${process.execPath}\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(settings)},'partial install');fs.writeFileSync(${JSON.stringify(join(dir, 'plugins/partial.json'))},'partial');process.exit(1);\n`);
+    const partial = tool === 'cc' ? JSON.stringify({ keep: true, enabledPlugins: { 'message-listener@personal-agent-local': true } })
+      : `${original}[plugins."message-listener@personal-agent-local"]\nenabled = true\n`;
+    await writeFile(command, `#!${process.execPath}\nconst fs=require('node:fs');fs.writeFileSync(${JSON.stringify(settings)},${JSON.stringify(partial)});process.exit(1);\n`);
     await assert.rejects(installListener({ home, inboxDir: inbox, tool, command }), /插件管理命令失败/);
-    assert.equal(await readFile(settings, 'utf8'), original);
+    if (tool === 'cc') assert.deepEqual(JSON.parse(await readFile(settings, 'utf8')), JSON.parse(original));
+    else assert.equal(await readFile(settings, 'utf8'), original);
     const backupPath = join(home, '.message-listener-backups', `${tool}.json`);
     assert.equal(JSON.parse(await readFile(backupPath, 'utf8')).phase, 'rolled_back');
     const later = tool === 'cc' ? '{ "laterUserSetting": true }\n' : 'later_user_setting = true\n';
@@ -185,6 +208,75 @@ test('返修2-1 缺 after 的旧备份、安装中/恢复中现场均拒绝盲�
     assert.equal(await readFile(settings, 'utf8'), '{"laterUserSetting":true}\n');
     assert.equal(await readFile(path, 'utf8'), JSON.stringify(backup));
   }
+});
+
+test('真机 A3：500MiB 无关插件不读进备份；CC/Codex 备份均小于1MiB', async t => {
+  for (const tool of ['cc', 'codex'] as const) {
+    const { home, inbox, command } = await fixture(t);
+    if (tool === 'codex') await writeFile(join(home, 'use-codex'), '');
+    const directory = join(home, tool === 'cc' ? '.claude' : '.codex', 'plugins/other-plugin');
+    await mkdir(directory, { recursive: true });
+    const payload = join(directory, '500MiB.bin');
+    const file = await open(payload, 'wx');
+    try { await file.truncate(500 * 1024 * 1024); await file.write(Buffer.from('keep'), 0, 4, 0); } finally { await file.close(); }
+    const before = await stat(payload);
+    const backup = await installListener({ home, inboxDir: inbox, tool, command });
+    assert.ok((await stat(backup)).size < 1024 * 1024);
+    assert.ok(!JSON.parse(await readFile(backup, 'utf8')).before.some((f: { path: string }) => f.path.includes('other-plugin')));
+    await uninstallListener({ home, tool });
+    assert.equal((await stat(payload)).size, 500 * 1024 * 1024);
+    assert.equal((await stat(payload)).mtimeMs, before.mtimeMs);
+    t.diagnostic(`${tool} 500MiB构造稀疏文件未改；备份 ${(await stat(backup + '.removed')).size} bytes`);
+  }
+});
+
+test('真机 A4：三个工具装后改模型/无关设置和其他插件，卸载全部保留，只移自有登记', async t => {
+  for (const tool of ['cc', 'codex', 'pi'] as const) {
+    const { home, inbox, command } = await fixture(t);
+    if (tool === 'codex') await writeFile(join(home, 'use-codex'), '');
+    const path = join(home, tool === 'cc' ? '.claude/settings.json' : tool === 'codex' ? '.codex/config.toml' : '.pi/agent/settings.json');
+    await mkdir(join(path, '..'), { recursive: true });
+    const initial = tool === 'codex' ? 'model = "before"\n# 保留注释\n[plugins.other]\nenabled = true\n'
+      : JSON.stringify({ model: 'before', effortLevel: 'low', ...(tool === 'cc' ? { enabledPlugins: { other: true }, extraKnownMarketplaces: { other: { keep: true } } } : { extensions: ['/constructed/other.ts'] }) });
+    await writeFile(path, initial, { mode: 0o640 });
+    const backup = await installListener({ home, inboxDir: inbox, tool, command });
+    const installed = await readFile(path, 'utf8');
+    if (tool === 'codex') await writeFile(path, installed.replace('model = "before"', 'model = "after"') + '\n[plugins.later]\nenabled = true\n');
+    else {
+      const value = JSON.parse(installed); value.model = 'after'; value.effortLevel = 'high';
+      if (tool === 'cc') value.enabledPlugins.later = true;
+      else value.extensions.push('/constructed/later.ts');
+      await writeFile(path, JSON.stringify(value));
+    }
+    await uninstallListener({ home, tool });
+    const result = await readFile(path, 'utf8');
+    if (tool === 'codex') {
+      assert.match(result, /model = "after"/); assert.match(result, /# 保留注释/);
+      assert.match(result, /\[plugins.other\]/); assert.match(result, /\[plugins.later\]/);
+      assert.ok(!result.includes('personal-agent-local'));
+    } else {
+      const expected = JSON.parse(initial); expected.model = 'after'; expected.effortLevel = 'high';
+      if (tool === 'cc') expected.enabledPlugins.later = true; else expected.extensions.push('/constructed/later.ts');
+      assert.deepEqual(JSON.parse(result), expected);
+    }
+    assert.equal((await stat(path)).mode & 0o777, 0o640);
+    assert.ok(await stat(backup + '.removed'));
+  }
+});
+
+test('真机 A4：旧v1成功安装备份可定点卸载，仍不恢复安装前整份目录', async t => {
+  const { home, inbox, command } = await fixture(t);
+  const backupPath = await installListener({ home, inboxDir: inbox, tool: 'cc', command });
+  const backup = JSON.parse(await readFile(backupPath, 'utf8'));
+  backup.version = 1; backup.paths = ['.claude/settings.json', '.claude/plugins'];
+  backup.before.push({ path: '.claude/plugins', mode: 0o700 });
+  await writeFile(backupPath, JSON.stringify(backup));
+  const path = join(home, '.claude/settings.json'); const settings = JSON.parse(await readFile(path, 'utf8'));
+  settings.model = 'later'; await writeFile(path, JSON.stringify(settings));
+  const other = join(home, '.claude/plugins/other.json'); await writeFile(other, 'keep');
+  await uninstallListener({ home, tool: 'cc' });
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { model: 'later' });
+  assert.equal(await readFile(other, 'utf8'), 'keep');
 });
 
 test('返修2-1 回滚无法完成时保留 recovery_required，后续修改也不会被卸载覆盖', async t => {

@@ -23,6 +23,6 @@ async function main() {
   if (action === 'install') {
     const backup = await installListener(options);
     console.log(`已安装 message-listener；配置备份：${backup}`);
-  } else { await uninstallListener(options); console.log('已卸载 message-listener，配置已恢复到安装前备份。'); }
+  } else { await uninstallListener(options); console.log('已卸载 message-listener，只移除本程序条目，保留你的其他设置。'); }
 }
 main().catch(error => { console.error(`错误：${errorMessage(error)}`); process.exitCode = 1; });

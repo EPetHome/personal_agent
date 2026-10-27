@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { readableLines, requestedAction } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
 import { toolNames } from './types.ts';
@@ -70,9 +71,9 @@ export function renderNotice(content: NoticeContent): string {
     '证据：', `项目：${e.project ?? '来源读取故障，项目暂不可知'}`,
     `意图原文：${e.intentOriginal ?? '原件未提供开工指令，未推测'}`,
     '你后来追加的要求：', ...(e.additionalRequirements.length ? e.additionalRequirements.map(text => `- ${text}`) : ['- 无']),
-    '最近几步：', ...(e.recentSteps.length ? e.recentSteps.map(step => `- ${step.at} ${step.text}`) : ['- 暂不可读']),
+    '做到哪了（最近几步）：', ...(e.recentSteps.length ? e.recentSteps.map(step => `- ${step.at} ${step.text}`) : ['- 暂不可读']),
     `判断依据：${e.reason}`,
-    ...(e.needs ? [`还欠什么：${e.needsProvided === false ? '总结里没写' : e.needs.length ? e.needs.join('；') : '总结写明无'}`] : []),
+    ...(e.needs ? [`还欠什么：${e.needs.length ? e.needs.join('；') : '无'}`] : []),
     ...e.originals.map(original => `原件：${original.path}`),
   ].join('\n');
 }
@@ -95,38 +96,39 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
     const waitingMember = record.waiting ? membersOf(record).find(member => pushMatchesMember(record.waiting!, member))
       : record.modelWaiting ? membersOf(record).find(member => member.sessionId === record.modelWaiting!.sessionId) : undefined;
-    const last = (record.modelWaiting ? waitingMember?.assistantReply?.text : undefined) ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
+    const modelReply = record.modelWaiting ? projection.pushes.findLast(p => p.recordKey === record.key && p.sessionId === record.modelWaiting!.sessionId
+      && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
+    const last = modelReply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
       key = `${kind}:${record.key}:${hash(JSON.stringify(record.loop))}`;
       title = `${ai} ${record.loop.status === '暂停' ? '停下了，需要你决定' : '做完了，给你一份交代'}`;
-      summary = `${record.project}：${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次。${record.loop.needsProvided === false ? '总结里没写' : record.loop.needs.join('；') || '总结写明没有待办。'}`;
+      summary = `${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次。还欠什么：${record.loop.needs.join('；') || '无'}`;
     } else if (record.status === '在等我' && record.waiting) {
       kind = 'waiting';
       key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
       const child = record.waiting.sessionId !== record.sessionId;
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-      const scope = child ? `子会话${waitingMember?.project !== record.project ? `（${waitingMember?.project}）` : ''}` : '';
-      summary = `${record.project}：${scope}在等你授权 ${last}。${record.waiting.detail}`;
+      summary = requestedAction(record.waiting.detail || last, record.project, `请回到${child ? '子' : ''}会话确认是否授权。`);
     } else if (record.status === '在等我' && record.modelWaiting) {
       kind = 'waiting';
       key = `model_waiting:${record.key}:${record.modelWaiting.fingerprint}`;
-      title = `${ai} 在等你回复`;
-      summary = `${record.project}：可能在等你回复；${record.modelWaiting.result.reason}。做到哪了：${last}。`;
+      title = `${ai} 可能在等你回复`;
+      summary = requestedAction(last, record.project);
     } else if (record.status === '疑似跑偏' && record.drift) {
       kind = 'drift';
       key = `drift:${record.key}:${record.drift.fingerprint}`;
       title = `${ai} 疑似跑偏`;
-      summary = `${record.project}：可能跑偏。意图是「${record.drift.result.intentQuote}」，实际在做「${record.drift.result.stepQuote}」；对不上：${record.drift.result.reason}`;
+      summary = `可能跑偏。意图是「${record.drift.result.intentQuote}」，实际在做「${record.drift.result.stepQuote}」；对不上：${record.drift.result.reason}`;
     } else if (record.status === '停滞') {
       kind = 'stalled';
       key = `stalled:${record.key}`;
       title = `${ai} 干到一半没动静了`;
       const minutes = Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000);
-      summary = `${record.project}：最后在做 ${last}，已经 ${minutes} 分钟没有新记录，按规则判为停滞。`;
+      summary = `最后在做 ${last}，已经 ${minutes} 分钟没有新记录，按规则判为停滞。`;
     }
     if (!kind) continue;
-    if (kind === 'waiting') summary += ` 意图：${compact(record.intent.initial ?? '原件未提供', 120)}；做到哪了：${compact(last, 160)}；等你做什么：${compact(record.waiting?.detail ?? record.modelWaiting?.result.reason ?? record.reason, 200)}。`;
+    summary = readableLines(summary, record.project).join('\n');
     const already = projection.notices.some(n => n.dedupeKey === key);
     const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     if (!already && projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK) {
@@ -137,7 +139,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const content: NoticeContent = {
       title, summary, returnCommand: returnCommand(record, config, record.waiting?.sessionId ?? record.modelWaiting?.sessionId),
       evidence: {
-        project: record.project, intentOriginal: record.intent.initial,
+        project: waitingMember?.project ?? record.project, intentOriginal: record.intent.initial,
         additionalRequirements: record.intent.additions, recentSteps: waitingMember?.recentSteps ?? record.recentSteps,
         reason: record.reason, originals: record.originals,
         ...(record.loop ? { needs: record.loop.needs, needsProvided: record.loop.needsProvided } : {}),
