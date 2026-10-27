@@ -164,7 +164,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
     drain(now) {
       if (draining) return draining;
       draining = withNamedLock(dir, '.feishu-receive.lock', async () => {
-        await connectionWrites;
+        // 连接状态只是展示；写入失败不能把收件和检测一起卡死。
+        await connectionWrites.catch(() => {});
         const inputs = await withNamedLock(dir, '.feishu-inbound.lock', () => readJsonl<unknown>(inbox));
         const receiptsPath = join(dir, 'feishu-receipts.jsonl');
         const receipts = new Set((await readJsonl<{ id: string }>(receiptsPath)).map(row => row.id));
