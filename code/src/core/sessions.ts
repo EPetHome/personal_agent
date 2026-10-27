@@ -1,12 +1,15 @@
 import { dirname } from 'node:path';
 import { isIgnoredProject } from './config.ts';
-import type { Config, PushRecord, SessionIdentity, SessionMember, SessionRecord } from './types.ts';
+import type { Config, PushRecord, SessionIdentity, SessionMember, SessionRecord, Tool } from './types.ts';
 
-export function isIgnoredMember(member: SessionIdentity, peers: readonly SessionIdentity[], config: Config): boolean {
+export function isInternalSession(tool: Tool, sessionId: string): boolean {
+  return ['cc', 'codex', 'pi'].includes(tool) && sessionId.startsWith('autoreview-');
+}
+export function isIgnoredMember(member: SessionIdentity, peers: readonly SessionIdentity[], config: Config, tool: Tool): boolean {
   const seen = new Set<string>();
   let current: SessionIdentity | undefined = member;
   while (current && !seen.has(current.sessionId)) {
-    if (isIgnoredProject(current.project, config)) return true;
+    if (isInternalSession(tool, current.sessionId) || isIgnoredProject(current.project, config)) return true;
     seen.add(current.sessionId);
     const parentId: string | undefined = current.parentSessionId;
     if (!parentId) break;
@@ -26,17 +29,19 @@ export function membersOf(record: SessionRecord): readonly SessionMember[] {
   return record.members?.length ? record.members : [record];
 }
 export function memberSnapshot(record: SessionRecord): SessionMember {
-  const { sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable } = record;
+  const { sessionId, project, cwdHistory, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable } = record;
   return structuredClone({
     sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded,
+    ...(cwdHistory === undefined ? {} : { cwdHistory }),
     ...(assistantReply === undefined ? {} : { assistantReply }),
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
     ...(unavailable === undefined ? {} : { unavailable }),
   });
 }
 export function pushMatchesMember(push: PushRecord, member: SessionMember): boolean {
-  return member.sessionId === push.sessionId && member.project === push.project &&
-    member.originals.some(original => original.path === push.transcriptPath);
+  if (member.sessionId !== push.sessionId || !member.originals.some(original => original.path === push.transcriptPath)) return false;
+  const history = member.cwdHistory?.filter(entry => entry.path === push.transcriptPath);
+  return history?.length ? history.some(entry => entry.cwds.includes(push.project)) : member.project === push.project;
 }
 /** 新对账必须 requireReadable；历史已验证推送仍可定位缓存成员，以保留先前等待。 */
 export function findPushTarget(records: Iterable<SessionRecord>, push: PushRecord, requireReadable = false): SessionRecord | undefined {

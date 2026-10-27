@@ -7,10 +7,10 @@ import { pi } from '../sources/pi/index.ts';
 import { isLoopSummary, loop } from '../sources/loop/index.ts';
 import { isIgnoredProject } from './config.ts';
 import { coreUnavailable, unreadable } from './health.ts';
-import { isIgnoredMember } from './sessions.ts';
+import { isIgnoredMember, isInternalSession } from './sessions.ts';
 import { SourceReader } from './source-reader.ts';
 import { errorMessage, hash, iso, object, requiredString } from './utils.ts';
-import type { Config, EventPayload, FailedSessionIdentity, HealthReport, HealthSource, Original, PushRecord, SessionIdentity, SessionRecord, SourceComponent } from './types.ts';
+import type { Config, EventPayload, FailedSessionIdentity, HealthReport, HealthSource, Original, PushRecord, SessionIdentity, SessionRecord, SourceComponent, Tool } from './types.ts';
 
 const components: SourceComponent[] = [cc, codex, pi, loop];
 const loopInfrastructure = new Set(['resources', 'projects', 'pipelines']);
@@ -24,13 +24,16 @@ export interface Perception {
   failedPaths: Set<string>;
   /** 已列到但尚无会话内容的文件，与真正解析失败分开，推送对账有界等待。 */
   unwrittenPaths: Set<string>;
+  presentPaths: Set<string>;
+  seenSessions: { tool: Tool; sessionId: string }[];
 }
 function permissionDenied(error: unknown): boolean {
   return ['EACCES', 'EPERM'].includes((error as NodeJS.ErrnoException).code ?? '');
 }
-async function walk(path: string, extension: string, health: HealthReport, depth = 0, loopOnly = false, failedPaths?: Set<string>): Promise<string[]> {
+async function walk(path: string, extension: string, health: HealthReport, depth = 0, loopOnly = false, failedPaths?: Set<string>, presentPaths?: Set<string>): Promise<string[]> {
   try {
     const stat = await lstat(path);
+    presentPaths?.add(`${health.source}:${path}`);
     if (stat.isSymbolicLink()) {
       if (loopOnly && depth > 0) return [];
       throw new Error('不跟随来源符号链接');
@@ -45,7 +48,7 @@ async function walk(path: string, extension: string, health: HealthReport, depth
           if (depth === 0 && (!entry.isDirectory() || loopInfrastructure.has(entry.name))) continue;
           if (depth === 1 && (!entry.isFile() || !isLoopSummary(entry.name))) continue;
         }
-        result.push(...await walk(join(path, entry.name), extension, health, depth + 1, loopOnly, failedPaths));
+        result.push(...await walk(join(path, entry.name), extension, health, depth + 1, loopOnly, failedPaths, presentPaths));
       }
       return result;
     }
@@ -75,7 +78,7 @@ async function readComponent(path: string, component: SourceComponent) {
     } catch (cause) { error = cause; }
     try { reader.finish(); } catch (cause) { error ??= cause; }
     original.fingerprint = reader.fingerprint;
-    return { record, original, identity: reader.identity, error: reader.error ?? error };
+    return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, error: reader.error ?? error };
   } finally { await handle.close(); }
 }
 function parsePush(value: unknown, path: string, line: number, fingerprint: string): PushRecord {
@@ -90,7 +93,7 @@ function parsePush(value: unknown, path: string, line: number, fingerprint: stri
   };
 }
 export async function perceive(config: Config): Promise<Perception> {
-  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set() };
+  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set(), presentPaths: new Set(), seenSessions: [] };
   const reports = new Map<HealthSource, HealthReport>();
   const ignoredSessions = new Set<string>();
   function report(source: HealthSource): HealthReport {
@@ -102,13 +105,19 @@ export async function perceive(config: Config): Promise<Perception> {
     if (root === null) continue;
     const health = report(component.tool);
     health.paths.push(root);
-    const files = await walk(root, component.extension, health, 0, component.tool === 'loop', result.failedPaths);
+    const files = await walk(root, component.extension, health, 0, component.tool === 'loop', result.failedPaths, result.presentPaths);
     const records: SessionRecord[] = [];
+    const identities: SessionIdentity[] = [];
     const failures: { path: string; description: string; identity?: SessionIdentity | null; original?: Original }[] = [];
     health.fileStats = { total: files.length, skipped: 0 };
+    health.fileStatsProfile = 'exclude_internal_v1';
     for (const path of files) {
       try {
         const observed = await readComponent(path, component);
+        for (const sessionId of observed.sessionIds) result.seenSessions.push({ tool: component.tool, sessionId });
+        if (observed.identity) identities.push(observed.identity);
+        if ((observed.identity && isInternalSession(component.tool, observed.identity.sessionId))
+          || (observed.sessionIds.size && [...observed.sessionIds].every(id => isInternalSession(component.tool, id)))) { health.fileStats.total--; continue; }
         if (observed.error) {
           failures.push({ path, description: `${path}：${errorMessage(observed.error)}`, identity: observed.identity, original: observed.original });
         } else if (observed.record) records.push(observed.record);
@@ -123,9 +132,13 @@ export async function perceive(config: Config): Promise<Perception> {
         failures.push({ path, description: `${path}：${errorMessage(error)}` });
       }
     }
-    const peers = [...records, ...failures.flatMap(failure => failure.identity ? [failure.identity] : [])];
+    const peers = [...records, ...identities];
     for (const failure of failures) {
-      if (failure.identity && isIgnoredMember(failure.identity, peers, config)) ignoredSessions.add(`${component.tool}:${failure.identity.sessionId}`);
+      // 无法读到身份时，只用工具固定会话文件命名识别内部会话；不据此创建正常记录。
+      const name = basename(failure.path, component.extension);
+      if (!failure.identity && (isInternalSession(component.tool, name)
+        || (component.tool === 'pi' && name.includes('_autoreview-')))) { health.fileStats.total--; continue; }
+      if (failure.identity && isIgnoredMember(failure.identity, peers, config, component.tool)) ignoredSessions.add(`${component.tool}:${failure.identity.sessionId}`);
       else {
         unreadable(health, failure.description);
         result.failedPaths.add(`${component.tool}:${failure.path}`);
@@ -136,7 +149,7 @@ export async function perceive(config: Config): Promise<Perception> {
     }
     if (!records.length && health.fileFailures?.count) coreUnavailable(health);
     for (const record of records) {
-      if (isIgnoredMember(record, peers, config)) ignoredSessions.add(record.key);
+      if (isIgnoredMember(record, peers, config, component.tool)) ignoredSessions.add(record.key);
       else result.records.push(record);
     }
   }
@@ -164,7 +177,8 @@ export async function perceive(config: Config): Promise<Perception> {
             if (!line.trim()) { if (!broken) consumed = lineNumber; continue; }
             try {
               const value = JSON.parse(line);
-              if (!ignoredSessions.has(`${value?.tool}:${value?.session_id}`)
+              if (!(typeof value?.session_id === 'string' && isInternalSession(value.tool, value.session_id))
+                && !ignoredSessions.has(`${value?.tool}:${value?.session_id}`)
                 && !(typeof value?.cwd === 'string' && isIgnoredProject(value.cwd, config))) {
                 result.pushes.push(parsePush(value, path, lineNumber, hash(line)));
               }

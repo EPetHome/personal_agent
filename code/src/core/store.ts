@@ -36,12 +36,15 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['session_observed', 'push_observed', 'push_validated', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'channel_delivery'];
+  const kinds = ['session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'channel_delivery'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
     }
     if (row.kind === 'session_observed' && (!row.record?.key || !row.record.originals || !row.record.intent)) throw new Error('会话事件结构损坏');
+    if (row.kind === 'session_seen' && (!['cc', 'codex', 'pi', 'loop'].includes(row.tool) || typeof row.sessionId !== 'string' || !row.sessionId)) throw new Error('会话身份事件结构损坏');
+    if (row.kind === 'push_empty' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.reason !== 'string')) throw new Error('空会话事件结构损坏');
+    if (row.kind === 'feishu_connection' && (!row.connection || !['connecting', 'connected', 'reconnecting', 'failed', 'stopped', 'fake'].includes(row.connection.state))) throw new Error('飞书连接事件结构损坏');
     if (row.kind === 'source_health' && !Array.isArray(row.report?.errors)) throw new Error('来源健康事件结构损坏');
     if (row.kind === 'push_observed' && !row.push?.sessionId) throw new Error('推送事件结构损坏');
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');

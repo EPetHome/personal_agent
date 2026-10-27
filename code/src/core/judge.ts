@@ -131,7 +131,10 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     summary = readableLines(summary, record.project).join('\n');
     const already = projection.notices.some(n => n.dedupeKey === key);
     const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
-    if (!already && projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK) {
+    const recovered = kind === 'waiting' && projection.pushes.some(push => push.recovered && push.recordKey === record.key
+      && (record.waiting ? pushIdentity(push) === pushIdentity(record.waiting)
+        : push.event === 'turn_end' && push.sessionId === record.modelWaiting?.sessionId && push.at === record.modelWaiting.evidenceAt));
+    if (!already && (recovered || (projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK))) {
       record.notice = '首次接入历史记录，不补发';
       if (projection.suppressedNotices.get(key) !== evidenceAt) suppressed?.push({ kind: 'notice_suppressed', dedupeKey: key, evidenceAt });
       continue;
@@ -187,6 +190,12 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);
   const failed = projection.notices.filter(n => projection.channelDeliveries.get(`local:${n.id}`) === false).length;
   if (failed) lines.push(`本机通知尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
+  if (projection.feishuConnection) {
+    const connection = projection.feishuConnection;
+    const status = connection.state === 'connected' ? '已连接' : connection.state === 'fake' ? '假渠道（未连接真实飞书）'
+      : connection.state === 'connecting' ? '未连接（连接中）' : connection.state === 'reconnecting' ? '未连接（重连中）' : '未连接';
+    lines.push(`飞书长连接：${status}${connection.failure ? `；${connection.failure.category}：${connection.failure.message}` : ''}`);
+  }
   const feishuFailed = projection.notices.filter(n => projection.channelDeliveries.get(`feishu:${n.id}`) === false).length;
   if (feishuFailed) lines.push(`飞书尚未成功：${feishuFailed} 条；已写发件记录，下轮检测重试。`);
   return lines.join('\n');

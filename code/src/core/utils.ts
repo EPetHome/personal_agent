@@ -108,6 +108,13 @@ export function emptyRecord(tool: Tool, sessionId: string, project: string, at: 
     recentSteps: [], pendingTools: [], assistantFinished: false, sessionEnded: false,
   };
 }
+/** 只收结构化 cwd 字段，不从命令、正文或工具输出推测目录。 */
+export function observeCwd(record: SessionRecord, cwd: unknown): void {
+  if (typeof cwd !== 'string' || !cwd.trim()) return;
+  record.cwdHistory ??= [{ path: record.originals[0]!.path, cwds: [record.project] }];
+  const history = record.cwdHistory[0]!;
+  if (!history.cwds.includes(cwd)) history.cwds.push(cwd);
+}
 export function addIntent(record: SessionRecord, text: string): void {
   const bounded = truncateText(text, 1000);
   if (record.intent.initial === null) record.intent.initial = bounded;

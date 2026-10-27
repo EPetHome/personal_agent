@@ -36,6 +36,7 @@ export function normalize(input: Perception, previous: Iterable<SessionRecord> =
     else {
       const latest = previous.lastActivityAt > record.lastActivityAt ? previous : structuredClone(record);
       latest.originals = [...previous.originals, ...record.originals];
+      latest.cwdHistory = [previous, record].flatMap(r => r.cwdHistory ?? r.originals.map(o => ({ path: o.path, cwds: [r.project] })));
       records.set(record.key, latest);
     }
   }
@@ -93,7 +94,7 @@ export function normalize(input: Perception, previous: Iterable<SessionRecord> =
       const currentIds = new Set(membersOf(record).map(member => member.sessionId));
       for (const member of cachedMembers) {
         if (currentIds.has(member.sessionId) || !member.originals.some(original => isFailedOriginal(record.tool, original.path, input.failedPaths))
-          || (config && isIgnoredMember(member, cachedMembers, config))) continue;
+          || (config && isIgnoredMember(member, cachedMembers, config, record.tool))) continue;
         // 只给本轮仍读到的根保留失败子成员；不复活旧根，也不把缓存当成新读到的事实。
         appendMember(record, { ...structuredClone(member), unavailable: true });
         currentIds.add(member.sessionId);

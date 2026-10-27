@@ -101,7 +101,7 @@ async function main() {
   }
   const view = command === 'detect' ? await detect(config, now)
     : command === 'rebuild' ? await rebuild(config, now) : await overview(config, now);
-  if (json) console.log(JSON.stringify({ at: view.at, records: view.records, health: [...view.projection.health.values()], ...('noticesAdded' in view ? { noticesAdded: view.noticesAdded } : {}) }, null, 2));
+  if (json) console.log(JSON.stringify({ at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}), ...('noticesAdded' in view ? { noticesAdded: view.noticesAdded } : {}) }, null, 2));
   else {
     if ('noticesAdded' in view) console.log(`检测完成，新增 ${view.noticesAdded} 条发件记录。`);
     if (command === 'rebuild') console.log('已从 events.jsonl 重建 state.json。');

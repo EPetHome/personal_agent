@@ -10,6 +10,7 @@ export class SourceReader {
   fingerprint = '';
   error: Error | undefined;
   identity: SessionIdentity | null = null;
+  readonly sessionIds = new Set<string>();
   private complete = false;
   private jsonChecked = false;
   private headers = new Map<string, string>();
@@ -84,7 +85,10 @@ export class SourceReader {
         this.error ??= new Error(`第 ${lineNumber} 行无法解析为 JSON`);
         continue; // 不把损坏前缀当正常结果：调用方在完整遍历后检查 error。
       }
-      this.identity ??= this.component.identifyRow?.(row) ?? null;
+      const identity = this.component.identifyRow?.(row) ?? null;
+      const sessionId = this.component.sessionIdOf?.(row) ?? identity?.sessionId;
+      if (sessionId) this.sessionIds.add(sessionId);
+      this.identity ??= identity;
       yield row;
     }
     this.jsonChecked = true;

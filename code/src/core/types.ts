@@ -25,6 +25,11 @@ export interface FeishuConfig {
   envFile?: string;
   timeoutMs: number;
 }
+export type FeishuFailureCategory = 'credentials' | 'permission' | 'network' | 'configuration' | 'unknown';
+export interface FeishuConnection {
+  state: 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'stopped' | 'fake';
+  failure?: { category: FeishuFailureCategory; message: string };
+}
 export interface JudgeConfig {
   executable: string;
   model: string;
@@ -90,6 +95,8 @@ export interface SessionRecord {
   type: 'ai_session' | 'loop_run';
   originals: Original[];
   project: string;
+  /** 每份原件实际出现过的目录；只用于推送对账，不改变起始项目。旧记录可省略。 */
+  cwdHistory?: { path: string; cwds: string[] }[];
   intent: { initial: string | null; additions: string[] };
   lastActivityAt: string;
   recentSteps: Step[];
@@ -108,7 +115,7 @@ export type SessionIdentity = Pick<SessionRecord, 'sessionId' | 'project' | 'par
 /** 失败原件的身份线索，不是可供正常状态/推送对账使用的会话记录。 */
 export type FailedSessionIdentity = SessionIdentity & { tool: Tool; original: Original };
 export type SessionMember = Pick<SessionRecord,
-  'sessionId' | 'project' | 'originals' | 'recentSteps' |
+  'sessionId' | 'project' | 'cwdHistory' | 'originals' | 'recentSteps' |
   'pendingTools' | 'assistantFinished' | 'sessionEnded' | 'assistantReply' | 'parentSessionId' | 'unavailable'> & {
     /** 只有失败身份、没有已读取活动事实时为 null，不捏造子成员时间。 */
     lastActivityAt: string | null;
@@ -124,7 +131,7 @@ export interface PushRecord {
   original: Original & { line: number };
 }
 /** 只有显式通过对账的推送才进入判断，保留实际发出事件的成员身份。 */
-export interface ValidatedPushRecord extends PushRecord { recordKey: string }
+export interface ValidatedPushRecord extends PushRecord { recordKey: string; recovered?: boolean }
 export interface HealthReport {
   source: HealthSource;
   /** 仅整体来源/推送故障会令会话状态无法确认。 */
@@ -132,6 +139,8 @@ export interface HealthReport {
   paths: string[];
   fileFailures?: { count: number; examples: string[] };
   fileStats?: { total: number; skipped: number };
+  /** 缺省是旧的全部候选口径；新口径排除内部会话，基线只能在同口径内比较/学习。 */
+  fileStatsProfile?: 'exclude_internal_v1';
   /** 最近一次可见会话清单；旧日志缺此字段时保留旧行为。 */
   sessionKeys?: string[];
 }
@@ -142,6 +151,8 @@ export interface SourceComponent {
   /** 失败文件的核心身份，仅用于忽略/不可用关联，不能证明正常状态或授权新推送对账。 */
   identify?(text: string): SessionIdentity | null;
   identifyRow?(row: Record<string, any>): SessionIdentity | null;
+  /** 只用于记住身份曾在文件中出现、排除空会话；不证明正文/项目可读。 */
+  sessionIdOf?(row: Record<string, any>): string | null;
   /** 来源读取使用可重复遍历的惰性行流，不加载整份原件。 */
   parseRows?(rows: Iterable<Record<string, any>>, original: Original): SessionRecord | null;
   parseLines?(lines: Iterable<string>, original: Original, context: SourceReadContext): SessionRecord | null;
@@ -208,8 +219,10 @@ export interface ReviewItem {
 }
 export type EventPayload =
   | { kind: 'session_observed'; record: SessionRecord }
+  | { kind: 'session_seen'; tool: Tool; sessionId: string }
   | { kind: 'push_observed'; push: PushRecord }
-  | { kind: 'push_validated'; pushId: string; recordKey: string }
+  | { kind: 'push_validated'; pushId: string; recordKey: string; recovered?: boolean }
+  | { kind: 'push_empty'; pushId: string; reason: string }
   | { kind: 'push_deferred'; pushId: string; rounds: number }
   | { kind: 'push_cursor'; path: string; lines: number; fingerprint: string }
   | { kind: 'source_health'; report: HealthReport }
@@ -219,10 +232,13 @@ export type EventPayload =
   | { kind: 'notices_delivered'; ids: string[] }
   | { kind: 'model_call_started'; task: JudgmentTask | 'attribution' | 'same_problem'; key: string }
   | { kind: 'model_checked'; check: ModelCheck }
-  | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean };
+  | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean }
+  | { kind: 'feishu_connection'; connection: FeishuConnection };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
 export interface Projection {
   sessions: Map<string, SessionRecord>;
+  seenSessions: Set<string>;
+  feishuConnection?: FeishuConnection & { at: string };
   pushes: ValidatedPushRecord[];
   health: Map<HealthSource, HealthState>;
   notices: Notice[];

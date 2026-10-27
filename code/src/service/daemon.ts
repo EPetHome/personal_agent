@@ -7,7 +7,7 @@ import { acquireLock, recoverDeadLock } from '../core/locks.ts';
 import { agentNotice } from '../core/learning.ts';
 import { appendJsonl, readJsonl } from '../core/store.ts';
 import { shellQuote } from '../core/utils.ts';
-import type { Config } from '../core/types.ts';
+import type { Channel, Config } from '../core/types.ts';
 
 interface RunEvent { kind: 'start' | 'stop' | 'alerted'; at: string; runId: string; pid?: number }
 function pause(ms: number, signal: AbortSignal): Promise<void> {
@@ -18,11 +18,11 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 /** 前台常驻与 launchd 使用同一个入口；不 fork，不读取默认个人目录。 */
-export async function runService(configInput: Config, signal: AbortSignal): Promise<void> {
+export async function runService(configInput: Config, signal: AbortSignal, components: { channels?: Channel[] } = {}): Promise<void> {
   const config = await validateConfig(configInput), dir = config.dataDir;
   await recoverDeadLock(dir, '.service.lock');
   const release = await acquireLock(dir, '.service.lock');
-  const channels = configuredChannels(config);
+  const channels = components.channels ?? configuredChannels(config);
   const runId = randomUUID(), runsPath = join(dir, 'service-runs.jsonl'), logPath = join(dir, 'service.log.jsonl');
   const interval = config.service?.intervalMs ?? 60000;
   async function log(kind: string, extra: Record<string, unknown> = {}) {

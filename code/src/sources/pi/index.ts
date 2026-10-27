@@ -34,12 +34,14 @@ function node(row: JsonObject): JsonObject {
 function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecord | null {
   const header = findRow(rows, row => row.type === 'session' || (row.type === 'header' && row.version === 1));
   if (!header || header.version === 1 || !identifyRow(header)) return null;
+  const cwds = new Set<string>([header.cwd]);
   const entries = new Map<string, JsonObject>();
   let leaf: JsonObject | undefined;
   let messages = 0;
   let prior: JsonObject | undefined;
   const bridges = new Map<string, string>();
   for (const source of rows) {
+    if (typeof source.cwd === 'string' && source.cwd.trim() && (source.type !== 'session' || source.id === header.id)) cwds.add(source.cwd);
     if (source.type === 'session') continue;
     const row = node(source);
     const predecessor = prior; prior = row;
@@ -73,6 +75,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     orphan.parentId = parent;
   }
   const record = emptyRecord('pi', requiredString(header.id, '会话 id'), requiredString(header.cwd, 'cwd'), iso(header.timestamp), original);
+  record.cwdHistory = [{ path: original.path, cwds: [...cwds] }];
   const branch: JsonObject[] = [];
   const seen = new Set<string>();
   while (leaf) {
@@ -121,6 +124,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
 }
 export const pi: SourceComponent = {
   tool: 'pi', extension: '.jsonl', identifyRow, parseRows,
+  sessionIdOf(row) { return row.type === 'session' && typeof row.id === 'string' && row.id.trim() ? row.id : null; },
   identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
   parse(text, original) { return parseRows(jsonLines(text), original); },
 };

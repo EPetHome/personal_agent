@@ -1,13 +1,14 @@
 import { join } from 'node:path';
 import { noticeCard } from './card.ts';
-import { realTransport } from './transport.ts';
+import { feishuFailure, realTransport, safeFeishuFailure } from './transport.ts';
 import type { FeishuTransport } from './transport.ts';
 import { receiveFeedback } from '../../core/feedback.ts';
 import { changeExperience } from '../../core/learning.ts';
+import { event } from '../../core/events.ts';
 import { withNamedLock } from '../../core/locks.ts';
-import { appendJsonl, readJsonl, readOutbox } from '../../core/store.ts';
+import { appendJsonl, readJsonl, readOutbox, withStoreLock } from '../../core/store.ts';
 import { hash, iso } from '../../core/utils.ts';
-import type { Channel, Config } from '../../core/types.ts';
+import type { Channel, Config, FeishuConnection } from '../../core/types.ts';
 
 export interface Incoming {
   id: string; at: string; actor: string; type: 'text' | 'action'; messageId: string;
@@ -73,6 +74,25 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
   let ingress: Promise<unknown> = Promise.resolve();
   let draining: Promise<number> | undefined;
   let stopped = false;
+  let connectionWrites: Promise<void> = Promise.resolve();
+  let connectionSignature: string | undefined;
+  function reportConnection(input: FeishuConnection): Promise<void> {
+    if (stopped && input.state !== 'stopped') return connectionWrites;
+    const state = ['connecting', 'connected', 'reconnecting', 'failed', 'stopped', 'fake'].includes(input.state) ? input.state : 'failed';
+    const connection: FeishuConnection = { state, ...(input.failure ? { failure: feishuFailure(input.failure.category) } : {}) };
+    const signature = JSON.stringify(connection);
+    if (signature === connectionSignature) return connectionWrites;
+    connectionSignature = signature;
+    connectionWrites = connectionWrites.catch(() => {}).then(() => withStoreLock(dir, async () => {
+      const at = new Date().toISOString(), logPath = join(dir, 'service.log.jsonl');
+      await readJsonl(logPath);
+      await appendJsonl(join(dir, 'events.jsonl'), [event({ kind: 'feishu_connection', connection }, at)]);
+      await appendJsonl(logPath, [{ at, kind: connection.state === 'failed' ? 'feishu_connection_failed' : 'feishu_connection',
+        state: connection.state, ...(connection.failure ?? {}) }]);
+    }, 30000));
+    void connectionWrites.catch(() => { if (connectionSignature === signature) connectionSignature = undefined; });
+    return connectionWrites;
+  }
   async function send(type: 'interactive' | 'text', content: unknown, key: string, noticeId?: string) {
     await withNamedLock(dir, '.feishu-send.lock', async () => {
       const history = await readJsonl<SentMessage>(sentPath);
@@ -144,6 +164,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
     drain(now) {
       if (draining) return draining;
       draining = withNamedLock(dir, '.feishu-receive.lock', async () => {
+        await connectionWrites;
         const inputs = await withNamedLock(dir, '.feishu-inbound.lock', () => readJsonl<unknown>(inbox));
         const receiptsPath = join(dir, 'feishu-receipts.jsonl');
         const receipts = new Set((await readJsonl<{ id: string }>(receiptsPath)).map(row => row.id));
@@ -161,12 +182,23 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
     },
     async start() {
       stopped = false;
-      if (options.mode === 'real' || injected) (await getTransport()).start?.({
-        'im.message.receive_v1': raw => channel.capture(raw, 'im.message.receive_v1'),
-        'card.action.trigger': raw => channel.capture(raw, 'card.action.trigger'),
-      });
+      await reportConnection({ state: options.mode === 'fake' && !injected ? 'fake' : 'connecting' });
+      if (options.mode === 'real' || injected) {
+        try {
+          await (await getTransport()).start?.({
+            'im.message.receive_v1': raw => channel.capture(raw, 'im.message.receive_v1'),
+            'card.action.trigger': raw => channel.capture(raw, 'card.action.trigger'),
+          }, state => { void reportConnection(state); });
+        } catch (error) { await reportConnection({ state: 'failed', failure: safeFeishuFailure(error) }); }
+      }
+      await connectionWrites;
     },
-    async stop() { stopped = true; if (transport) (await transport).stop?.(); await ingress; if (draining) await draining; await channel.drain(); },
+    async stop() {
+      stopped = true;
+      if (transport) { const ready = await transport.catch(() => undefined); ready?.stop?.(); }
+      await ingress; if (draining) await draining; await channel.drain();
+      await reportConnection({ state: 'stopped' });
+    },
   };
   return channel;
 }
