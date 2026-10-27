@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, filterRows, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
@@ -60,11 +60,13 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
     }
   }
   if (!messages) return null;
+  for (const row of rows) if (!row.sessionId || row.sessionId === record.sessionId) observeCwd(record, row.cwd);
   record.pendingTools = [...pending.values()];
   return finishRecord(record);
 }
 export const cc: SourceComponent = {
   tool: 'cc', extension: '.jsonl', identifyRow, parseRows,
+  sessionIdOf(row) { return typeof row.sessionId === 'string' && row.sessionId.trim() ? row.sessionId : null; },
   identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
   parse(text, original) { return parseRows(jsonLines(text), original); },
 };

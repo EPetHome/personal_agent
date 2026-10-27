@@ -1,4 +1,4 @@
-import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, requiredString } from '../../core/utils.ts';
+import { addIntent, addStep, commandSummary, compact, contentText, emptyRecord, findJsonObject, findRow, finishRecord, isHuman, iso, jsonLines, observeCwd, requiredString } from '../../core/utils.ts';
 import type { JsonObject } from '../../core/utils.ts';
 import { replyExcerpt } from '../../core/notice-text.ts';
 import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '../../core/types.ts';
@@ -48,6 +48,8 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
       lastAgent = { text: message, phase: actualPhase };
     }
     for (const row of rows) {
+      observeCwd(record, row.cwd);
+      if (row.type === 'session_meta' || row.type === 'turn_context') observeCwd(record, row.payload?.cwd);
       const item = completedItem(row);
       const p = row.payload;
       const isItem = item && items.includes(item.type);
@@ -135,6 +137,10 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
 }
 export const codex: SourceComponent = {
   tool: 'codex', extension: '.jsonl', identifyRow, parseRows,
+  sessionIdOf(row) {
+    const id = row.type === 'session_meta' ? row.payload?.id ?? row.payload?.session_id : undefined;
+    return typeof id === 'string' && id.trim() ? id : null;
+  },
   identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
   parse(text, original) { return parseRows(jsonLines(text), original); },
 };

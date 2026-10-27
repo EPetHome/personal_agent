@@ -10,7 +10,7 @@ import { skipAnomaly } from './health.ts';
 import { judgeRecords, planNotices } from './judge.ts';
 import { normalize } from './normalize.ts';
 import { perceive } from './perception.ts';
-import { findPushTarget, isFailedOriginal, isIgnoredMember, membersOf } from './sessions.ts';
+import { findPushTarget, isFailedOriginal, isIgnoredMember, isInternalSession, membersOf } from './sessions.ts';
 import { appendJsonl, readEvents, readOutbox, withModelLock, withStoreLock, writeState } from './store.ts';
 import { iso } from './utils.ts';
 import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Notice, Projection } from './types.ts';
@@ -18,12 +18,12 @@ import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, No
 export interface Snapshot { at: string; records: JudgedRecord[]; projection: Projection }
 function activeProjection(projection: Projection, config: Config): Projection {
   const sessions = new Map([...projection.sessions].filter(([, record]) => {
-    if (config.sources[record.tool] === null || isIgnoredProject(record.project, config)) return false;
+    if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || isInternalSession(record.tool, record.sessionId)) return false;
     const health = projection.health.get(record.tool);
     // 整体故障时保留最后事实并标失明；局部故障不能让坏文件的旧状态冒充本轮正常。
     return health?.errors.length || !health?.sessionKeys || health.sessionKeys.includes(record.key);
   }).map(([key, record]) => {
-    const members = record.members?.filter(member => !isIgnoredMember(member, record.members!, config));
+    const members = record.members?.filter(member => !isIgnoredMember(member, record.members!, config, record.tool));
     if (!members || members.length === record.members?.length) return [key, record];
     return [key, {
       ...record, members, originals: members.flatMap(member => member.originals),
@@ -37,8 +37,13 @@ function activeProjection(projection: Projection, config: Config): Projection {
   const waitingKeys = new Set(pushes.map(push => `waiting:${push.recordKey}:${pushIdentity(push)}`));
   return {
     ...projection, sessions, pushes,
+    feishuConnection: config.feishu ? projection.feishuConnection ?? { state: config.feishu.mode === 'fake' ? 'fake' : 'stopped', at: projection.lastScanAt ?? '' } : undefined,
     health: new Map([...projection.health].filter(([source]) => source === 'inbox' ? config.inboxDir !== null : config.sources[source] !== null)),
     notices: projection.notices.filter(notice => (notice.tool === 'agent' || (notice.tool === 'inbox' ? config.inboxDir !== null : config.sources[notice.tool] !== null))
+      && (notice.kind !== 'blind' || (notice.tool !== 'agent' && !!projection.health.get(notice.tool)?.since
+        && notice.dedupeKey === `blind:${notice.tool}:${projection.health.get(notice.tool)?.episodeId}`))
+      && (notice.kind !== 'unreadable' || (notice.tool !== 'agent' && !!projection.health.get(notice.tool)?.fileFailures?.count
+        && notice.dedupeKey === `unreadable:${notice.tool}:${projection.health.get(notice.tool)?.fileFailureEpisodeId}`))
       && (!notice.sessionKey || sessions.has(notice.sessionKey))
       && (!notice.memberSessionId || (!!notice.sessionKey && membersOf(sessions.get(notice.sessionKey)!).some(member => member.sessionId === notice.memberSessionId)))
       && (notice.kind !== 'waiting' || notice.dedupeKey.startsWith('model_waiting:') || waitingKeys.has(notice.dedupeKey))
@@ -55,7 +60,7 @@ function snapshot(events: AgentEvent[], config: Config, now?: string): Snapshot 
   return { at, records, projection };
 }
 function serializedState(view: Snapshot) {
-  return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()] };
+  return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}) };
 }
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
 async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>) {
@@ -137,7 +142,16 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     for (const record of input.records) {
       if (JSON.stringify(previous.sessions.get(record.key)) !== JSON.stringify(record)) add({ kind: 'session_observed', record });
     }
+    const seenSessions = new Set(previous.seenSessions);
+    for (const record of input.records) for (const member of membersOf(record)) seenSessions.add(`${record.tool}:${member.sessionId}`);
+    for (const identity of input.seenSessions) {
+      const key = `${identity.tool}:${identity.sessionId}`;
+      if (!seenSessions.has(key)) { add({ kind: 'session_seen', ...identity }); seenSessions.add(key); }
+    }
     const ids = new Set(events.map(e => e.id));
+    const emptyPushes = new Set(events.flatMap(e => e.kind === 'push_empty' ? [e.pushId] : []));
+    const observedPushes = new Set(events.flatMap(e => e.kind === 'push_observed' ? [event({ kind: 'push_observed', push: e.push }, now).id] : []));
+    const unhealthySources = new Set(input.health.filter(report => report.errors.length).map(report => report.source));
     const deferred = new Map(events.flatMap(e => e.kind === 'push_deferred' ? [[e.pushId, e.rounds] as const] : []));
     for (const push of input.pushes) {
       const entry = event({ kind: 'push_observed', push }, now);
@@ -145,24 +159,34 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       // 原件/目录/归并本轮已失败：仅留原始推送，不借缓存成员对账，也不放大局部故障。
       const unwritten = input.unwrittenPaths.has(`${push.tool}:${push.transcriptPath}`);
       if (!unwritten && isFailedOriginal(push.tool, push.transcriptPath, input.failedPaths)) continue;
-      const record = unwritten ? undefined : findPushTarget(available.values(), push, true);
+      const record = unwritten ? undefined : findPushTarget(input.records, push, true);
       if (!record) {
         const report = input.health.find(h => h.source === push.tool);
         const root = config.sources[push.tool];
         const path = root ? relative(root, push.transcriptPath) : '..';
         const conflicting = [...available.values()].filter(r => r.tool === push.tool).flatMap(membersOf)
-          .some(m => (m.sessionId === push.sessionId && (m.project !== push.project || !m.originals.some(o => o.path === push.transcriptPath)))
+          .some(m => (m.sessionId === push.sessionId && !m.originals.some(o => o.path === push.transcriptPath))
             || (m.sessionId !== push.sessionId && m.originals.some(o => o.path === push.transcriptPath)));
-        // 只容忍配置内尚未落盘的会话；错项目、错成员、配置外路径仍立即按原规则报。
-        if (path && path !== '..' && !path.startsWith('../') && !isAbsolute(path) && !conflicting && !report?.errors.length
-          && (deferred.get(entry.id) ?? 0) < 2) {
+        // 身份/路径冲突仍立即报；仅目录尚未写到文件时，也按推送早到给最多两轮。
+        const canDefer = path && path !== '..' && !path.startsWith('../') && !isAbsolute(path) && !conflicting && !unhealthySources.has(push.tool);
+        if (canDefer && (deferred.get(entry.id) ?? 0) < 2) {
           add({ kind: 'push_deferred', pushId: entry.id, rounds: (deferred.get(entry.id) ?? 0) + 1 });
+          continue;
+        }
+        if (canDefer && push.event === 'session_end' && push.transcriptPath.endsWith('.jsonl')
+          && !seenSessions.has(`${push.tool}:${push.sessionId}`) && !input.presentPaths.has(`${push.tool}:${push.transcriptPath}`)) {
+          if (!emptyPushes.has(entry.id)) {
+            add({ kind: 'push_empty', pushId: entry.id, reason: '空会话：会话结束推送；从未在会话文件读到此身份；两轮宽限后文件仍不存在，不生成会话或提醒' });
+            emptyPushes.add(entry.id);
+          }
           continue;
         }
         report?.errors.push(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上；未跟随 transcript_path 读取其他文件`);
         continue;
       }
-      const validated = event({ kind: 'push_validated', pushId: entry.id, recordKey: record.key }, now);
+      const recovered = observedPushes.has(entry.id) && previous.health.get(push.tool)?.errors.some(error =>
+        error.startsWith(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上`));
+      const validated = event({ kind: 'push_validated', pushId: entry.id, recordKey: record.key, ...(recovered ? { recovered: true } : {}) }, now);
       if (!ids.has(validated.id)) { added.push(validated); ids.add(validated.id); }
     }
     for (const cursor of input.cursors) {
@@ -172,9 +196,9 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     }
     for (const report of input.health) {
       const last = previous.health.get(report.source);
-      const anomaly = skipAnomaly(report, last?.skipBaseline);
+      const anomaly = skipAnomaly(report, last);
       if (anomaly) report.errors.push(anomaly);
-      if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats])) add({ kind: 'source_health', report });
+      if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile])) add({ kind: 'source_health', report });
     }
     add({ kind: 'scan_completed' });
     // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。

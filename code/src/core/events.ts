@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hash } from './utils.ts';
-import { findPushTarget } from './sessions.ts';
+import { findPushTarget, membersOf } from './sessions.ts';
 import { learnSkipBaseline } from './health.ts';
 import type { AgentEvent, EventPayload, Projection, PushRecord } from './types.ts';
 
@@ -16,13 +16,17 @@ export function event(payload: EventPayload, at: string): AgentEvent {
   return { ...payload, version: 1, at, id };
 }
 export function project(events: AgentEvent[]): Projection {
-  const result: Projection = { sessions: new Map(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelCalls: new Map(), channelDeliveries: new Map() };
+  const result: Projection = { sessions: new Map(), seenSessions: new Set(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelCalls: new Map(), channelDeliveries: new Map() };
   const rawPushes = new Map<string, PushRecord>();
   const pushes = new Set<string>();
   const notices = new Set<string>();
   for (const entry of events) {
     switch (entry.kind) {
-      case 'session_observed': result.sessions.set(entry.record.key, entry.record); break;
+      case 'session_observed':
+        result.sessions.set(entry.record.key, entry.record);
+        for (const member of membersOf(entry.record)) result.seenSessions.add(`${entry.record.tool}:${member.sessionId}`);
+        break;
+      case 'session_seen': result.seenSessions.add(`${entry.tool}:${entry.sessionId}`); break;
       case 'push_observed':
         // 包括旧日志在内，收到推送本身不证明它可用于判断。
         if (!rawPushes.has(entry.id)) rawPushes.set(entry.id, entry.push);
@@ -31,7 +35,7 @@ export function project(events: AgentEvent[]): Projection {
         const push = rawPushes.get(entry.pushId);
         const record = result.sessions.get(entry.recordKey);
         if (push && record && findPushTarget([record], push, true) && !pushes.has(entry.id)) {
-          result.pushes.push({ ...push, recordKey: entry.recordKey });
+          result.pushes.push({ ...push, recordKey: entry.recordKey, ...(entry.recovered ? { recovered: true } : {}) });
           pushes.add(entry.id);
         }
         break;
@@ -42,7 +46,7 @@ export function project(events: AgentEvent[]): Projection {
         const episodeId = since ? previous?.episodeId ?? entry.id : null;
         const fileFailureSince = entry.report.fileFailures?.count ? previous?.fileFailureSince ?? entry.at : null;
         const fileFailureEpisodeId = fileFailureSince ? previous?.fileFailureEpisodeId ?? entry.id : null;
-        const skipBaseline = learnSkipBaseline(entry.report, previous?.skipBaseline);
+        const skipBaseline = learnSkipBaseline(entry.report, previous);
         result.health.set(entry.report.source, { ...entry.report, since, episodeId, fileFailureSince, fileFailureEpisodeId, skipBaseline });
         break;
       }
@@ -66,6 +70,8 @@ export function project(events: AgentEvent[]): Projection {
       }
       case 'model_checked': result.modelChecks.set(entry.check.key, entry.check); break;
       case 'channel_delivery': result.channelDeliveries.set(`${entry.channel}:${entry.noticeId}`, entry.ok); break;
+      case 'feishu_connection': result.feishuConnection = { ...entry.connection, at: entry.at }; break;
+      case 'push_empty':
       case 'push_cursor': break;
     }
   }
