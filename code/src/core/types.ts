@@ -86,6 +86,9 @@ export interface LoopFacts {
   repairs: number;
   needs: string[];
   needsProvided?: boolean;
+  batch?: string;
+  phase?: string;
+  sessions?: { development: string; review: string; acceptance: string[] };
 }
 /** 来源组件和后续步骤唯一的会话交换格式。不保存整份会话/工具返回正文。 */
 export interface SessionRecord {
@@ -140,9 +143,11 @@ export interface HealthReport {
   fileFailures?: { count: number; examples: string[] };
   fileStats?: { total: number; skipped: number };
   /** 缺省是旧的全部候选口径；新口径排除内部会话，基线只能在同口径内比较/学习。 */
-  fileStatsProfile?: 'exclude_internal_v1';
+  fileStatsProfile?: 'exclude_internal_v1' | 'exclude_internal_v2';
   /** 最近一次可见会话清单；旧日志缺此字段时保留旧行为。 */
   sessionKeys?: string[];
+  /** 只保留有限的故障身份，供卡片定位会话，不把单条报信说成整种工具失效。 */
+  affectedSessions?: (SessionIdentity & { intentOriginal?: string | null })[];
 }
 export interface SourceReadContext { modifiedAt: string }
 export interface SourceComponent {

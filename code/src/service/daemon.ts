@@ -6,7 +6,8 @@ import { validateConfig } from '../core/config.ts';
 import { acquireLock, recoverDeadLock } from '../core/locks.ts';
 import { agentNotice } from '../core/learning.ts';
 import { appendJsonl, readJsonl } from '../core/store.ts';
-import { shellQuote } from '../core/utils.ts';
+import { firstScreen } from '../core/notice-text.ts';
+import { renderNotice } from '../core/judge.ts';
 import type { Channel, Config } from '../core/types.ts';
 
 interface RunEvent { kind: 'start' | 'stop' | 'alerted'; at: string; runId: string; pid?: number }
@@ -45,7 +46,11 @@ export async function runService(configInput: Config, signal: AbortSignal, compo
     const crashes = history.filter(e => e.kind === 'start' && Date.parse(e.at) >= windowStart && !stopped.has(e.runId));
     const alerted = history.some(e => e.kind === 'alerted' && Date.parse(e.at) >= windowStart);
     if (crashes.length >= (config.service?.restartThreshold ?? 3) && !alerted) {
-      const notice = agentNotice('service_restart', `restarts:${crashes[0]!.runId}`, at, 'personal agent 短时间内反复重启', `短时间内 ${crashes.length} 次异常退出后重新启动。日志：${logPath}`, `open ${shellQuote(logPath)}`);
+      const notice = agentNotice('service_restart', `restarts:${crashes[0]!.runId}`, at, 'personal agent 短时间内反复重启',
+        firstScreen('personal agent，负责替你盯住 AI 的值班程序', `短时间内 ${crashes.length} 次异常退出后重新启动，盯防可能不连续。`, '请检查本机值班程序是否稳定；不会替你停止或启动任何 AI。'),
+        'node code/src/cli/main.ts overview --config <你运行时使用的配置文件>');
+      notice.content.evidence.reason = `异常重启记录：${runsPath}；运行日志：${logPath}`;
+      notice.text = renderNotice(notice.content);
       await publishNotices(config, [notice], at, channels);
       await appendJsonl(runsPath, [{ kind: 'alerted', at, runId } satisfies RunEvent]);
     }

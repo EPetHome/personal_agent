@@ -100,7 +100,8 @@ test('来源损坏按工具合并报警，恢复后再次失败开启新一轮�
   const [notice] = await readOutbox(config.dataDir);
   assert.equal(notice?.tool, 'codex');
   assert.equal(notice?.kind, 'blind');
-  assert.match(notice!.text, /从 2026-10-20T10:31:00.000Z 起读不了 Codex/);
+  assert.match(notice!.content.summary, /出了什么事：从.+起，暂时读不了Codex/);
+  assert.doesNotMatch(notice!.content.summary, /\d{4}-\d\d-\d\dT/);
   assert.equal((await detect(config, '2026-10-20T10:32:00Z')).noticesAdded, 0);
   await put(join(config.sources.codex, 'bad.jsonl'), 'another broken line\n');
   assert.equal((await detect(config, '2026-10-20T10:33:00Z')).noticesAdded, 0);

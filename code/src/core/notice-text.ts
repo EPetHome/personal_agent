@@ -1,5 +1,29 @@
 import { compact } from './utils.ts';
 
+/** 按运行机器当地日历显示，不把 UTC 或跨夏令时的24小时差当作「昨天」。 */
+export function localTime(at: string, now: string): string {
+  const date = new Date(at), current = new Date(now);
+  if (!Number.isFinite(date.getTime())) return '时间暂不清楚';
+  const day = (d: Date) => Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  const days = (day(current) - day(date)) / 86400000;
+  const hour = date.getHours();
+  const label = days === 0 ? hour >= 18 ? '今晚' : hour < 6 ? '今天凌晨' : hour < 12 ? '今天上午' : '今天下午'
+    : days === 1 ? '昨天' : `${date.getFullYear() === current.getFullYear() ? '' : `${date.getFullYear()}年`}${date.getMonth() + 1}月${date.getDate()}日`;
+  return `${label} ${String(hour).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+/** 第一屏只讲人话；原文完整保留在证据，不泄漏中枢路径/行号。 */
+export function humanText(text: string, project: string, now: string): string {
+  return readableLines(text, project).join('；')
+    .replace(/[+]?[0-9]{4,6}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z/g, at => localTime(at, now))
+    .replace(/(?:~\/|\/)[^\s，；。！？、'"<>]+/g, '相关文件')
+    .replace(/[A-Za-z0-9_.-]+\.(?:jsonl|json|[cm]?[jt]sx?|md|txt|log|lock)\b(?::\d+(?::\d+)?)?/g, '相关文件').replace(/第\s*\d+\s*行/g, '')
+    .replace(/\b(?:Read|read)[:：]?\s*/g, '查看文件：').replace(/\b(?:Edit|Write|edit|write)[:：]?\s*/g, '修改文件：').replace(/\b(?:Bash|bash)[:：]?\s*/g, '运行命令：')
+    .replace(/transcript(?:_path)?/gi, '会话记录').replace(/推送/g, '报信').replace(/对账/g, '核对').replace(/来源/g, '记录');
+}
+export function firstScreen(who: string, what: string, action: string): string {
+  return `谁：${who}\n出了什么事：${what}\n要不要你管：${action}`;
+}
+
 /** 有界保留回复首尾和换行，避免长表格挤掉末尾的问题。 */
 export function replyExcerpt(text: string): string {
   const chars = [...text.trim()];

@@ -78,7 +78,7 @@ async function readComponent(path: string, component: SourceComponent) {
     } catch (cause) { error = cause; }
     try { reader.finish(); } catch (cause) { error ??= cause; }
     original.fingerprint = reader.fingerprint;
-    return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, error: reader.error ?? error };
+    return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, lastRecordAt: reader.lastRecordAt, modifiedAt: stat.mtime.toISOString(), error: reader.error ?? error };
   } finally { await handle.close(); }
 }
 function parsePush(value: unknown, path: string, line: number, fingerprint: string): PushRecord {
@@ -96,6 +96,8 @@ export async function perceive(config: Config): Promise<Perception> {
   const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set(), presentPaths: new Set(), seenSessions: [] };
   const reports = new Map<HealthSource, HealthReport>();
   const ignoredSessions = new Set<string>();
+  const activity = new Map<string, { at: string; intent: string | null }>();
+  const summaryWrites = new Map<string, string>();
   function report(source: HealthSource): HealthReport {
     if (!reports.has(source)) reports.set(source, { source, errors: [], paths: [] });
     return reports.get(source)!;
@@ -110,17 +112,24 @@ export async function perceive(config: Config): Promise<Perception> {
     const identities: SessionIdentity[] = [];
     const failures: { path: string; description: string; identity?: SessionIdentity | null; original?: Original }[] = [];
     health.fileStats = { total: files.length, skipped: 0 };
-    health.fileStatsProfile = 'exclude_internal_v1';
+    health.fileStatsProfile = 'exclude_internal_v2';
     for (const path of files) {
       try {
         const observed = await readComponent(path, component);
         for (const sessionId of observed.sessionIds) result.seenSessions.push({ tool: component.tool, sessionId });
         if (observed.identity) identities.push(observed.identity);
-        if ((observed.identity && isInternalSession(component.tool, observed.identity.sessionId))
+        if (!observed.error && observed.identity && observed.lastRecordAt) {
+          const previous = activity.get(observed.identity.sessionId);
+          if (!previous || observed.lastRecordAt > previous.at) activity.set(observed.identity.sessionId, { at: observed.lastRecordAt, intent: observed.record?.intent.initial ?? null });
+        }
+        if ((observed.identity && isInternalSession(component.tool, observed.identity.sessionId, observed.identity.project))
           || (observed.sessionIds.size && [...observed.sessionIds].every(id => isInternalSession(component.tool, id)))) { health.fileStats.total--; continue; }
         if (observed.error) {
           failures.push({ path, description: `${path}：${errorMessage(observed.error)}`, identity: observed.identity, original: observed.original });
-        } else if (observed.record) records.push(observed.record);
+        } else if (observed.record) {
+          records.push(observed.record);
+          if (component.tool === 'loop') summaryWrites.set(observed.record.key, observed.modifiedAt);
+        }
         else {
           health.fileStats.skipped++;
           // 空/非会话记录不能给推送对账，也不能把过去已知子任务误当完成。
@@ -141,6 +150,7 @@ export async function perceive(config: Config): Promise<Perception> {
       if (failure.identity && isIgnoredMember(failure.identity, peers, config, component.tool)) ignoredSessions.add(`${component.tool}:${failure.identity.sessionId}`);
       else {
         unreadable(health, failure.description);
+        if (failure.identity && (health.affectedSessions?.length ?? 0) < 3) (health.affectedSessions ??= []).push(failure.identity);
         result.failedPaths.add(`${component.tool}:${failure.path}`);
         if (failure.original && typeof failure.identity?.parentSessionId === 'string' && failure.identity.parentSessionId.trim()) {
           result.failedSessions.push({ ...failure.identity, tool: component.tool, original: failure.original });
@@ -150,7 +160,26 @@ export async function perceive(config: Config): Promise<Perception> {
     if (!records.length && health.fileFailures?.count) coreUnavailable(health);
     for (const record of records) {
       if (isIgnoredMember(record, peers, config, component.tool)) ignoredSessions.add(record.key);
-      else result.records.push(record);
+      else {
+        if (record.loop?.sessions) {
+          const sessions = record.loop.sessions, summaryAt = record.lastActivityAt;
+          const roles: [string, string][] = [[sessions.development, '开发'], [sessions.review, `评审第 ${Math.max(1, record.loop.reviews + 1)} 轮`], ...sessions.acceptance.map((id): [string, string] => [id, '验收'])];
+          if (record.loop.status === '进行中') for (const [id, phase] of roles) {
+            const observed = activity.get(id);
+            if (observed && observed.at > record.lastActivityAt) {
+              record.lastActivityAt = observed.at;
+              // 总结的轮次时间是「开始」，不是「结束」。只有总结写成后又有评审记录才是下一轮。
+              if (id !== sessions.review || observed.at > (summaryWrites.get(record.key) ?? summaryAt)) record.loop.phase = phase;
+            }
+          }
+          const intent = activity.get(sessions.development)?.intent;
+          // 总结不带批名时，只取开发任务明确写出的批名/提示词标题，不读它提到的文件。
+          record.loop.batch ??= intent?.match(/批次[：:]\s*([^\n<]+)/)?.[1]?.trim()
+            ?? intent?.match(/(?:提示词[-：:]\s*)([^\n<>"/]+?)(?:\.md|（|\(|\n|$)/)?.[1]?.trim();
+          if (record.lastActivityAt > summaryAt) record.recentSteps.unshift({ at: record.lastActivityAt, text: record.loop.phase ?? '开发' });
+        }
+        result.records.push(record);
+      }
     }
   }
   if (config.inboxDir !== null) {
@@ -177,7 +206,7 @@ export async function perceive(config: Config): Promise<Perception> {
             if (!line.trim()) { if (!broken) consumed = lineNumber; continue; }
             try {
               const value = JSON.parse(line);
-              if (!(typeof value?.session_id === 'string' && isInternalSession(value.tool, value.session_id))
+              if (!(typeof value?.session_id === 'string' && isInternalSession(value.tool, value.session_id, typeof value.cwd === 'string' ? value.cwd : ''))
                 && !ignoredSessions.has(`${value?.tool}:${value?.session_id}`)
                 && !(typeof value?.cwd === 'string' && isIgnoredProject(value.cwd, config))) {
                 result.pushes.push(parsePush(value, path, lineNumber, hash(line)));

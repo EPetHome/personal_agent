@@ -2,14 +2,15 @@ import { dirname } from 'node:path';
 import { isIgnoredProject } from './config.ts';
 import type { Config, PushRecord, SessionIdentity, SessionMember, SessionRecord, Tool } from './types.ts';
 
-export function isInternalSession(tool: Tool, sessionId: string): boolean {
-  return ['cc', 'codex', 'pi'].includes(tool) && sessionId.startsWith('autoreview-');
+export function isInternalSession(tool: Tool, sessionId: string, project = ''): boolean {
+  // 只做词法目录边界匹配，不访问个人目录；流水线整批验收的会话号可能是普通 UUID。
+  return ['cc', 'codex', 'pi'].includes(tool) && (sessionId.startsWith('autoreview-') || project.split('/').includes('.pi-autoreview'));
 }
 export function isIgnoredMember(member: SessionIdentity, peers: readonly SessionIdentity[], config: Config, tool: Tool): boolean {
   const seen = new Set<string>();
   let current: SessionIdentity | undefined = member;
   while (current && !seen.has(current.sessionId)) {
-    if (isInternalSession(tool, current.sessionId) || isIgnoredProject(current.project, config)) return true;
+    if (isInternalSession(tool, current.sessionId, current.project) || isIgnoredProject(current.project, config)) return true;
     seen.add(current.sessionId);
     const parentId: string | undefined = current.parentSessionId;
     if (!parentId) break;

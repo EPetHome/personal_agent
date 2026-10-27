@@ -1,4 +1,5 @@
 import type { Notice } from '../../core/types.ts';
+import { localTime } from '../../core/notice-text.ts';
 
 function markdown(content: string) { return { tag: 'markdown', content }; }
 function button(text: string, value: Record<string, string>) {
@@ -10,8 +11,7 @@ function buttons(actions: unknown[]) {
 /** 编号仅放按钮的隐藏 value，不放标题、正文或确认文本。 */
 export function noticeCard(notice: Notice) {
   const evidence = notice.content.evidence;
-  const summary = notice.kind === 'weekly' && notice.reviews?.length ? notice.content.summary.split('\n\n复盘')[0]! + '\n\n复盘' : notice.kind === 'recurrence' ? '同类问题再次出现，归因与对策请你确认。' : notice.content.summary;
-  const elements: unknown[] = [markdown(summary), markdown(`回去看：\n${notice.content.returnCommand}`)];
+  const elements: unknown[] = [markdown(notice.content.summary), markdown(`回去看：\n${notice.content.returnCommand}`)];
   if (!['weekly', 'recurrence', 'service_restart'].includes(notice.kind)) elements.push(buttons(['正确', '误报'].map(verdict => button(verdict, { action: 'feedback', verdict, noticeId: notice.id }))));
   for (const item of notice.reviews ?? []) {
     elements.push(markdown(item.title));
@@ -20,7 +20,7 @@ export function noticeCard(notice: Notice) {
   }
   elements.push({ tag: 'collapsible_panel', expanded: false, header: { title: { tag: 'plain_text', content: '证据' } }, elements: [markdown([
     `意图原文：${evidence.intentOriginal ?? '未提供'}`, ...evidence.additionalRequirements.map(s => `追加要求：${s}`),
-    ...evidence.recentSteps.map(s => `${s.at} ${s.text}`), `判断依据：${evidence.reason}`, ...evidence.originals.map(o => `原件：${o.path}`),
+    ...evidence.recentSteps.map(s => `${localTime(s.at, notice.at)} ${s.text}`), `判断依据：${evidence.reason}`, ...evidence.originals.map(o => `原件：${o.path}`),
   ].join('\n'))] });
   return { schema: '2.0', config: { update_multi: true }, header: { title: { tag: 'plain_text', content: notice.content.title }, template: notice.level === '现在就要你' ? 'orange' : 'blue' }, body: { elements } };
 }

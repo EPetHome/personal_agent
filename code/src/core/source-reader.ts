@@ -10,6 +10,7 @@ export class SourceReader {
   fingerprint = '';
   error: Error | undefined;
   identity: SessionIdentity | null = null;
+  lastRecordAt: string | undefined;
   readonly sessionIds = new Set<string>();
   private complete = false;
   private jsonChecked = false;
@@ -84,6 +85,10 @@ export class SourceReader {
       } catch {
         this.error ??= new Error(`第 ${lineNumber} 行无法解析为 JSON`);
         continue; // 不把损坏前缀当正常结果：调用方在完整遍历后检查 error。
+      }
+      if (typeof row.timestamp === 'string' && Number.isFinite(Date.parse(row.timestamp))) {
+        const at = new Date(row.timestamp).toISOString();
+        if (!this.lastRecordAt || at > this.lastRecordAt) this.lastRecordAt = at;
       }
       const identity = this.component.identifyRow?.(row) ?? null;
       const sessionId = this.component.sessionIdOf?.(row) ?? identity?.sessionId;
