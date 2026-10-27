@@ -170,7 +170,7 @@ test('真机 A7：loop 小问题、额外发现和人工欠项合并列出；确
   assert.deepEqual(last.content.evidence.needs, []); assert.match(last.text, /还欠什么：无/);
 });
 
-for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长表格后提问，本机正文首行是问题，无路径/理由/表格/重复/叠标点`, async t => {
+for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长表格后提问，本机四段文案保留原问题，无内部路径/理由/表格/重复/叠标点`, async t => {
   const { root, config, transcript } = await fixture(t);
   const question = '请你确认要选择 A 还是 B？';
   const reply = '已整理好了。。\n| 方案 | 内容 |\n| --- | --- |\n' + '| A | 构造条目 |\n'.repeat(200)
@@ -190,8 +190,11 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长
   await detect(config, now, { judge: { async judge(r) { return r.task === 'waiting' ? { answer: '是', reason: 'MODEL_REASON_EVIDENCE_ONLY' } : no; } } });
   const calls = await readJsonl<string[]>(log); assert.equal(calls.length, 1);
   const body = calls[0]!.at(-1)!;
-  assert.equal(body.split('\n')[0], question); assert.equal(body, question);
-  assert.ok(!/\/sample|\||MODEL_REASON|。。/.test(body));
+  assert.match(body.split('\n')[0]!, /^谁：/);
+  assert.equal(body.split('\n')[2], `要不要你管：${question}`);
+  assert.equal(body.split(question).length - 1, 1);
+  assert.match(body.split('\n')[3]!, /^回去看：/);
+  assert.ok(!/\/sample|\||MODEL_REASON|。。/.test(body.split('\n回去看：')[0]!));
   assert.ok((await readOutbox(config.dataDir))[0]?.content.evidence.reason.includes('MODEL_REASON_EVIDENCE_ONLY'));
 });
 
@@ -299,8 +302,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`返修1-1：${tool} 有
   assert.ok([...waiting[0]!.assistantReply].length <= 1200);
   assert.equal(view.records[0]?.status, '在等我');
   assert.equal(view.records[0]?.modelWaiting?.evidenceAt, push!.at);
-  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1), question, '通知不能退化为默认占位话');
-  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary, question);
+  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1)?.split('\n')[2], `要不要你管：${question}`, '通知不能退化为默认占位话');
+  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary.split('\n')[2], `要不要你管：${question}`);
   await detect(config, new Date().toISOString());
   assert.equal((await readJsonl(modelLog)).length, contexts.length, '成功判断空跑不重调');
   assert.equal((await readJsonl(notifications)).length, 1, '同一条提醒继续去重');

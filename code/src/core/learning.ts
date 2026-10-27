@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { withNamedLock } from './locks.ts';
 import { isIgnoredProject } from './config.ts';
@@ -8,6 +8,9 @@ import { event, project } from './events.ts';
 import { piReadOnly } from './model.ts';
 import { feedbackCategory, kindNames } from './statistics.ts';
 import { compact, hash, iso, shellQuote, truncateText } from './utils.ts';
+import { firstScreen, humanText, localTime } from './notice-text.ts';
+import { renderNotice } from './judge.ts';
+import { toolNames } from './types.ts';
 import type { Config, Notice, ReviewItem } from './types.ts';
 
 export const layers = ['意图没说清', 'AI 执行偏了', '工具与环境', '盯防自身', '归因未定'] as const;
@@ -17,6 +20,9 @@ export type MemoryStatus = typeof memoryStatuses[number];
 export interface Problem {
   id: string; source: string; at: string; type: string; tool: string; project: string | null;
   fact: string; locations: string[]; layer: Layer; reason: string; countermeasure: string; experienceId: string;
+  returnCommand?: string;
+  sameReason?: string;
+  loop?: { batch: string; repairs: number; reviews: number };
 }
 export interface Experience {
   id: string; type: string; tool: string; project: string | null; layer: Layer; reason: string; countermeasure: string;
@@ -53,6 +59,11 @@ export async function readLearning(dataDir: string) {
     } else throw new Error('不支持的经验事件，保留现场');
   }
   return { events, problems, experiences };
+}
+export async function learningBaseline(dataDir: string): Promise<string | undefined> {
+  const rows = await readJsonl<{ version: number; at: string }>(join(dataDir, 'learning-baseline.jsonl'));
+  if (rows.some(row => row.version !== 1 || !Number.isFinite(Date.parse(row.at)))) throw new Error('复盘首次接入记录损坏，保留现场');
+  return rows[0]?.at;
 }
 export async function changeExperience(dataDir: string, id: string, status: MemoryStatus, changes?: Partial<Pick<Experience, 'layer' | 'reason' | 'countermeasure' | 'note'>>, atInput = new Date().toISOString(), replyId?: string, expectedRevision?: string): Promise<'changed' | 'duplicate' | 'stale' | 'inactive'> {
   const at = iso(atInput);
@@ -115,7 +126,10 @@ export function reviewItems(problems: Problem[], experiences: Map<string, Experi
     const previous = all.at(-2);
     // 使用再次出现时留存的旧对策，不拿事后新定的对策伪装成“有对策却又出现”。
     const previousCountermeasure = previous && latest.countermeasure ? latest.countermeasure : '';
-    const title = `${kindNames[latest.type.replace(/^正确:/, '') as Notice['kind']] ?? latest.type}：${compact(latest.fact, 180)}；第 ${all.length} 次${previous ? `，上次 ${previous.at}` : ''}${previousCountermeasure ? `，上次对策：${previousCountermeasure}（有对策却又出现）` : ''}；归因：${experience.layer}（${experience.status}）；建议对策：${experience.countermeasure || '待起草/修改'}`;
+    const ai = `${latest.project ? `${basename(latest.project)} 的 ` : ''}${toolNames[latest.tool as keyof typeof toolNames] ?? latest.tool}`;
+    const fact = latest.loop ? `${latest.loop.batch}，已评审 ${latest.loop.reviews} 轮、返修 ${latest.loop.repairs} 次`
+      : `${kindNames[latest.type.replace(/^正确:/, '') as Notice['kind']] ?? latest.type}：${compact(latest.fact, 180)}`;
+    const title = humanText(`${ai}：${fact}；第 ${all.length} 次${previous ? `，上次${localTime(previous.at, to)}；为什么算同类：${latest.sameReason ?? '同种问题、同种工具，已有记录将它们归在同一类'}` : ''}${previousCountermeasure ? `，上次对策：${previousCountermeasure}（有对策却又出现）` : ''}；归因：${experience.layer}（${experience.status}）；建议对策：${experience.countermeasure || '还没定，请补充或修改后确认'}`, latest.project ?? '', to);
     result.push({ experienceId: experience.id, experienceRevision: experienceRevision(experience), title, count: all.length, previousAt: previous?.at ?? null, previousCountermeasure, layer: experience.layer, countermeasure: experience.countermeasure, status: experience.status });
   }
   return result.sort((a, b) => Number(!!b.previousCountermeasure) - Number(!!a.previousCountermeasure) || Number(b.count > 1) - Number(a.count > 1) || b.count - a.count || a.title.localeCompare(b.title));
@@ -124,6 +138,10 @@ export function reviewItems(problems: Problem[], experiences: Map<string, Experi
 export async function collectProblems(config: Config, now: string, injected?: ExperienceModel): Promise<Notice[]> {
   return withNamedLock(config.dataDir, '.learning.lock', async () => {
     const state = await readLearning(config.dataDir);
+    // 与现有经验日志分开追加：不改写旧反馈/经验，旧版本回退也仍能读原日志。
+    const existingBaseline = await learningBaseline(config.dataDir);
+    const baselineAt = existingBaseline ?? now;
+    if (!existingBaseline) await appendJsonl(join(config.dataDir, 'learning-baseline.jsonl'), [{ version: 1, at: baselineAt }]);
     const input = await withStoreLock(config.dataDir, async () => ({ events: await readEvents(config.dataDir), outbox: await readOutbox(config.dataDir), feedback: await readFeedback(config.dataDir) }));
     const lookup = new Map(input.outbox.map(n => [n.id, n]));
     const candidates: Omit<Problem, 'layer' | 'reason' | 'countermeasure' | 'experienceId'>[] = [];
@@ -137,12 +155,16 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
       const occurrence = notice && feedback.verdict !== '漏了' ? `notice:${notice.id}:${feedback.verdict}` : source;
       candidates.push({ id: hash(occurrence), source, at: feedback.at, type: feedback.verdict === '正确' ? `正确:${category.kind}` : feedback.verdict,
         tool: category.tool, project: notice?.content.evidence.project ?? null,
-        fact: truncateText([feedback.verdict, feedback.comment, notice?.content.summary].filter(Boolean).join('；'), 4000), locations: notice?.content.evidence.originals.map(o => o.path) ?? [] });
+        fact: truncateText([feedback.verdict, feedback.comment, notice?.content.summary].filter(Boolean).join('；'), 4000), locations: notice?.content.evidence.originals.map(o => o.path) ?? [],
+        ...(notice ? { returnCommand: notice.content.returnCommand } : {}) });
     }
     for (const record of project(input.events).sessions.values()) {
       if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || !record.loop || record.lastActivityAt > now || (record.loop.repairs < 2 && !/上限|达到.{0,8}限/.test(record.loop.conclusion))) continue;
       const source = `loop:${record.key}`;
-      candidates.push({ id: hash(source), source, at: record.lastActivityAt, type: 'loop返修', tool: 'loop', project: record.project, fact: `${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次`, locations: record.originals.map(o => o.path) });
+      candidates.push({ id: hash(source), source, at: record.lastActivityAt, type: 'loop返修', tool: 'loop', project: record.project,
+        fact: `${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次`, locations: record.originals.map(o => o.path),
+        returnCommand: record.originals[0] ? `open ${shellQuote(record.originals[0].path)}` : undefined,
+        loop: { batch: record.loop.batch ?? '批次名暂未记录', reviews: record.loop.reviews, repairs: record.loop.repairs } });
     }
     const known = new Set(state.problems.map(p => p.id));
     const notices: Notice[] = [];
@@ -172,7 +194,13 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
         if (!last) continue;
         const same = previous.layer === problem.layer && (problem.layer !== '归因未定' || problem.fact === last.fact)
           || await ask('same_problem', `${last.id}:${problem.id}`, signal => model!.same(last, problem, signal));
-        if (same) { matched = previous; break; }
+        if (same) {
+          matched = previous;
+          problem.sameReason = previous.layer === problem.layer && problem.layer !== '归因未定'
+            ? `都是${problem.type === 'loop返修' ? 'loop 反复返修' : problem.type}，并且都归为「${problem.layer}」`
+            : problem.fact === last.fact ? '同种工具出现同样的问题事实，具体原因仍待确认' : '逐条比较两次问题后，认为发生的是同一类问题；具体原因还需你确认';
+          break;
+        }
       }
       problem.experienceId = matched?.id ?? hash(`experience:${problem.id}`);
       // 冻结问题发生前有效的已确认对策，期间确认/修订过的当前版本不能回填历史。
@@ -192,10 +220,21 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
     for (const problem of ordered) {
       prior.push(problem);
       const count = prior.filter(p => p.experienceId === problem.experienceId).length;
-      if (count < 2 || (count !== 2 && !problem.countermeasure)) continue;
+      const firstAfterBaseline = !prior.some(p => p !== problem && p.experienceId === problem.experienceId && p.at > baselineAt);
+      if (problem.at <= baselineAt || count < 2 || (count !== 2 && !problem.countermeasure && !firstAfterBaseline)) continue;
       const item = reviewItems(prior, state.experiences, problem.at, problem.at).find(r => r.experienceId === problem.experienceId);
       if (!item || input.events.some(e => e.kind === 'notice_planned' && e.notice.dedupeKey === `recurrence:${problem.id}`)) continue;
-      notices.push(agentNotice('recurrence', `recurrence:${problem.id}`, now, '同类问题又出现了，请确认归因与对策', item.title, `open ${shellQuote(join(config.dataDir, 'learning.jsonl'))}`, [item]));
+      const ai = `${problem.project ? `${basename(problem.project)} 的 ` : ''}${toolNames[problem.tool as keyof typeof toolNames] ?? problem.tool}`;
+      const who = humanText(`${ai}${problem.loop ? `，${problem.loop.batch}，已评审 ${problem.loop.reviews} 轮` : '，你反馈过的问题'}`, problem.project ?? '', now);
+      const title = `${ai}${problem.loop ? `（${humanText(problem.loop.batch, problem.project ?? '', now)}）返修 ${problem.loop.repairs} 次` : ' 的同类问题又出现了'}，请确认经验`;
+      const notice = agentNotice('recurrence', `recurrence:${problem.id}`, now, title,
+        firstScreen(who, item.title, '请看归因和建议对策，点「同意」只会将这条经验记为已确认；点「改一下」退回待确认，不会自动执行或修改项目规则。'),
+        problem.returnCommand ?? '暂时没有可恢复的会话，请查看你反馈的那条提醒。', [item]);
+      notice.content.evidence = { project: problem.project, intentOriginal: null, additionalRequirements: [],
+        recentSteps: prior.filter(p => p.experienceId === problem.experienceId).map(p => ({ at: p.at, text: p.fact })),
+        reason: `${problem.reason}\n同类依据：${problem.sameReason ?? '已有归类'}`, originals: problem.locations.map(path => ({ path, fingerprint: '' })) };
+      notice.text = renderNotice(notice.content);
+      notices.push(notice);
     }
     return notices;
   });

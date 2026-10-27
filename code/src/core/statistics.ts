@@ -2,6 +2,7 @@ import { readFeedback } from './feedback.ts';
 import { readOutbox } from './store.ts';
 import { iso } from './utils.ts';
 import { toolNames } from './types.ts';
+import { localTime } from './notice-text.ts';
 import type { Feedback, Notice } from './types.ts';
 
 export const kindNames: Record<Notice['kind'], string> = { waiting: '在等你', drift: '疑似跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成', weekly: '每周小结', recurrence: '同类问题', service_restart: '常驻重启' };
@@ -65,5 +66,5 @@ export async function statistics(dataDir: string, now = new Date().toISOString()
 }
 export function renderStatistics(stats: Statistics): string {
   const percent = (n: number | null) => n === null ? '—' : `${(n * 100).toFixed(1)}%`;
-  return [`反馈统计（${stats.from} ～ ${stats.to}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈'])].join('\n');
+  return [`反馈统计（${localTime(stats.from, stats.to)} ～ ${localTime(stats.to, stats.to)}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈'])].join('\n');
 }

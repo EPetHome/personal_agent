@@ -1,5 +1,5 @@
 import { basename } from 'node:path';
-import { readableLines, requestedAction } from './notice-text.ts';
+import { firstScreen, humanText, localTime, requestedAction } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
 import { toolNames } from './types.ts';
@@ -92,43 +92,53 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     let kind: Notice['kind'] | undefined;
     let key = '';
     let title = '';
-    let summary = '';
+    let summary = '', action = '';
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
     const waitingMember = record.waiting ? membersOf(record).find(member => pushMatchesMember(record.waiting!, member))
       : record.modelWaiting ? membersOf(record).find(member => member.sessionId === record.modelWaiting!.sessionId) : undefined;
     const modelReply = record.modelWaiting ? projection.pushes.findLast(p => p.recordKey === record.key && p.sessionId === record.modelWaiting!.sessionId
       && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
-    const last = modelReply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
+    const last = record.loop?.phase ?? modelReply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
+    const batch = record.loop ? humanText(record.loop.batch ?? '批次名暂未记录', record.project, now) : '';
+    const identity = record.loop ? `${ai}，${batch}，${record.loop.phase ?? '开发'}（已评审 ${record.loop.reviews} 轮）`
+      : `${ai}：${compact(humanText(record.intent.initial ?? '任务意图暂未记录', record.project, now), 140)}`;
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
-      key = `${kind}:${record.key}:${hash(JSON.stringify(record.loop))}`;
-      title = `${ai} ${record.loop.status === '暂停' ? '停下了，需要你决定' : '做完了，给你一份交代'}`;
-      summary = `${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次。还欠什么：${record.loop.needs.join('；') || '无'}`;
+      // 展示用的批名/当前步骤/关联会话不改变旧版去重键，升级不能重发已交代的总结。
+      const { batch: _batch, phase: _phase, sessions: _sessions, ...facts } = record.loop;
+      key = `${kind}:${record.key}:${hash(JSON.stringify(facts))}`;
+      title = `${ai}（${batch}）${record.loop.status === '暂停' ? '停下了，需要你决定' : '做完了，给你一份交代'}`;
+      summary = `${record.loop.conclusion}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次。还欠什么：${compact(record.loop.needs.join('；') || '无', 280)}`;
+      action = record.loop.status === '暂停' ? '请打开总结，决定接下来怎么做。' : record.loop.needs.length ? '请有空打开总结，核销还欠的事项。' : '不用管，只是告诉你；不会自动合入或发布。';
     } else if (record.status === '在等我' && record.waiting) {
       kind = 'waiting';
       key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
       const child = record.waiting.sessionId !== record.sessionId;
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-      summary = requestedAction(record.waiting.detail || last, record.project, `请回到${child ? '子' : ''}会话确认是否授权。`);
+      summary = `${localTime(record.waiting.at, now)}停下来等你授权${child ? '，等的是这个子会话' : ''}。`;
+      action = requestedAction(record.waiting.detail || last, record.project, `请回到${child ? '子' : ''}会话确认是否授权。`);
     } else if (record.status === '在等我' && record.modelWaiting) {
       kind = 'waiting';
       key = `model_waiting:${record.key}:${record.modelWaiting.fingerprint}`;
       title = `${ai} 可能在等你回复`;
-      summary = requestedAction(last, record.project);
+      summary = `${localTime(record.modelWaiting.evidenceAt, now)}答完后留下了一个需要你回复的问题。`;
+      action = requestedAction(last, record.project);
     } else if (record.status === '疑似跑偏' && record.drift) {
       kind = 'drift';
       key = `drift:${record.key}:${record.drift.fingerprint}`;
       title = `${ai} 疑似跑偏`;
       summary = `可能跑偏。意图是「${record.drift.result.intentQuote}」，实际在做「${record.drift.result.stepQuote}」；对不上：${record.drift.result.reason}`;
+      action = '请回到会话核对是否偏离要求；可以回复「正确」或「误报」。';
     } else if (record.status === '停滞') {
       kind = 'stalled';
       key = `stalled:${record.key}`;
-      title = `${ai} 干到一半没动静了`;
+      title = `${ai}${record.loop ? `（${batch}）` : ''} 干到一半没动静了`;
       const minutes = Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000);
-      summary = `最后在做 ${last}，已经 ${minutes} 分钟没有新记录，按规则判为停滞。`;
+      summary = `最后在做 ${compact(last, 180)}，已经 ${minutes} 分钟没有新记录；最后动静是${localTime(record.lastActivityAt, now)}。`;
+      action = '请有空回去看看是否卡住；这里只提醒，不会替你启动或停止它。';
     }
     if (!kind) continue;
-    summary = readableLines(summary, record.project).join('\n');
+    summary = firstScreen(identity, humanText(summary, record.project, now), humanText(action, record.project, now));
     const already = projection.notices.some(n => n.dedupeKey === key);
     const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     const recovered = kind === 'waiting' && projection.pushes.some(push => push.recovered && push.recordKey === record.key
@@ -159,14 +169,27 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const key = `${kind}:${health.source}:${kind === 'blind' ? health.episodeId : health.fileFailureEpisodeId}`;
     if (projection.notices.some(n => n.dedupeKey === key)) continue;
     const failures = health.fileFailures;
+    const failureDetails = [...health.errors, ...(failures?.examples ?? [])].join('\n');
+    const affected = health.affectedSessions?.[0] ?? records.find(r => r.tool === health.source && r.originals.some(o => failureDetails.includes(o.path)));
+    const intent = affected && ('intentOriginal' in affected ? affected.intentOriginal : 'intent' in affected ? affected.intent.initial : null);
+    const ai = affected ? `${basename(affected.project)} 的 ${toolNames[health.source]}` : `${toolNames[health.source]}（项目和会话暂时无法辨认）`;
+    const mismatch = health.errors.some(error => /推送与已读取会话对不上/.test(error));
+    const since = localTime((kind === 'blind' ? health.since : health.fileFailureSince) ?? now, now);
+    const what = mismatch ? `从${since}起，这个会话的报信和记录没能核对上，暂时不能确认它现在在做什么；其他会话继续检测。`
+      : kind === 'blind' ? `从${since}起，暂时读不了${affected ? '这个会话的记录' : `${toolNames[health.source]} 的会话记录`}，当前进度不能确认；其他工具继续检测。`
+        : `从${since}起发现 ${failures!.count} 份会话读不了；其余会话照常判断和显示。`;
+    const command = affected && health.source !== 'inbox'
+      ? health.source === 'loop' && 'originals' in affected ? `open ${shellQuote(affected.originals[0]!.path)}`
+        : health.source !== 'loop' ? `${shellQuote(config.commands[health.source])} ${health.source === 'cc' ? '--resume' : health.source === 'codex' ? 'resume' : '--session'} ${shellQuote(affected.sessionId)}` : '暂时无法定位总结，请打开 loop 检查。'
+      : `暂时无法定位具体会话，请打开 ${toolNames[health.source]} 检查。`;
     const content: NoticeContent = {
-      title: kind === 'blind' ? `${toolNames[health.source]} 的盯防看不见了`
-        : `${toolNames[health.source]} 有 ${failures!.count} 份会话读不了`,
-      summary: kind === 'blind' ? `从 ${health.since} 起读不了 ${toolNames[health.source]}，当前状态不能确认；其他来源继续检测。`
-        : `从 ${health.fileFailureSince} 起发现 ${failures!.count} 份会话读不了；其余会话照常判断和显示。`,
-      returnCommand: `open ${shellQuote(health.paths[0] ?? config.dataDir)}`,
+      title: kind === 'blind' ? `${affected ? ai : toolNames[health.source]} 的盯防看不见了`
+        : `${affected ? ai : toolNames[health.source]} 有 ${failures!.count} 份会话读不了`,
+      summary: firstScreen(`${ai}：${compact(humanText(intent ?? '任务意图暂未记录', affected?.project ?? '', now), 140)}`,
+        what, affected ? '请回去看看这个会话是否仍在工作；若工作正常，可以回「误报」，我会记下。' : '请检查这个工具的会话记录是否能正常打开；若工具工作正常，可以回「误报」。'),
+      returnCommand: command,
       evidence: {
-        project: null, intentOriginal: null, additionalRequirements: [], recentSteps: [],
+        project: affected?.project ?? null, intentOriginal: intent ?? null, additionalRequirements: [], recentSteps: [],
         reason: [...(kind === 'blind' ? health.errors.slice(0, 3) : []), ...(failures?.examples.slice(0, 3) ?? [])]
           .map(error => compact(error, 240)).join('\n'), originals: [],
       },

@@ -101,7 +101,7 @@ test('A8 助手答完的问句模型是→等待，否→完成；新用户要�
     assert.equal(view.records[0]?.status, waiting ? '在等我' : '已完成');
     const notices = await readOutbox(config.dataDir);
     assert.equal(notices.length, waiting ? 1 : 0);
-    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary, '使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
+    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary.split('\n')[2], '要不要你管：使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
     await detect(config, '2026-10-20T10:02:00Z', { judge }); assert.equal(calls.length, 2);
     await appendFile(transcript, JSON.stringify(ccUser('选 A，继续', '2026-10-20T10:03:00Z')) + '\n');
     assert.equal((await detect(config, '2026-10-20T10:04:00Z', { judge })).records[0]?.status, '进行中');

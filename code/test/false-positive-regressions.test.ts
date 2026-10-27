@@ -223,11 +223,11 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     const health = first.projection.health.get(tool)!;
     assert.deepEqual(health.fileStats, { total: 10, skipped: 5 });
     assert.equal(health.since, null); assert.deepEqual(health.errors, []);
-    assert.equal(health.fileStatsProfile, 'exclude_internal_v1'); assert.equal(health.skipBaseline, 0.5);
+    assert.equal(health.fileStatsProfile, 'exclude_internal_v2'); assert.equal(health.skipBaseline, 0.5);
     assert.equal(first.records.length, 5); assert.equal(calls, 5); assert.equal(first.noticesAdded, 0);
     assert.ok((await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8')).startsWith(prefix));
     const added = (await readEvents(f.config.dataDir)).slice(history.length);
-    assert.ok(added.some(e => e.kind === 'source_health' && e.report.fileStatsProfile === 'exclude_internal_v1'), '统计数量相同时也须追加口径变更');
+    assert.ok(added.some(e => e.kind === 'source_health' && e.report.fileStatsProfile === 'exclude_internal_v2'), '统计数量相同时也须追加口径变更');
     assert.equal((await rebuild(f.config)).projection.health.get(tool)?.skipBaseline, 0.5);
     assert.equal((await detect(f.config, '2026-10-20T10:02:00Z', { judge })).noticesAdded, 0);
 

@@ -12,6 +12,9 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   let conclusion: string | undefined;
   let sessionId: string | undefined;
   let lastRound: string | undefined;
+  let batch: string | undefined, phase: string | undefined, reviewSession: string | undefined;
+  const acceptanceSessions: string[] = [];
+  let lastConclusion = '';
   let counts: RegExpMatchArray | null = null;
   let needsDepth = 0;
   let fenced = false;
@@ -21,6 +24,13 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
     project ??= line.match(/^- 项目[：:]\s*(.+)$/)?.[1]?.trim();
     conclusion ??= line.match(/^- 状态[：:]\s*(.+)$/)?.[1]?.trim();
     sessionId ??= line.match(/^- 开发会话[：:]\s*(\S+)/)?.[1];
+    reviewSession ??= line.match(/评审会话[：:]\s*(\S+)/)?.[1];
+    const acceptance = line.match(/验收会话[：:]\s*(\S+)/)?.[1];
+    if (acceptance) acceptanceSessions.push(acceptance);
+    batch ??= line.match(/^- (?:批次|任务)[：:]\s*(.+)$/)?.[1]?.trim();
+    phase ??= line.match(/^- 当前(?:阶段|步骤)[：:]\s*(开发|评审(?:第?\s*\d+\s*轮)?|验收)/)?.[1];
+    if (/^- 验收命令[：:]\s*(?:进行中|运行中)/.test(line)) phase = '验收';
+    if (/^结论[：:]/.test(line)) lastConclusion = line;
     counts ??= line.match(/评审\s*(\d+)\s*次[，,、\s]*返修\s*(\d+)\s*次/);
     const round = line.match(/### 第\s*\d+\s*轮[（(](\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)/);
     if (round) lastRound = `${round[1]}T${round[2]}`;
@@ -50,7 +60,12 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   const at = lastRound ? new Date(lastRound).toISOString() : iso(context?.modifiedAt, 'loop 原件修改时间');
   const record = emptyRecord('loop', sessionId ?? basename(original.path, '.md'), actualProject, at, original);
   record.type = 'loop_run';
-  record.loop = { status, conclusion: actualConclusion, reviews: Number(counts[1]), repairs: Number(counts[2]), needs, needsProvided: true };
+  const reviews = Number(counts[1]);
+  record.loop = { status, conclusion: actualConclusion, reviews, repairs: Number(counts[2]), needs, needsProvided: true,
+    ...(batch ? { batch } : {}), phase: phase ?? (status === '完成' ? '已完成' : /需返修|不通过/.test(lastConclusion) || !reviews ? '开发' : /通过/.test(lastConclusion) ? '验收' : `评审第 ${reviews + 1} 轮`),
+    sessions: { development: record.sessionId, review: reviewSession ?? `autoreview-rev-${record.sessionId}`,
+      acceptance: [...acceptanceSessions, `autoreview-acc-${record.sessionId}`, `autoreview-acc-strong-${record.sessionId}`] },
+  };
   record.assistantFinished = status === '完成';
   record.recentSteps = [{ at, text: `状态：${actualConclusion}` }, ...needs.slice(-7).map(text => ({ at, text }))];
   return record;

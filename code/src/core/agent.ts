@@ -18,7 +18,7 @@ import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, No
 export interface Snapshot { at: string; records: JudgedRecord[]; projection: Projection }
 function activeProjection(projection: Projection, config: Config): Projection {
   const sessions = new Map([...projection.sessions].filter(([, record]) => {
-    if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || isInternalSession(record.tool, record.sessionId)) return false;
+    if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || isInternalSession(record.tool, record.sessionId, record.project)) return false;
     const health = projection.health.get(record.tool);
     // 整体故障时保留最后事实并标失明；局部故障不能让坏文件的旧状态冒充本轮正常。
     return health?.errors.length || !health?.sessionKeys || health.sessionKeys.includes(record.key);
@@ -182,6 +182,10 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
           continue;
         }
         report?.errors.push(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上；未跟随 transcript_path 读取其他文件`);
+        if (report && (report.affectedSessions?.length ?? 0) < 3 && !report.affectedSessions?.some(s => s.sessionId === push.sessionId)) {
+          const known = [...available.values()].find(r => r.tool === push.tool && membersOf(r).some(m => m.sessionId === push.sessionId));
+          (report.affectedSessions ??= []).push({ sessionId: push.sessionId, project: push.project, intentOriginal: known?.intent.initial ?? null });
+        }
         continue;
       }
       const recovered = observedPushes.has(entry.id) && previous.health.get(push.tool)?.errors.some(error =>
@@ -198,7 +202,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       const last = previous.health.get(report.source);
       const anomaly = skipAnomaly(report, last);
       if (anomaly) report.errors.push(anomaly);
-      if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile])) add({ kind: 'source_health', report });
+      if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile, last.affectedSessions]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile, report.affectedSessions])) add({ kind: 'source_health', report });
     }
     add({ kind: 'scan_completed' });
     // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。
