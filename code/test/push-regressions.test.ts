@@ -98,7 +98,9 @@ test('返修1：多层子会话按自己的项目/原件对账并归到根会话
   assert.equal(parent.waiting?.sessionId, 'grandchild');
   assert.equal(view.records.find(r => r.sessionId === 'other')?.status, '进行中');
   const [notice] = await readOutbox(f.config.dataDir);
-  assert.match(notice!.text, /子会话（\/sample\/child-worktree）[\s\S]*npm run build/);
+  assert.match(notice!.text, /子会话[\s\S]*npm run build/);
+  assert.equal(notice?.content.evidence.project, '/sample/child-worktree');
+  assert.ok(!notice?.content.summary.includes('/sample/child-worktree'));
   assert.equal(notice?.content.returnCommand, "'/sample tools/codex' resume grandchild");
   assert.deepEqual(notice?.content.evidence.additionalRequirements, []);
 });

@@ -235,7 +235,7 @@ test('loop：无读权限的唯一总结被跳过，不当整体失明，也不�
 });
 
 for (const missing of [true, false]) {
-  test(`loop：需要你做的事${missing ? '缺段说「总结里没写」' : '明确无才说没有待办'}`, async t => {
+  test(`loop：${missing ? '无欠项段且全文无欠项' : '明确写无'}，交代写「还欠什么：无」`,  async t => {
     const f = await fixture(t);
     f.config.sources.cc = null;
     f.config.sources.loop = join(f.root, 'loop');
@@ -243,8 +243,8 @@ for (const missing of [true, false]) {
     await put(join(f.config.sources.loop, 'project', `${uuid}.md`), text);
     await detect(f.config, later);
     const [notice] = await readOutbox(f.config.dataDir);
-    assert.match(notice!.text, missing ? /总结里没写/ : /总结写明没有待办/);
-    if (missing) assert.ok(!notice!.text.includes('没有待办'));
+    assert.match(notice!.text, /还欠什么：无/);
+    assert.ok(!notice!.text.includes('总结里没写'));
   });
 }
 

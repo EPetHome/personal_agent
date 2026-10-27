@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { fileChannel } from '../channels/file/index.ts';
 import { accepts, configuredChannels } from '../channels/index.ts';
 import { maintain } from './maintenance.ts';
@@ -138,14 +138,27 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       if (JSON.stringify(previous.sessions.get(record.key)) !== JSON.stringify(record)) add({ kind: 'session_observed', record });
     }
     const ids = new Set(events.map(e => e.id));
+    const deferred = new Map(events.flatMap(e => e.kind === 'push_deferred' ? [[e.pushId, e.rounds] as const] : []));
     for (const push of input.pushes) {
       const entry = event({ kind: 'push_observed', push }, now);
       if (!ids.has(entry.id)) { added.push(entry); ids.add(entry.id); }
       // 原件/目录/归并本轮已失败：仅留原始推送，不借缓存成员对账，也不放大局部故障。
-      if (isFailedOriginal(push.tool, push.transcriptPath, input.failedPaths)) continue;
-      const record = findPushTarget(available.values(), push, true);
+      const unwritten = input.unwrittenPaths.has(`${push.tool}:${push.transcriptPath}`);
+      if (!unwritten && isFailedOriginal(push.tool, push.transcriptPath, input.failedPaths)) continue;
+      const record = unwritten ? undefined : findPushTarget(available.values(), push, true);
       if (!record) {
         const report = input.health.find(h => h.source === push.tool);
+        const root = config.sources[push.tool];
+        const path = root ? relative(root, push.transcriptPath) : '..';
+        const conflicting = [...available.values()].filter(r => r.tool === push.tool).flatMap(membersOf)
+          .some(m => (m.sessionId === push.sessionId && (m.project !== push.project || !m.originals.some(o => o.path === push.transcriptPath)))
+            || (m.sessionId !== push.sessionId && m.originals.some(o => o.path === push.transcriptPath)));
+        // 只容忍配置内尚未落盘的会话；错项目、错成员、配置外路径仍立即按原规则报。
+        if (path && path !== '..' && !path.startsWith('../') && !isAbsolute(path) && !conflicting && !report?.errors.length
+          && (deferred.get(entry.id) ?? 0) < 2) {
+          add({ kind: 'push_deferred', pushId: entry.id, rounds: (deferred.get(entry.id) ?? 0) + 1 });
+          continue;
+        }
         report?.errors.push(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上；未跟随 transcript_path 读取其他文件`);
         continue;
       }

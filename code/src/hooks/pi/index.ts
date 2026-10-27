@@ -1,4 +1,4 @@
-import { emitPush } from '../protocol.ts';
+import { emitPush, pushReplyExcerpt } from '../protocol.ts';
 import type { HookPayload } from '../protocol.ts';
 
 // 只依赖宿主的通知接口，结构型契约避免引入第三方运行依赖。
@@ -35,8 +35,7 @@ export function registerMessageListener(pi: ListenerAPI, inboxDir: string): void
       const message = event.message;
       if (message?.role !== 'assistant') return;
       const blocks = Array.isArray(message.content) ? message.content : [];
-      lastReply = blocks.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n');
-      lastReply = [...lastReply].slice(0, 4000).join('');
+      lastReply = pushReplyExcerpt(blocks.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n'));
     } catch { lastReply = ''; }
   });
   pi.on('agent_settled', (_event, ctx) => notify('agent_settled', ctx));

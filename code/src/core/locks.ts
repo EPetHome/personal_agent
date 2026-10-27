@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /** 只恢复带本程序 owner 的锁，且须由内核确认原 PID 已退出。未知/活锁绝不清。 */
 export async function recoverDeadLock(dataDir: string, name: string): Promise<void> {
@@ -23,13 +24,20 @@ export async function recoverDeadLock(dataDir: string, name: string): Promise<vo
     throw error;
   } finally { await release(); }
 }
-export async function acquireLock(dataDir: string, name: string): Promise<() => Promise<void>> {
+export async function acquireLock(dataDir: string, name: string, waitMs = 0): Promise<() => Promise<void>> {
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const path = join(dataDir, name);
-  try { await mkdir(path, { mode: 0o700 }); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`数据目录正被占用：${path}；未知锁须确认没有相关进程后人工恢复`);
-    throw error;
+  const deadline = performance.now() + waitMs;
+  while (true) {
+    try { await mkdir(path, { mode: 0o700 }); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (waitMs <= 0) throw new Error(`数据目录正被占用：${path}；未知锁须确认没有相关进程后人工恢复`);
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error('值班程序还没忙完，这次反馈尚未记下，请稍后再试。');
+      // 只等，不删除/猜测锁的主人；也不重试已经开始写入的操作。
+      await delay(Math.min(50, remaining));
+    }
   }
   const token = randomUUID();
   try { await writeFile(join(path, 'owner.json'), JSON.stringify({ program: 'personal-agent', pid: process.pid, token }), { flag: 'wx', mode: 0o600 }); }

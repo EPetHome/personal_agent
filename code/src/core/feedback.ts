@@ -11,7 +11,7 @@ export async function readFeedback(dataDir: string): Promise<Feedback[]> {
     || (row.noticeId !== null && typeof row.noticeId !== 'string'))) throw new Error('feedback.jsonl 结构损坏；保留现场，请先备份再恢复');
   return rows;
 }
-export async function receiveFeedback(dataDir: string, channel: string, reply: ChannelReply): Promise<'已记下'> {
+export async function receiveFeedback(dataDir: string, channel: string, reply: ChannelReply, waitMs = 30000): Promise<'已记下'> {
   const at = iso(reply.at);
   const match = /^(正确|误报|漏了)(?:\s+([\s\S]*))?$/.exec(reply.content.trim());
   if (!match) throw new Error('反馈请用「正确 / 误报 / 漏了」，后面可附一句话');
@@ -28,5 +28,5 @@ export async function receiveFeedback(dataDir: string, channel: string, reply: C
     if (reply.replyId && previous.some(row => row.channel === channel && row.replyId === reply.replyId)) return '已记下';
     await appendJsonl(join(dataDir, 'feedback.jsonl'), [feedback]);
     return '已记下';
-  });
+  }, waitMs);
 }

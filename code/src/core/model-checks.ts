@@ -1,6 +1,7 @@
 import { membersOf, pushMatchesMember } from './sessions.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
 import { compact, hash } from './utils.ts';
+import { ComponentFailure, safeFailure } from './process.ts';
 import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, Projection, SessionMember, SessionRecord } from './types.ts';
 
 const TEN_MINUTES = 10 * 60 * 1000;
@@ -15,7 +16,7 @@ function candidate(record: SessionRecord, member: SessionMember, task: Candidate
   const context = boundedContext({
     intentOriginal: record.intent.initial, additionalRequirements: record.intent.additions,
     previousSummary: previous?.summary ?? '',
-    newSteps: member.recentSteps.filter(step => !previous?.stepIds.includes(stepId(step))), assistantReply: reply,
+    newSteps: member.recentSteps.filter(step => (previous?.error === '调用失败，仅规则判断' && !previous.failure) || !previous?.stepIds.includes(stepId(step))), assistantReply: reply,
   });
   return { key, task, sessionId: member.sessionId, evidenceAt: at, context, stepIds,
     fingerprint: hash(JSON.stringify([config.judge?.executable, config.judge?.model, record.intent, member.recentSteps, reply, at])) };
@@ -43,7 +44,7 @@ async function timedJudgment(judge: Judge, request: JudgmentRequest, millisecond
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => { controller.abort(); reject(new Error('模型判断超时')); }, Math.max(1, milliseconds));
+    timer = setTimeout(() => { reject(new ComponentFailure('timeout', '模型调用或本轮等待超时')); controller.abort(); }, Math.max(1, milliseconds));
   });
   try { return await Promise.race([Promise.resolve().then(() => judge.judge(request, { signal: controller.signal })), timeout]); }
   finally { clearTimeout(timer!); }
@@ -56,14 +57,20 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
   const day = now.slice(0, 10);
   const deadline = performance.now() + (config.judge.cycleTimeoutMs ?? 60000);
   let checked = 0;
-  for (const record of records) for (const item of candidates(record, projection, config, now)) {
+  // 总览的工具/项目排序不能决定模型排队；最新证据优先，同一时刻先查是否在等用户。
+  const queue = records.flatMap(record => candidates(record, projection, config, now).map(item => ({ record, item })))
+    .sort((a, b) => b.item.evidenceAt.localeCompare(a.item.evidenceAt)
+      || (a.item.task === b.item.task ? 0 : a.item.task === 'waiting' ? -1 : 1) || a.item.key.localeCompare(b.item.key));
+  for (const { record, item } of queue) {
     const previous = projection.modelChecks.get(item.key);
     const deferred = previous?.error === DEFERRED;
-    if (previous?.fingerprint === item.fingerprint && !deferred) continue;
+    const retry = deferred || previous?.error === '调用失败，仅规则判断'
+      || (previous?.error === '每日额度用完，仅规则判断' && previous.at.slice(0, 10) !== day);
+    if (previous?.fingerprint === item.fingerprint && !retry) continue;
     // 首次接入的旧完成记录也不是新动静，不能先耗尽额度再轮到当前任务。
     if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY
       || (projection.startedAt && Date.parse(item.evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK)) continue;
-    if (item.task === 'drift' && (!item.context.newSteps.length || (previous && !deferred && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES))) continue;
+    if (item.task === 'drift' && (!item.context.newSteps.length || (previous && !retry && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES))) continue;
     const check: ModelCheck = { key: item.key, recordKey: record.key, sessionId: item.sessionId, task: item.task,
       at: now, evidenceAt: item.evidenceAt, fingerprint: item.fingerprint, stepIds: item.stepIds,
       summary: compact([...([previous?.summary ?? '', ...item.context.newSteps.map(s => s.text)].filter(Boolean).join('；'))].slice(-500).join(''), 500) };
@@ -79,8 +86,18 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     } else {
       projection.modelCalls.set(day, used + 1);
       const request: JudgmentRequest = { task: item.task, format: 'binary', context: item.context };
-      try { check.result = validateJudgment(await timedJudgment(judge, request, Math.min(config.judge.timeoutMs, deadline - performance.now())), request); }
-      catch { check.error = '调用失败，仅规则判断'; }
+      try {
+        const answer = await timedJudgment(judge, request, Math.min(config.judge.timeoutMs, deadline - performance.now()));
+        try { check.result = validateJudgment(answer, request); }
+        catch { throw new ComponentFailure('invalid_answer', '答案缺少约定的是非或依据字段'); }
+      } catch (error) {
+        check.error = '调用失败，仅规则判断'; check.failure = safeFailure(error);
+      }
+    }
+    if (check.error) {
+      // 失败/超限并未完成判断，不吞步骤；下一轮重试仍提供相同证据。
+      check.stepIds = previous?.stepIds ?? [];
+      check.summary = previous?.summary ?? '';
     }
     await persist({ kind: 'model_checked', check });
     projection.modelChecks.set(item.key, check);
@@ -97,7 +114,11 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
         if (item.task === 'drift' && check && Date.parse(now) - Date.parse(check.at) < TEN_MINUTES) (record.modelNotes ??= []).push('跑偏检查间隔未到，本轮仅规则判断');
         continue;
       }
-      if (check.error) { (record.modelNotes ??= []).push(check.error); continue; }
+      if (check.error) {
+        (record.modelNotes ??= []).push(check.error);
+        if (check.failure) record.modelNotes.push(`${check.failure.category}：${check.failure.detail}`);
+        continue;
+      }
       if (check.result?.answer !== '是') continue;
       if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY) {
         if (Date.parse(now) - Date.parse(record.lastActivityAt) > ONE_DAY) {

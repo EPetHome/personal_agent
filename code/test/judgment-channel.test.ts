@@ -40,7 +40,7 @@ test('A5 推送→规则等待→发件→本机通知一次；模型不取代�
   assert.equal(first.records[0]?.status, '在等我'); assert.equal(calls.length, 0);
   const notice = (await readOutbox(config.dataDir))[0]!;
   assert.equal(notice.level, '现在就要你');
-  for (const text of ['Claude Code', '/sample/project', '意图', '做到哪了', '等你做什么']) assert.ok(notice.text.includes(text));
+  for (const text of ['Claude Code', '/sample/project', '意图', '做到哪了', '允许执行 npm test 吗']) assert.ok(notice.text.includes(text));
   const notifications = await readJsonl<string[]>(log);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]!.at(-2), notice.content.title);
@@ -101,7 +101,7 @@ test('A8 助手答完的问句模型是→等待，否→完成；新用户要�
     assert.equal(view.records[0]?.status, waiting ? '在等我' : '已完成');
     const notices = await readOutbox(config.dataDir);
     assert.equal(notices.length, waiting ? 1 : 0);
-    if (waiting) { assert.match(notices[0]!.content.summary, /可能/); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
+    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary, '使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
     await detect(config, '2026-10-20T10:02:00Z', { judge }); assert.equal(calls.length, 2);
     await appendFile(transcript, JSON.stringify(ccUser('选 A，继续', '2026-10-20T10:03:00Z')) + '\n');
     assert.equal((await detect(config, '2026-10-20T10:04:00Z', { judge })).records[0]?.status, '进行中');
@@ -139,7 +139,7 @@ test('首次历史完成不耗模型额度；有新动静才调，模型等待�
   assert.equal(calls.length, 2);
 });
 
-test('模型失败/每日上限保留规则，总览明确标注；调用预留可重放且无新动静不重试', async t => {
+test('模型失败下一轮重试、每日上限仍保留规则；用量预留可重放', async t => {
   for (const fail of [true, false]) {
     const { config, transcript } = await fixture(t);
     config.judge!.dailyLimit = fail ? 10 : 0;
@@ -150,8 +150,8 @@ test('模型失败/每日上限保留规则，总览明确标注；调用预留�
     assert.match(renderOverview(view.records, view.projection), fail ? /调用失败，仅规则判断/ : /每日额度用完，仅规则判断/);
     const count = calls.length;
     await detect(config, '2026-10-20T10:02:00Z', { judge }); await rebuild(config);
-    assert.equal(calls.length, count);
-    assert.equal((await readEvents(config.dataDir)).filter(e => e.kind === 'model_call_started').length, count);
+    assert.equal(calls.length, fail ? count * 2 : count);
+    assert.equal((await readEvents(config.dataDir)).filter(e => e.kind === 'model_call_started').length, calls.length);
   }
 });
 
@@ -205,7 +205,7 @@ test('Pi 判断器真实子进程边界仅用替身：固定无工具参数、JS
   await executable(command, 'console.log("not JSON")');
   await assert.rejects(piJudge(config.judge!).judge(request));
   await executable(command, 'setTimeout(()=>{},10000)'); config.judge!.timeoutMs = 30;
-  await assert.rejects(piJudge(config.judge!).judge(request), /失败或超时/);
+  await assert.rejects(piJudge(config.judge!).judge(request), /超时/);
 });
 
 test('评测 CLI 用当前可执行替身完成两种问法，判错也只记分不设通过线', async t => {

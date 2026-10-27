@@ -1,5 +1,5 @@
 import { basename } from 'node:path';
-import { emptyRecord, iso, requiredString, truncateText } from '../../core/utils.ts';
+import { compact, emptyRecord, iso, requiredString, truncateText } from '../../core/utils.ts';
 import type { Original, SessionRecord, SourceComponent, SourceReadContext } from '../../core/types.ts';
 
 export function isLoopSummary(name: string): boolean {
@@ -13,8 +13,8 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   let sessionId: string | undefined;
   let lastRound: string | undefined;
   let counts: RegExpMatchArray | null = null;
-  let needsProvided = false;
-  let inNeeds = false;
+  let needsDepth = 0;
+  let fenced = false;
   const needs: string[] = [];
   for (const line of lines) {
     if (/^#\s+自动评审总结/.test(line) || /^- 状态[：:]/.test(line)) recognized = true;
@@ -24,11 +24,20 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
     counts ??= line.match(/评审\s*(\d+)\s*次[，,、\s]*返修\s*(\d+)\s*次/);
     const round = line.match(/### 第\s*\d+\s*轮[（(](\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)/);
     if (round) lastRound = `${round[1]}T${round[2]}`;
-    if (/^## 需要你做的事/.test(line)) { needsProvided = true; inNeeds = true; continue; }
-    if (/^## /.test(line)) inNeeds = false;
-    if (inNeeds) {
-      const need = line.replace(/^[-*]\s*/, '').trim();
-      if (need && need !== '无') needs.push(truncateText(need, 1000));
+    if (/^\s*(?:```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (heading) {
+      if (/需要你做的事|小问题汇总|验收额外发现/.test(heading[2]!)) needsDepth = heading[1]!.length;
+      else if (needsDepth && heading[1]!.length <= needsDepth) needsDepth = 0;
+      continue;
+    }
+    if (needsDepth || /\[人工\]/.test(line)) {
+      if (/^\s*[-*]\s*\[[xX]\]/.test(line)) continue;
+      const raw = line.replace(/^\s*[-*]\s*(?:\[ \]\s*)?/, '').trim();
+      if (/^\|?[\s:|-]+\|?$/.test(raw) || /^\|\s*(?:#|编号|序号|验收项|事项|问题)\s*\|/.test(raw)) continue;
+      const need = compact(raw.replace(/^\||\|$/g, '').replace(/\s*\|\s*/g, '；'), 1000);
+      if (need && !/^(?:无|暂无|没有)(?:新增)?(?:待办|欠项|小问题|额外发现)?[。.!！]?$/.test(need) && !needs.includes(need)) needs.push(truncateText(need, 1000));
     }
   }
   if (!recognized) throw new Error('无法识别 loop 总结格式');
@@ -41,7 +50,7 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   const at = lastRound ? new Date(lastRound).toISOString() : iso(context?.modifiedAt, 'loop 原件修改时间');
   const record = emptyRecord('loop', sessionId ?? basename(original.path, '.md'), actualProject, at, original);
   record.type = 'loop_run';
-  record.loop = { status, conclusion: actualConclusion, reviews: Number(counts[1]), repairs: Number(counts[2]), needs, needsProvided };
+  record.loop = { status, conclusion: actualConclusion, reviews: Number(counts[1]), repairs: Number(counts[2]), needs, needsProvided: true };
   record.assistantFinished = status === '完成';
   record.recentSteps = [{ at, text: `状态：${actualConclusion}` }, ...needs.slice(-7).map(text => ({ at, text }))];
   return record;
