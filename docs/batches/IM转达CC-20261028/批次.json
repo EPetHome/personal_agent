@@ -1,0 +1,12 @@
+{
+  "name": "IM转达CC-20261028",
+  "branch": "feat/IM转达CC",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "IM转达CC": {
+      "prompt": "../../prompt/提示词-IM转达-CC第一格.md",
+      "scope": { "allow": ["code/", "docs/batches/IM转达CC-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["IM转达CC"]]
+}
