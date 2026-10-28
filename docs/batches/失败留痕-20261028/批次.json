@@ -1,0 +1,12 @@
+{
+  "name": "失败留痕-20261028",
+  "branch": "fix/失败留痕",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "丙-失败留痕": {
+      "prompt": "../../prompt/提示词-减负与封存-丙-失败留痕.md",
+      "scope": { "allow": ["code/", "docs/batches/减负与封存-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["丙-失败留痕"]]
+}
