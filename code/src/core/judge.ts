@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { channelName, undeliveredNotices } from './delivery.ts';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
@@ -301,7 +302,8 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   }
   const day = projection.lastScanAt?.slice(0, 10);
   if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);
-  const failed = projection.notices.filter(n => !isFeedbackSuppressed(n, projection.feedbackSuppressions) && projection.channelDeliveries.get(`local:${n.id}`) === false).length;
+  const undelivered = undeliveredNotices(projection);
+  const failed = undelivered.filter(item => item.channel === 'local' && !item.stopped).length;
   if (failed) lines.push(`本机通知尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
   if (projection.feishuConnection) {
     const connection = projection.feishuConnection;
@@ -309,7 +311,9 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
       : connection.state === 'connecting' ? '未连接（连接中）' : connection.state === 'reconnecting' ? '未连接（重连中）' : '未连接';
     lines.push(`飞书长连接：${status}${connection.failure ? `；${connection.failure.category}：${connection.failure.message}` : ''}`);
   }
-  const feishuFailed = projection.notices.filter(n => !isFeedbackSuppressed(n, projection.feedbackSuppressions) && projection.channelDeliveries.get(`feishu:${n.id}`) === false).length;
+  const feishuFailed = undelivered.filter(item => item.channel === 'feishu' && !item.stopped).length;
   if (feishuFailed) lines.push(`飞书尚未成功：${feishuFailed} 条；已写发件记录，下轮检测重试。`);
+  for (const item of undelivered.filter(item => item.stopped)) lines.push(`没发出去：${item.title} → ${channelName(item.channel)}；${item.historyUnknown
+    ? '历史失败次数待恢复，暂停发送' : `连续失败 ${item.failures} 次，已停发`}；${item.failure.category}：${item.failure.reason}`);
   return lines.join('\n');
 }

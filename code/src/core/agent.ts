@@ -1,6 +1,9 @@
 import { isAbsolute, join, relative } from 'node:path';
 import { fileChannel } from '../channels/file/index.ts';
 import { accepts, configuredChannels } from '../channels/index.ts';
+import { localAlert, reportStorageFailure, withStorageAlerts } from './alerts.ts';
+import { channelName, MAX_CHANNEL_FAILURES, undeliveredNotices } from './delivery.ts';
+import { safeDeliveryFailure } from './failures.ts';
 import { maintain } from './maintenance.ts';
 import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
@@ -91,7 +94,8 @@ async function snapshot(events: AgentEvent[], config: Config, now?: string): Pro
 }
 function serializedState(view: Snapshot) {
   return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()],
-    ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}) };
+    ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}),
+    undeliveredNotices: undeliveredNotices(view.projection) };
 }
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
 async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>, deferSnapshots = false) {
@@ -115,7 +119,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   for (const channel of channels) for (const notice of queued.notices) {
     if (!accepts(channel, notice) || isFeedbackSuppressed(notice, projection.feedbackSuppressions)) continue;
     const key = `${channel.name}:${notice.id}`;
-    if (!queued.channelDeliveries.has(key) && !previous.deliveredNoticeIds.has(notice.id)) add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok: false });
+    if (!queued.channelDeliveries.has(key) && !previous.deliveredNoticeIds.has(notice.id)) add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok: false, phase: 'queued' });
   }
   let written = 0;
   const flush = async () => {
@@ -144,13 +148,33 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   }
   for (const channel of channels) for (const notice of deliverable) {
     const key = `${channel.name}:${notice.id}`;
-    if (!accepts(channel, notice) || complete.channelDeliveries.get(key) !== false || attempted.has(key)) continue;
+    if (!accepts(channel, notice) || complete.channelDeliveries.get(key) !== false || attempted.has(key)
+      || !complete.channelDeliveryStates.has(key) || complete.channelDeliveryStates.get(key)?.historyUnknown
+      || (complete.channelDeliveryStates.get(key)?.failures ?? 0) >= MAX_CHANNEL_FAILURES) continue;
     if (!await canDeliver(notice)) continue;
     attempted.add(key);
-    let ok = true;
-    try { await channel.send(notice); } catch { ok = false; }
-    add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok });
+    let ok = true, failure;
+    try { await channel.send(notice); }
+    catch (error) { ok = false; failure = safeDeliveryFailure(error); await reportStorageFailure(config, error, channels); }
+    add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok, phase: 'attempted', ...(failure ? { failure } : {}) });
     await flush();
+  }
+  const delivery = activeProjection(project([...events, ...added]), config), local = channels.find(channel => channel.name === 'local');
+  // 包括升级前几百次的旧失败：不再调用原渠道，直接按停止状态告知一次。
+  const stoppedDeliveries = undeliveredNotices(delivery).filter(item => item.stopped && !item.historyUnknown);
+  if (local) for (const notice of deliverable) {
+    const stopped = stoppedDeliveries.filter(item => item.noticeId === notice.id);
+    if (!stopped.length || delivery.deliveryAlerted.has(notice.id) || !await canDeliver(notice)) continue;
+    // 外部通知与日志无原子事务。先持久化一次尝试，崩溃/通知失败也不无限重弹。
+    add({ kind: 'notice_delivery_alerted', noticeId: notice.id }); await flush();
+    delivery.deliveryAlerted.add(notice.id);
+    const destinations = stopped.map(item => `${channelName(item.channel)}（${item.failure.category}：${item.failure.reason}）`).join('、');
+    const alert = localAlert('delivery_failed', `delivery-failed:${notice.id}`, at, `未送达：${notice.content.title}`,
+      `「${notice.content.title}」没发到${stopped.map(item => channelName(item.channel)).join('、')}，已停止重试`, `原因：${destinations}。请查看本机总览。`);
+    let ok = true, failure;
+    try { await local.send(alert); }
+    catch (error) { ok = false; failure = safeDeliveryFailure(error); await reportStorageFailure(config, error, channels); }
+    add({ kind: 'notice_delivery_alerted', noticeId: notice.id, ok, ...(failure ? { failure } : {}) }); await flush();
   }
   const unconfirmed = deliverable.filter(notice => known.has(notice.id) && !complete.deliveredNoticeIds.has(notice.id)).map(notice => notice.id);
   if (unconfirmed.length) { add({ kind: 'notices_delivered', ids: unconfirmed }); await flush(); }
@@ -159,16 +183,19 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   return { ...view, noticesAdded };
 }
 export async function publishNotices(config: Config, notices: Notice[], now: string, channels = configuredChannels(config), attempted = new Set<string>()) {
-  return withStoreLock(config.dataDir, async () => {
+  return withStorageAlerts(config, channels, () => withStoreLock(config.dataDir, async () => {
     const events = await prepareEventLog(config.dataDir, now), known = new Set(project(events).notices.map(n => n.id));
     const added = notices.filter(n => !known.has(n.id)).map(notice => event({ kind: 'notice_planned', notice }, now));
     return settle(config, events, added, now, channels, attempted);
-  });
+  }), false);
 }
 export async function detect(configInput: Config, currentTime = new Date().toISOString(), components: { judge?: Judge; channels?: Channel[]; experienceModel?: ExperienceModel } = {}) {
   const config = await validateConfig(configInput);
   const now = iso(currentTime, '当前时间');
   const channels = components.channels ?? configuredChannels(config);
+  return withStorageAlerts(config, channels, () => detectOnce(config, now, channels, components));
+}
+async function detectOnce(config: Config, now: string, channels: Channel[], components: { judge?: Judge; experienceModel?: ExperienceModel }) {
   const attempted = new Set<string>();
   let modelDeadline = Infinity;
   const deferSnapshots = !!config.judge && (!components.judge || !!components.judge.writeSnapshot);
@@ -277,7 +304,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       if (payload.kind === 'model_call_started') {
         // 短锁内按最新日志原子预留；不能拿模型阶段开始时的旧额度覆盖并发用量。
         const used = project(await readEvents(config.dataDir)).modelCalls.get(now.slice(0, 10)) ?? 0;
-        if (used >= config.judge!.dailyLimit) return false;
+        if (used >= (config.judge!.dailyLimit ?? Infinity)) return false;
       }
       await appendJsonl(join(config.dataDir, 'events.jsonl'), [event(payload, now)]);
       return true;

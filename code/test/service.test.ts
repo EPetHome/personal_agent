@@ -132,6 +132,10 @@ test('段2 A7：三次实际 SIGKILL 与重启，恢复已退出进程锁，只�
   const messages = await waitFor(() => readJsonl<SentMessage>(join(config.dataDir, 'feishu-sent.jsonl')), rows => rows.some(m => m.noticeId === alerts[0]!.id));
   assert.equal(messages.filter(m => m.noticeId === alerts[0]!.id).length, 1);
   await stop(last.child); assert.equal(last.child.exitCode, 0, last.output());
+  const abnormal = (await readJsonl<{ kind: string; message?: string }>(join(config.dataDir, 'service.log.jsonl')))
+    .filter(row => row.kind === 'previous_abnormal_exit');
+  assert.equal(abnormal.length, 3, '丙 A6：每次实际SIGKILL重启均留下单次异常记录');
+  assert.ok(abnormal.every(row => row.message === '上次没有正常停止'));
 });
 
 test('锁恢复不删除活进程锁或未知锁；launchd 激活/停用仅调用显式测试替身', async t => {

@@ -18,7 +18,7 @@ export async function checkSnapshotModels(notices: Notice[], projection: Project
     const input: TaskSnapshotInput = { goal, currentTask, lastOutput, factualStatus };
     let snapshot = notice.snapshot;
     const used = projection.modelCalls.get(day) ?? 0;
-    if (used < config.judge.dailyLimit && Date.now() < deadline
+    if (used < (config.judge.dailyLimit ?? Infinity) && Date.now() < deadline
       && await persist({ kind: 'model_call_started', task: 'snapshot', key }) !== false) {
       projection.modelCalls.set(day, used + 1);
       try {

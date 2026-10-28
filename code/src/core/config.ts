@@ -57,7 +57,7 @@ export async function validateConfig(value: unknown): Promise<Config> {
     config.judge = {
       executable: requiredString(judge.executable, 'judge.executable'),
       model: requiredString(judge.model, 'judge.model'),
-      dailyLimit: integer(judge.dailyLimit, 240, 'judge.dailyLimit', 0),
+      ...(judge.dailyLimit == null ? {} : { dailyLimit: integer(judge.dailyLimit, 0, 'judge.dailyLimit', 0) }),
       timeoutMs: integer(judge.timeoutMs, 30000, 'judge.timeoutMs', 1),
       cycleTimeoutMs: integer(judge.cycleTimeoutMs, 60000, 'judge.cycleTimeoutMs', 1),
     };

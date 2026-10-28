@@ -37,7 +37,7 @@ export async function evaluate(configInput: Config, sampleDir: string, now = new
     for (const sample of requests) {
       const row: Evaluation['samples'][number] = { file: sample.file };
       for (const format of ['binary', 'confidence'] as const) {
-        if (used >= config.judge!.dailyLimit) { result[format].failed++; row[format] = '每日额度用完'; continue; }
+        if (used >= (config.judge!.dailyLimit ?? Infinity)) { result[format].failed++; row[format] = '每日额度用完'; continue; }
         await appendJsonl(join(config.dataDir, 'events.jsonl'), [event({ kind: 'model_call_started', task: sample.request.task, key: `evaluation:${sample.file}:${format}` }, at)]);
         used++;
         try {
