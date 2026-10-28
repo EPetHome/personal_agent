@@ -80,7 +80,7 @@ for (const waiting of [false, true]) {
       if (failure === 'directory-permission' && process.getuid?.() === 0) { t.skip('root 会绕过目录权限位'); return; }
       const f = await family(t);
       if (waiting) await put(f.inbox, [f.push()]);
-      const first = await detect(f.config, '2026-10-20T10:01:00Z');
+      const first = await detect(f.config, '2026-10-20T10:06:00Z');
       const expected = waiting ? '在等我' : '进行中';
       assert.equal(first.records.find(r => r.sessionId === 'demo-codex')?.status, expected);
       const cachedChild = first.records.find(r => r.sessionId === 'demo-codex')!.members!.find(m => m.sessionId === 'child')!;
@@ -95,7 +95,7 @@ for (const waiting of [false, true]) {
       try {
         // 文件不可读期间的新结束推送不可信，不能借缓存成员校验或解除先前等待。
         await put(f.inbox, [...(waiting ? [f.push()] : []), f.push('session_end', '2026-10-20T10:02:00Z')]);
-        const second = await detect(f.config, '2026-10-20T10:03:00Z');
+        const second = await detect(f.config, '2026-10-20T10:08:00Z');
         const parent = second.records.find(r => r.sessionId === 'demo-codex')!;
         assert.equal(parent.status, expected);
         assert.equal(second.records.find(r => r.sessionId === 'other')?.status, '已完成');

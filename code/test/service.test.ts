@@ -88,12 +88,12 @@ test('launchd CLI 默认只写临时目录；安装冲突和卸载后改动均�
   await writeFile(path, before); await uninstallService(configPath, target);
 });
 
-test('段2 A6：实际前台常驻→追加构造推送→2分钟内文件与假飞书卡片；同时收私聊漏报', async t => {
+test('段2 A6：实际前台常驻→追加已满等候窗口的构造推送→文件与假飞书卡片；同时收私聊漏报', async t => {
   const { config, configPath } = await fixture(t), transcript = join(config.sources.cc!, 'session.jsonl');
-  const at = new Date(Date.now() - 1000).toISOString(); await put(transcript, [ccUser('构造前台常驻任务', at), ccCall(at)]);
+  const at = new Date(Date.now() - 12 * 60000).toISOString(); await put(transcript, [ccUser('构造前台常驻任务', at), ccCall(at)]);
   const process = daemon(configPath); t.after(() => stop(process.child, 'SIGKILL'));
   await waitFor(() => readJsonl<{ kind: string }>(join(config.dataDir, 'service.log.jsonl')), rows => rows.some(r => r.kind === 'scan_completed'));
-  const began = Date.now(); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', new Date().toISOString())]);
+  const began = Date.now(); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', at)]);
   const notices = await waitFor(() => readOutbox(config.dataDir), rows => rows.some(n => n.kind === 'waiting'));
   const notice = notices.find(n => n.kind === 'waiting')!;
   await waitFor(() => readJsonl<SentMessage>(join(config.dataDir, 'feishu-sent.jsonl')), rows => rows.some(m => m.noticeId === notice.id));
@@ -110,7 +110,19 @@ test('段2 A7：三次实际 SIGKILL 与重启，恢复已退出进程锁，只�
   for (let i = 0; i < 3; i++) {
     const before = (await readJsonl<{ kind: string }>(join(config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length;
     const p = daemon(configPath); children.push(p.child);
-    await waitFor(() => readJsonl<{ kind: string }>(join(config.dataDir, 'service.log.jsonl')), rows => rows.filter(r => r.kind === 'scan_completed').length > before);
+    try {
+      await waitFor(() => readJsonl<{ kind: string }>(join(config.dataDir, 'service.log.jsonl')), rows => rows.filter(r => r.kind === 'scan_completed').length > before);
+    } catch (error) {
+      // 只补构造现场，不改变等待上限/断言；失败时不要再只剩一个泛化超时。
+      const names = await readdir(config.dataDir);
+      const locks = await Promise.all(names.filter(name => name.includes('.lock')).map(async name => ({ name,
+        files: await readdir(join(config.dataDir, name)).catch(e => (e as NodeJS.ErrnoException).code),
+        owner: await readFile(join(config.dataDir, name, 'owner.json'), 'utf8').catch(e => (e as NodeJS.ErrnoException).code),
+      })));
+      t.diagnostic(JSON.stringify({ round: i + 1, before, exitCode: p.child.exitCode, signalCode: p.child.signalCode, output: p.output(), locks,
+        log: await readJsonl(join(config.dataDir, 'service.log.jsonl')).catch(e => String(e)) }));
+      throw error;
+    }
     await stop(p.child, 'SIGKILL');
   }
   const last = daemon(configPath); children.push(last.child);

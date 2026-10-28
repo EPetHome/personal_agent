@@ -6,6 +6,7 @@ import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
 import { checkSnapshotModels } from './snapshot-model.ts';
 import { noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
+import { nextNoticeReplies, routeNotice } from './interaction.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
 import { event, project, pushIdentity } from './events.ts';
 import { skipAnomaly } from './health.ts';
@@ -85,6 +86,9 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   const at = raw.lastScanAt && raw.lastScanAt > now ? raw.lastScanAt : now;
   const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const add = (payload: EventPayload) => { added.push(event(payload, at)); };
+  for (const reply of nextNoticeReplies(projection)) add({ kind: 'notice_reply_observed', ...reply });
+  // supplemental 通知也走同一分流；历史卡片（缺字段）绝不重新计划或改变出口。
+  for (const entry of added) if (entry.kind === 'notice_planned') entry.notice = routeNotice(entry.notice, projection, at);
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
   const suppressed: EventPayload[] = [];
@@ -241,7 +245,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile, last.affectedSessions]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile, report.affectedSessions])) add({ kind: 'source_health', report });
     }
     add({ kind: 'scan_completed' });
-    // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。
+    // 已过等候间隔的授权等待等确定提醒先交付，绝不等待其他会话的模型。
     return settle(config, events, added, now, channels, attempted, deferSnapshots);
   });
   if (!config.judge) return finish(ruleView);

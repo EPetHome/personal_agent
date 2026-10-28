@@ -214,7 +214,7 @@ test('空会话 A2：同一 Codex 来源有元数据空会话及正常等待回�
     return { answer: request.task === 'waiting' ? '是' : '否', reason: '构造的等待回复判断' };
   } };
   for (let round = 1; round <= 4; round++) {
-    const view = await detect(f.config, at(round), { judge });
+    const view = await detect(f.config, at(round + 5), { judge }); // 等待事实已满五分钟。
     assert.deepEqual(view.projection.health.get('codex')?.errors, []);
     assert.deepEqual(view.records.map(r => [r.sessionId, r.status]), [['healthy', '在等我']]);
   }

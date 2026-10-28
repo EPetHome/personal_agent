@@ -10,13 +10,15 @@ import { feishuChannel } from '../src/channels/feishu/index.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { readFeedback } from '../src/core/feedback.ts';
 import { readJsonl, readOutbox } from '../src/core/store.ts';
-import { ccCall, ccUser, put, pushed, sandbox } from './fixtures.ts';
+import { ccCall, ccUser, put, pushed as samplePush, sandbox } from './fixtures.ts';
+// 本文件测渠道而非等待窗口：使用已等足五分钟的授权事实。
+const pushed = (path: string) => samplePush(path, 'waiting_permission', '2026-10-20T09:55:01Z');
 
 async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_test', timeoutMs: 2000 };
   const transcript = join(f.config.sources.cc!, 'session.jsonl');
-  await put(transcript, [ccUser(), ccCall()]);
+  await put(transcript, [ccUser(undefined, '2026-10-20T09:40:00Z'), ccCall('2026-10-20T09:55:00Z')]);
   return { ...f, transcript, sent: () => readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl')) };
 }
 function text(id: string, content: string, parent?: string, actor = 'ou_test', chat = 'p2p') {

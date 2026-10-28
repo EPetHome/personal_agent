@@ -38,7 +38,7 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
   const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'channel_delivery'];
+  const kinds = ['session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'notice_reply_observed', 'channel_delivery'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
@@ -52,6 +52,9 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
     if (row.kind === 'push_validated' && (typeof row.pushId !== 'string' || !row.pushId || typeof row.recordKey !== 'string' || !row.recordKey)) throw new Error('推送对账事件结构损坏');
     if (row.kind === 'push_deferred' && (typeof row.pushId !== 'string' || !Number.isInteger(row.rounds) || row.rounds < 1 || row.rounds > 2)) throw new Error('推送宽限事件结构损坏');
     if (row.kind === 'notice_planned' && !row.notice?.id) throw new Error('发件事件结构损坏');
+    if (row.kind === 'notice_reply_observed' && (typeof row.noticeId !== 'string' || !row.noticeId
+      || !row.reply || !Number.isInteger(row.reply.index) || row.reply.index < -1
+      || !Number.isFinite(Date.parse(row.reply.at)) || typeof row.reply.sessionId !== 'string')) throw new Error('卡片回话引用结构损坏');
     if (row.kind === 'notice_suppressed' && (typeof row.dedupeKey !== 'string' || typeof row.evidenceAt !== 'string')) throw new Error('历史提醒抑制事件结构损坏');
     if (row.kind === 'model_call_started' && (typeof row.key !== 'string' || !['drift', 'waiting', 'snapshot', 'attribution', 'same_problem'].includes(row.task))) throw new Error('模型用量事件结构损坏');
     if (row.kind === 'notice_snapshot_written' && (typeof row.key !== 'string' || !row.key || !row.snapshot

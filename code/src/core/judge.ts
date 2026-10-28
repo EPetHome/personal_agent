@@ -2,6 +2,7 @@ import { basename } from 'node:path';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { modelEvidenceKey } from './evidence.ts';
+import { routeNotice, waitingReady } from './interaction.ts';
 import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
@@ -93,7 +94,7 @@ function createNotice(tool: Notice['tool'], kind: Notice['kind'], dedupeKey: str
 function attachSnapshot(notice: Notice, value: TaskSnapshot, projection: Projection): Notice {
   const snapshot = projection.noticeSnapshots.get(noticeSnapshotKey(notice)) ?? value;
   notice.snapshot = snapshot;
-  notice.content = presentNotice({ ...notice.content, evidence: { ...notice.content.evidence,
+  notice.content = presentNotice({ ...notice.content, actionItems: snapshot.actionItems, evidence: { ...notice.content.evidence,
     presentation: { situation: snapshot.situation, action: snapshot.action } } }, snapshot.situation, snapshot.action, notice.at);
   notice.text = notice.kind === 'blind' || notice.kind === 'unreadable'
     ? truncateUtf8(renderNotice(notice.content, notice.at, notice.evidenceAt), 4096) : renderNotice(notice.content, notice.at, notice.evidenceAt);
@@ -139,6 +140,8 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       title = `${ai}${record.loop ? `（${batch}）` : ''} 干到一半没动静了`;
     }
     if (!kind) continue;
+    // 授权等待同样先等五分钟；期间推进已由具体成员的事实/推送解除。
+    if (kind === 'waiting' && waitingMember && record.waiting && !waitingReady(waitingMember, record.waiting.at, now)) continue;
     const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     const memberId = waitingId ?? record.drift?.sessionId ?? record.sessionId;
     const feedbackKey = feedbackSuppressionKey({ tool: record.tool, kind, sessionKey: record.key, memberSessionId: memberId });
@@ -235,7 +238,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       : { goal: intent ?? null, currentTask: null, lastOutput: compact(lastOutput, 1200), factualStatus: '看不见了' };
     candidates.push(attachSnapshot(notice, ruleSnapshot(input, affected?.project ?? '', now), projection));
   }
-  return candidates;
+  return candidates.map(notice => routeNotice(notice, projection, now));
 }
 export function renderOverview(records: JudgedRecord[], projection: Projection): string {
   const lines = ['工具 | 项目 | 意图 | 状态 | 最后活动时间 | 提醒'];

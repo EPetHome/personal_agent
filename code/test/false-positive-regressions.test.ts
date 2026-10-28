@@ -56,13 +56,13 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     const f = await fixture(t, tool);
     await put(f.transcript, [...rows(tool), moved(tool, '/demo/shop/api')]);
     await put(f.inbox, [f.push('waiting_permission', '/demo/shop/api')]);
-    const view = await detect(f.config, now);
+    const view = await detect(f.config, '2026-10-20T10:06:00Z');
     assert.equal(view.noticesAdded, 1); assert.equal(view.records.length, 1);
     assert.equal(view.records[0]?.status, '在等我'); assert.equal(view.records[0]?.project, '/demo/shop');
     assert.equal(view.projection.pushes.length, 1); assert.equal(view.projection.health.get(tool)?.since, null);
     assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['waiting']);
     assert.deepEqual((await rebuild(f.config)).records, view.records);
-    assert.equal((await detect(f.config, '2026-10-20T10:02:00Z')).noticesAdded, 0);
+    assert.equal((await detect(f.config, '2026-10-20T10:07:00Z')).noticesAdded, 0);
   });
 
   test(`误报 A1 模型链路：${tool} 换目录的 turn_end 推送继续参与是否在等用户判断`, async t => {
@@ -71,7 +71,7 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     const detail = '推送独有的问题：现在是否继续部署？';
     await put(f.inbox, [{ ...f.push('turn_end', '/demo/shop/api'), detail }]);
     const calls: JudgmentRequest[] = [];
-    const view = await detect(f.config, now, { judge: { async judge(request) {
+    const view = await detect(f.config, '2026-10-20T10:06:00Z', { judge: { async judge(request) {
       calls.push(request); return request.task === 'waiting' ? { answer: '是', reason: '需要用户回复' } : { answer: '否', reason: '未偏离' };
     } } });
     assert.equal(calls.find(call => call.task === 'waiting')?.context.assistantReply, detail);
@@ -288,14 +288,14 @@ for (const pushEvent of ['waiting_permission', 'turn_end']) test(`误报 A7 ${pu
   const before = await Promise.all(['events', 'outbox', 'feedback'].map(name => readFile(join(f.config.dataDir, `${name}.jsonl`), 'utf8')));
   assert.equal((await overview(f.config)).records.some(r => r.sessionId === internalId), false);
   let deliveries = 0;
-  const view = await detect(f.config, now, { judge, channels: [{ name: 'local', async send() { deliveries++; }, async receive() { return '已记下'; } }] });
+  const view = await detect(f.config, '2026-10-20T10:06:00Z', { judge, channels: [{ name: 'local', async send() { deliveries++; }, async receive() { return '已记下'; } }] });
   assert.equal(deliveries, 0, '已恢复的失明及内部跑偏即使原渠道投递失败，也不能补发');
   assert.equal(view.projection.health.get('cc')?.since, null); assert.equal(view.noticesAdded, 0);
   assert.equal(view.records.length, 1); assert.equal(view.records[0]?.status, '在等我'); assert.equal(view.records[0]?.project, '/demo/shop');
   assert.equal((await readOutbox(f.config.dataDir)).length, 2);
   assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 1);
   assert.deepEqual((await rebuild(f.config)).records, view.records);
-  assert.equal((await detect(f.config, '2026-10-20T10:02:00Z', { judge })).noticesAdded, 0);
+  assert.equal((await detect(f.config, '2026-10-20T10:07:00Z', { judge })).noticesAdded, 0);
   for (const [index, name] of ['events', 'outbox', 'feedback'].entries()) {
     const after = await readFile(join(f.config.dataDir, `${name}.jsonl`), 'utf8');
     assert.ok(after.startsWith(before[index]!));
@@ -304,7 +304,7 @@ for (const pushEvent of ['waiting_permission', 'turn_end']) test(`误报 A7 ${pu
   // 后来发生真正的新故障，也不能复活旧误报的失败渠道队列。
   await appendFile(f.inbox, JSON.stringify(f.push('session_end', '/demo/shop', 'wrong-new-id')) + '\n');
   const sent: string[] = [];
-  const next = await detect(f.config, '2026-10-20T10:03:00Z', { judge, channels: [{ name: 'local', async send(notice) { sent.push(notice.id); }, async receive() { return '已记下'; } }] });
+  const next = await detect(f.config, '2026-10-20T10:08:00Z', { judge, channels: [{ name: 'local', async send(notice) { sent.push(notice.id); }, async receive() { return '已记下'; } }] });
   assert.equal(next.noticesAdded, 1); assert.equal(sent.length, 1);
   assert.ok(sent.every(id => !notices.some(old => old.id === id)));
 });

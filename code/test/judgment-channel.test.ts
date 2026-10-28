@@ -36,7 +36,7 @@ test('A5 推送→规则等待→发件→本机通知一次；模型不取代�
   const { judge, calls } = stubJudge(() => no);
   await put(transcript, [ccUser(), ccCall()]);
   await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
-  const first = await detect(config, '2026-10-20T10:01:00Z', { judge });
+  const first = await detect(config, '2026-10-20T10:06:00Z', { judge });
   assert.equal(first.records[0]?.status, '在等我'); assert.equal(calls.length, 0);
   const notice = (await readOutbox(config.dataDir))[0]!;
   assert.equal(notice.level, '现在就要你');
@@ -98,14 +98,14 @@ test('A8 助手答完的问句模型是→等待，否→完成；新用户要�
     const answer = ccAnswer(); answer.message.content[0]!.text = '使用 A 方案还是 B 方案？';
     await put(transcript, [ccUser(), answer]);
     const { judge, calls } = stubJudge(r => r.task === 'waiting' && waiting ? { answer: '是', reason: '需要你选择方案才能继续' } : no);
-    const view = await detect(config, '2026-10-20T10:01:00Z', { judge });
+    const view = await detect(config, '2026-10-20T10:06:00Z', { judge });
     assert.equal(view.records[0]?.status, waiting ? '在等我' : '已完成');
     const notices = await readOutbox(config.dataDir);
     assert.equal(notices.length, waiting ? 1 : 0);
-    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary.split('\n')[2], '要你做：使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
-    await detect(config, '2026-10-20T10:02:00Z', { judge }); assert.equal(calls.length, 2);
-    await appendFile(transcript, JSON.stringify(ccUser('选 A，继续', '2026-10-20T10:03:00Z')) + '\n');
-    assert.equal((await detect(config, '2026-10-20T10:04:00Z', { judge })).records[0]?.status, '进行中');
+    if (waiting) { assert.match(notices[0]!.content.title, /可能/); assert.equal(notices[0]!.content.summary.split('\n')[2], '要你做：1.【回复会话】使用 A 方案还是 B 方案？'); assert.ok(!notices[0]!.text.includes(notices[0]!.id)); }
+    await detect(config, '2026-10-20T10:07:00Z', { judge }); assert.equal(calls.length, 2);
+    await appendFile(transcript, JSON.stringify(ccUser('选 A，继续', '2026-10-20T10:08:00Z')) + '\n');
+    assert.equal((await detect(config, '2026-10-20T10:09:00Z', { judge })).records[0]?.status, '进行中');
   }
 });
 
@@ -116,7 +116,7 @@ test('模型子成员等待保留真实回看/回复；忽略子项目后不再�
   const child = codexMeta('child', 'demo-codex'); child.payload.cwd = '/sample/child-project';
   await put(join(config.sources.codex, 'child.jsonl'), [child, codexEvent({ type: 'user_message', message: '子任务' }), codexEvent({ type: 'task_complete', last_agent_message: '请你选择使用哪个方案？' })]);
   const { judge } = stubJudge(r => r.task === 'waiting' ? { answer: '是', reason: '需要你选择方案' } : no);
-  const view = await detect(config, '2026-10-20T10:01:00Z', { judge });
+  const view = await detect(config, '2026-10-20T10:06:00Z', { judge });
   assert.equal(view.records[0]?.status, '在等我');
   const notice = (await readOutbox(config.dataDir))[0]!;
   assert.equal(notice.memberSessionId, 'child'); assert.match(notice.content.returnCommand, /resume child/);
@@ -134,7 +134,7 @@ test('首次历史完成不耗模型额度；有新动静才调，模型等待�
   assert.equal(calls.length, 0);
   const answer = ccAnswer('2026-10-20T10:02:00Z'); answer.message.content[0]!.text = '请你选择方案？';
   await appendFile(transcript, [ccUser('现在继续只改 A', '2026-10-20T10:02:00Z'), answer].map(r => JSON.stringify(r)).join('\n') + '\n');
-  assert.equal((await detect(config, '2026-10-20T10:03:00Z', { judge })).records[0]?.status, '在等我');
+  assert.equal((await detect(config, '2026-10-20T10:07:00Z', { judge })).records[0]?.status, '在等我');
   assert.equal(calls.length, 2);
   assert.equal((await detect(config, '2026-10-21T10:04:00Z', { judge })).records[0]?.status, '已搁置');
   assert.equal(calls.length, 2);
@@ -146,11 +146,11 @@ test('模型失败下一轮重试、每日上限仍保留规则；用量预留�
     config.judge!.dailyLimit = fail ? 10 : 0;
     const { judge, calls } = stubJudge(() => { throw new Error('test-only'); });
     await put(transcript, [ccUser(), ccAnswer()]);
-    const view = await detect(config, '2026-10-20T10:01:00Z', { judge });
+    const view = await detect(config, '2026-10-20T10:06:00Z', { judge });
     assert.equal(view.records[0]?.status, '已完成');
     assert.match(renderOverview(view.records, view.projection), fail ? /调用失败，仅规则判断/ : /每日额度用完，仅规则判断/);
     const count = calls.length;
-    await detect(config, '2026-10-20T10:02:00Z', { judge }); await rebuild(config);
+    await detect(config, '2026-10-20T10:07:00Z', { judge }); await rebuild(config);
     assert.equal(calls.length, fail ? count * 2 : count);
     assert.equal((await readEvents(config.dataDir)).filter(e => e.kind === 'model_call_started').length, calls.length);
   }
@@ -163,7 +163,7 @@ test('本机通知失败不丢发件，明示失败，下轮重试，成功后�
   await executable(command, 'process.exit(1)');
   config.localChannel = { executable: command, timeoutMs: 5000 };
   await put(transcript, [ccUser(), ccCall()]); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
-  const first = await detect(config, '2026-10-20T10:01:00Z');
+  const first = await detect(config, '2026-10-20T10:06:00Z');
   assert.equal(first.noticesAdded, 1); assert.match(renderOverview(first.records, first.projection), /本机通知尚未成功/);
   const log = join(root, 'called');
   await executable(command, `require('node:fs').appendFileSync(${JSON.stringify(log)},'called\\n')`);
@@ -175,7 +175,7 @@ test('A9 反馈 CLI 默认最近提醒，日期与编号落盘，回话写明误
   const { root, config, transcript } = await fixture(t);
   config.judge = null;
   await put(transcript, [ccUser(), ccCall()]); await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
-  await detect(config, '2026-10-20T10:01:00Z');
+  await detect(config, '2026-10-20T10:06:00Z');
   const path = join(root, 'config.json'); await put(path, JSON.stringify(config));
   const cli = spawnSync(process.execPath, [resolve(import.meta.dirname, '../src/cli/main.ts'), 'feedback', '误报', '我不需要处理', '--config', path, '--now', '2026-10-20T10:02:00Z'], { encoding: 'utf8' });
   assert.equal(cli.status, 0, cli.stderr); assert.match(cli.stdout.trim(), /^已记下：这个会话之后不会再因为等你回复或授权叫你/);

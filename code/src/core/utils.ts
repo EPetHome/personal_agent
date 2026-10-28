@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Original, SessionRecord, Tool } from './types.ts';
+import type { Original, SessionRecord, Step, Tool } from './types.ts';
 
 // 外部 JSON 只在组件解析边界使用；统一记录在内部保持强类型。
 export type JsonObject = Record<string, any>;
@@ -138,12 +138,19 @@ export function meaningfulRequest(text: string): string {
   const value = intentText(text);
   return /^(?:合入|继续|好的?|可以|同意|收到|开始|确认|是|否|行|没问题|继续吧|你来做|开始吧|执行|提交|推送)[。.!！\s]*$/.test(value) ? '' : value;
 }
-export function addIntent(record: SessionRecord, text: string, at?: string): void {
+export function addIntent(record: SessionRecord, text: string, at?: string, activity: 'human' | 'explicit_human' | 'agent' = 'human'): void {
   const meaningful = intentText(text);
-  if (!meaningful) return;
   const bounded = truncateText(meaningful, 1000);
-  if (record.intent.initial === null) record.intent.initial = bounded;
-  else record.intent.additions.push(bounded);
+  if (meaningful) {
+    if (record.intent.initial === null) record.intent.initial = bounded;
+    else record.intent.additions.push(bounded);
+  }
+  if (at) {
+    const humanRefs = record.humanRequestRefs ??= [];
+    if (activity !== 'agent') humanRefs.push({ index: meaningful ? record.intent.additions.length : -1, at, sessionId: record.sessionId,
+      ...(activity === 'explicit_human' ? { explicitHuman: true } : {}) });
+  }
+  if (!meaningful) return;
   if (at && meaningfulRequest(bounded)) {
     const refs = record.requestRefs ??= { goal: null, latest: null, beforeStep: null, beforeReply: null };
     const ref = { index: record.intent.additions.length, at };
@@ -155,7 +162,7 @@ export function addReply(record: SessionRecord, reply: { at: string; text: strin
   record.assistantReply = reply;
   if (record.requestRefs) record.requestRefs.beforeReply = record.requestRefs.latest;
 }
-export function addStep(record: SessionRecord, step: { at: string; text: string }): void {
+export function addStep(record: SessionRecord, step: Step): void {
   if (record.requestRefs) record.requestRefs.beforeStep = record.requestRefs.latest;
   record.recentSteps.push({ ...step, requestRef: record.requestRefs?.latest ? { ...record.requestRefs.latest, sessionId: record.sessionId } : null });
   if (record.recentSteps.length > 8) record.recentSteps.shift();

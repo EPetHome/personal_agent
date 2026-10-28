@@ -43,8 +43,9 @@ async function waitFor(check: () => Promise<boolean>, timeout = 5000) {
 test('飞书 A1：16位微秒按钮记今天的误报并回话；秒/毫秒同义，异常时间留说明', async t => {
   const f = await fixture(t), now = new Date().toISOString();
   const transcript = join(f.config.sources.cc!, 'sample.jsonl');
-  await put(transcript, [ccUser('构造任务', now), ccCall(now)]);
-  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', now)]);
+  const stopped = new Date(Date.parse(now) - 12 * 60000).toISOString();
+  await put(transcript, [ccUser('构造任务', stopped), ccCall(stopped)]);
+  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', stopped)]);
   await detect(f.config, now);
   const notice = (await readOutbox(f.config.dataDir))[0]!, message = (await f.sent())[0]!;
   const microseconds = String(Date.parse(now) * 1000);
@@ -136,8 +137,9 @@ test('飞书 A3：检测持锁超过30秒时连接状态独立重试，收件/�
   const f = await fixture(t), now = new Date().toISOString();
   f.config.service = { intervalMs: 100, restartWindowMs: 1000, restartThreshold: 3 };
   const transcript = join(f.config.sources.cc!, 'sample.jsonl');
-  await put(transcript, [ccUser('构造长检测', now), ccCall(now)]);
-  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', now)]);
+  const stopped = new Date(Date.parse(now) - 12 * 60000).toISOString();
+  await put(transcript, [ccUser('构造长检测', stopped), ccCall(stopped)]);
+  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', stopped)]);
   let connected: ((state: FeishuConnection) => void) | undefined, holding = false;
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });

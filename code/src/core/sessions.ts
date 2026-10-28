@@ -30,10 +30,12 @@ export function membersOf(record: SessionRecord): readonly SessionMember[] {
   return record.members?.length ? record.members : [record];
 }
 export function memberSnapshot(record: SessionRecord): SessionMember {
-  const { sessionId, project, cwdHistory, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable } = record;
+  const { sessionId, project, cwdHistory, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable, requestRefs, humanRequestRefs } = record;
   return structuredClone({
     sessionId, project, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded,
     ...(cwdHistory === undefined ? {} : { cwdHistory }),
+    ...(requestRefs === undefined ? {} : { requestRefs }),
+    ...(humanRequestRefs === undefined ? {} : { humanRequestRefs }),
     ...(assistantReply === undefined ? {} : { assistantReply }),
     ...(parentSessionId === undefined ? {} : { parentSessionId }),
     ...(unavailable === undefined ? {} : { unavailable }),

@@ -17,7 +17,7 @@ export function event(payload: EventPayload, at: string): AgentEvent {
   return { ...payload, version: 1, at, id };
 }
 export function project(events: AgentEvent[]): Projection {
-  const result: Projection = { sessions: new Map(), seenSessions: new Set(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), feedbackSuppressions: new Set(), modelCalls: new Map(), channelDeliveries: new Map() };
+  const result: Projection = { sessions: new Map(), seenSessions: new Set(), pushes: [], health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(), modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), noticeReplies: new Map(), feedbackSuppressions: new Set(), modelCalls: new Map(), channelDeliveries: new Map() };
   const checksByFingerprint = new Map<string, import('./types.ts').ModelCheck>();
   const rawPushes = new Map<string, PushRecord>();
   const pushes = new Set<string>();
@@ -80,6 +80,9 @@ export function project(events: AgentEvent[]): Projection {
         break;
       }
       case 'notice_snapshot_written': result.noticeSnapshots.set(entry.key, entry.snapshot); break;
+      case 'notice_reply_observed':
+        if (!result.noticeReplies.has(entry.noticeId)) result.noticeReplies.set(entry.noticeId, entry.reply);
+        break;
       case 'channel_delivery': result.channelDeliveries.set(`${entry.channel}:${entry.noticeId}`, entry.ok); break;
       case 'feishu_connection': result.feishuConnection = { ...entry.connection, at: entry.at }; break;
       case 'push_empty':
@@ -97,6 +100,10 @@ export function project(events: AgentEvent[]): Projection {
     const fingerprint = notice.dedupeKey.slice(notice.dedupeKey.lastIndexOf(':') + 1);
     const check = checksByFingerprint.get(`${notice.sessionKey}:${fingerprint}`);
     return check ? { ...notice, evidenceAt: check.evidenceAt, memberSessionId: check.sessionId } : notice;
+  });
+  result.notices = result.notices.map(notice => {
+    const reply = result.noticeReplies.get(notice.id);
+    return reply && notice.snapshot ? { ...notice, snapshot: { ...notice.snapshot, nextHumanReply: reply } } : notice;
   });
   return result;
 }

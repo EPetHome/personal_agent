@@ -6,5 +6,7 @@ export function configuredChannels(config: Config): Channel[] {
   return [...(config.localChannel ? [localChannel(config.dataDir, config.localChannel)] : []), ...(config.feishu ? [feishuChannel(config)] : [])];
 }
 export function accepts(channel: Channel, notice: Notice): boolean {
-  return (channel.levels ?? ['现在就要你']).includes(notice.level);
+  return (channel.levels ?? ['现在就要你']).includes(notice.level)
+    && (!notice.delivery || !['local', 'feishu'].includes(channel.name)
+      || notice.delivery.channels.some(name => name === channel.name));
 }

@@ -66,9 +66,12 @@ export interface JudgmentResult {
   situation?: string;
   action?: string;
   actionType?: TaskActionType;
+  actionItems?: TaskActionItem[];
   confidence?: '高' | '中' | '低';
 }
 export type TaskActionType = '回答问题' | '做个决定' | '去看一眼' | '不用管';
+export type TaskActionLabel = '回复会话' | '你去做' | '要你定·红线' | '不用管';
+export interface TaskActionItem { text: string; label: TaskActionLabel; suggestion?: string }
 export interface TaskSnapshotInput {
   goal: string | null;
   currentTask: string | null;
@@ -79,8 +82,14 @@ export interface TaskSnapshotDraft {
   situation: string;
   action: string;
   actionType: TaskActionType;
+  /** 旧快照可缺省；新快照至少一件。 */
+  actionItems?: TaskActionItem[];
 }
-export interface TaskSnapshot extends TaskSnapshotInput, TaskSnapshotDraft { source: '模型' | '规则' }
+export interface TaskSnapshot extends TaskSnapshotInput, TaskSnapshotDraft {
+  source: '模型' | '规则';
+  /** 追加事件关联的下一句真人输入，只存引用，不复制正文。 */
+  nextHumanReply?: RequestRef;
+}
 export interface Judge {
   judge(request: JudgmentRequest, options?: { signal?: AbortSignal }): Promise<JudgmentResult>;
   /** 替身省略此方法即只做规则兜底，不偷偷调用真实模型。 */
@@ -108,6 +117,8 @@ export interface Original { path: string; fingerprint: string }
 export interface Step {
   at: string;
   text: string;
+  /** 来源明确标注步骤性质；旧记录缺省时不以时间相等猜成收尾。 */
+  kind?: 'assistant' | 'tool' | 'tool_result';
   /** 仅有界的最近8步保存当时要求索引，不复制正文，也不送入判断步骤。 */
   requestRef?: RequestRef | null;
 }
@@ -126,7 +137,13 @@ export interface LoopFacts {
   sessions?: { development: string; review: string; acceptance: string[] };
 }
 /** 指向已有 intent 字符串；只加固定数量的时间/索引，不复制真人要求正文。 */
-export interface RequestRef { index: number; at: string; sessionId?: string }
+export interface RequestRef {
+  index: number;
+  at: string;
+  sessionId?: string;
+  /** 子代理中的真人活动必须有消息级明确 human 标记，旧记录缺省不算。 */
+  explicitHuman?: true;
+}
 export interface RequestRefs {
   goal: RequestRef | null;
   latest: RequestRef | null;
@@ -145,6 +162,8 @@ export interface SessionRecord {
   cwdHistory?: { path: string; cwds: string[] }[];
   intent: { initial: string | null; additions: string[] };
   requestRefs?: RequestRefs;
+  /** 真人输入的时间/原文索引，含「继续」等短回复；不复制正文。index=-1 为纯媒体。 */
+  humanRequestRefs?: RequestRef[];
   lastActivityAt: string;
   recentSteps: Step[];
   pendingTools: PendingTool[];
@@ -162,7 +181,7 @@ export type SessionIdentity = Pick<SessionRecord, 'sessionId' | 'project' | 'par
 /** 失败原件的身份线索，不是可供正常状态/推送对账使用的会话记录。 */
 export type FailedSessionIdentity = SessionIdentity & { tool: Tool; original: Original };
 export type SessionMember = Pick<SessionRecord,
-  'sessionId' | 'project' | 'cwdHistory' | 'originals' | 'recentSteps' |
+  'sessionId' | 'project' | 'cwdHistory' | 'originals' | 'recentSteps' | 'requestRefs' | 'humanRequestRefs' |
   'pendingTools' | 'assistantFinished' | 'sessionEnded' | 'assistantReply' | 'parentSessionId' | 'unavailable'> & {
     /** 只有失败身份、没有已读取活动事实时为 null，不捏造子成员时间。 */
     lastActivityAt: string | null;
@@ -233,6 +252,7 @@ export interface NoticeContent {
   summary: string;
   situation?: string;
   action?: string;
+  actionItems?: TaskActionItem[];
   returnCommand: string;
   evidence: {
     project: string | null;
@@ -262,6 +282,8 @@ export interface Notice {
   /** 健康提醒能定位会话时的反馈作用域；未知会话不得压住整个来源。 */
   feedbackScope?: string;
   snapshot?: TaskSnapshot;
+  /** 发卡时确定并保留，重试不因人在场与否变化而改走另一出口。旧卡仍按级别。 */
+  delivery?: { presence: '在场' | '不在场'; channels: ('local' | 'feishu')[]; decidedAt: string; lastHumanAt?: string };
   content: NoticeContent;
   text: string;
   reviews?: ReviewItem[];
@@ -293,6 +315,7 @@ export type EventPayload =
   | { kind: 'notices_delivered'; ids: string[] }
   | { kind: 'model_call_started'; task: JudgmentTask | 'snapshot' | 'attribution' | 'same_problem'; key: string }
   | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot }
+  | { kind: 'notice_reply_observed'; noticeId: string; reply: RequestRef }
   | { kind: 'model_checked'; check: ModelCheck }
   | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean }
   | { kind: 'feishu_connection'; connection: FeishuConnection };
@@ -314,6 +337,7 @@ export interface Projection {
   /** 所有历史证据的判断索引；由旧/新事件重建，不改写日志。 */
   modelEvidence: Map<string, ModelCheck>;
   noticeSnapshots: Map<string, TaskSnapshot>;
+  noticeReplies: Map<string, RequestRef>;
   /** 从只追加反馈现算，非事件事实，也不持久化为跨会话规则。 */
   feedbackSuppressions: Set<string>;
   modelCalls: Map<string, number>;

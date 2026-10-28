@@ -1,5 +1,6 @@
 import { membersOf, pushMatchesMember } from './sessions.ts';
 import { modelEvidenceKey } from './evidence.ts';
+import { humanRequests, waitingReady } from './interaction.ts';
 import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
@@ -34,17 +35,38 @@ function candidates(record: JudgedRecord, projection: Projection, config: Config
   if (!config.judge || record.tool === 'loop' || ['看不见了', '已搁置'].includes(record.status) || membersOf(record).some(m => m.unavailable)) return [];
   const result: Candidate[] = [];
   const source = projection.sessions.get(record.key) ?? record;
-  if (!record.waiting) for (const member of membersOf(source)) {
-    const push = projection.pushes.filter(p => p.recordKey === record.key && pushMatchesMember(p, member) && p.at <= now
+  const activities = membersOf(source).map(member => ({ member,
+    push: projection.pushes.filter(p => p.recordKey === record.key && pushMatchesMember(p, member) && p.at <= now
       && member.lastActivityAt !== null && p.at >= member.lastActivityAt)
-      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1);
+      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1),
+  }));
+  if (!record.waiting) for (const { member, push } of activities) {
     if (member.sessionEnded || push?.event === 'session_end' || push?.event === 'waiting_permission' || member.pendingTools.length
       || !(member.assistantFinished || push?.event === 'turn_end')) continue;
     const reply = push?.event === 'turn_end' ? push.detail : member.assistantReply?.text ?? '';
-    if (reply.trim()) result.push(candidate(record, member, 'waiting', reply, push?.at ?? member.lastActivityAt!, projection, config));
+    const at = push?.at ?? member.lastActivityAt!;
+    const known = projection.modelEvidence.get(modelEvidenceKey({ recordKey: record.key, sessionId: member.sessionId, task: 'waiting', evidenceAt: at }));
+    if (reply.trim() && (waitingReady(member, at, now) || (!!known?.result && !known.error))) {
+      result.push(candidate(record, member, 'waiting', reply, at, projection, config));
+    }
   }
   if (!record.waiting && record.intent.initial && record.recentSteps.length && !membersOf(record).every(m => m.sessionEnded)) {
-    result.push(candidate(record, { ...record, lastActivityAt: record.lastActivityAt }, 'drift', '', record.lastActivityAt, projection, config));
+    // 单独的收尾问句不能绕过等待窗口花一次跑偏调用；真正的执行步骤仍立即检查。
+    // 真人已接话而尚无后续步骤时，也不能拿旧答复重调模型。
+    const actionable = activities.some(({ member, push }) => {
+      const latestHuman = humanRequests(member).at(-1)?.at;
+      const finished = !member.pendingTools.length
+        && (member.assistantFinished || member.sessionEnded || push?.event === 'turn_end' || push?.event === 'session_end');
+      return member.recentSteps.some(step => {
+        if (latestHuman && Date.parse(step.at) < Date.parse(latestHuman)) return false;
+        // 工具与说明可在同一消息/同一毫秒；只给已结束回合的最终回复套窗口。
+        // 旧步骤没有 kind 时按文本识别最终回复，不把同时间的工具一起压住。
+        const replyStep = step.kind !== 'tool' && step.kind !== 'tool_result'
+          && step.text === compact(member.assistantReply?.text ?? '');
+        return !finished || !replyStep || waitingReady(member, push?.at ?? member.assistantReply?.at ?? step.at, now);
+      });
+    });
+    if (actionable) result.push(candidate(record, { ...record, lastActivityAt: record.lastActivityAt }, 'drift', '', record.lastActivityAt, projection, config));
   }
   return result;
 }

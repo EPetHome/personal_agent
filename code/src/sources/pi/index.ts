@@ -107,17 +107,17 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
         requiredString(b.name, '工具名');
         const step = { id, at, text: b.summary };
         pending.set(id, step);
-        addStep(record, { at, text: step.text });
+        addStep(record, { at, text: step.text, kind: 'tool' });
       }
       const text = contentText(message.content);
       if (text) {
-        addStep(record, { at, text: compact(text) });
+        addStep(record, { at, text: compact(text), kind: 'assistant' });
         addReply(record, { at, text });
       }
       record.assistantFinished = message.stopReason === 'stop' && !message.content.some((b: JsonObject) => b.type === 'toolCall');
     } else {
       pending.delete(requiredString(message.toolCallId, 'toolCallId'));
-      addStep(record, { at, text: message.isError ? '工具返回错误' : '工具结果已返回' });
+      addStep(record, { at, text: message.isError ? '工具返回错误' : '工具结果已返回', kind: 'tool_result' });
     }
   }
   record.pendingTools = [...pending.values()];

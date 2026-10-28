@@ -14,7 +14,8 @@ import type { SentMessage } from '../src/channels/feishu/index.ts';
 import type { ReviewItem } from '../src/core/types.ts';
 import { ccAnswer, ccUser, codexEvent, codexMeta, piHeader, piMessage, put, sandbox } from './fixtures.ts';
 
-const now = '2026-10-20T10:01:00.000Z';
+// 版式测试在等候五分钟且离场后发卡。
+const now = '2026-10-20T10:11:00.000Z';
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 }; f.config.learning = false;
@@ -71,8 +72,8 @@ test('卡片 A6/A7：实际检测保留冒号后三项列表，时间后有空�
   await put(join(f.config.sources.cc!, 'sample.jsonl'), [ccUser('给商品列表加缓存'), answer]);
   await detect(f.config, now, { judge: { async judge(request) { return { answer: request.task === 'waiting' ? '是' : '否', reason: '构造列表提问' }; } } });
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
-  const action = notice.content.summary.split('\n')[2]!;
-  for (const item of ['等你核销：', '在飞书点几张卡片的按钮', '看新卡片是不是一眼能懂', '确认这一周反馈都留得下来']) assert.ok(action.includes(item));
+  const action = notice.content.summary;
+  for (const item of ['在飞书点几张卡片的按钮', '看新卡片是不是一眼能懂', '确认这一周反馈都留得下来']) assert.ok(action.includes(item));
   assert.match(noticeTimeAndReturn(notice), /\d\d:\d\d/);
   assert.ok(!action.endsWith('：'));
 });

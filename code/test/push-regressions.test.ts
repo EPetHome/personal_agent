@@ -28,7 +28,7 @@ async function family(t: TestContext) {
 test('返修1：合法子会话授权推送归入父记录，其他 Codex 会话正常，重建和重复检测不误报/重复发', async t => {
   const f = await family(t);
   await put(f.inbox, [f.push('child', f.child)]);
-  const view = await detect(f.config, '2026-10-20T10:01:00Z');
+  const view = await detect(f.config, '2026-10-20T10:06:00Z');
   assert.equal(view.records.length, 2);
   const parent = view.records.find(r => r.sessionId === 'demo-codex')!;
   assert.equal(parent.status, '在等我');
@@ -44,7 +44,7 @@ test('返修1：合法子会话授权推送归入父记录，其他 Codex 会话
   await rm(join(f.config.dataDir, 'state.json'));
   const replay = await rebuild(f.config);
   assert.equal(replay.records.find(r => r.sessionId === 'demo-codex')?.status, '在等我');
-  assert.equal((await detect(f.config, '2026-10-20T10:02:00Z')).noticesAdded, 0);
+  assert.equal((await detect(f.config, '2026-10-20T10:07:00Z')).noticesAdded, 0);
   assert.equal((await readOutbox(f.config.dataDir)).length, 1);
 });
 
@@ -54,13 +54,13 @@ test('返修1：父会话和其他子会话继续活动/结束，不会掩盖仍
   await put(sibling, [codexMeta('sibling', 'demo-codex'), codexEvent({ type: 'task_started' })]);
   await appendFile(f.parent, JSON.stringify(codexEvent({ type: 'agent_message', message: '父会话还在检查', phase: 'commentary' }, 'event_msg', '2026-10-20T10:02:00Z')) + '\n');
   await put(f.inbox, [f.push('child', f.child), f.push('sibling', sibling, 'session_end', '2026-10-20T10:03:00Z')]);
-  const view = await detect(f.config, '2026-10-20T10:04:00Z');
+  const view = await detect(f.config, '2026-10-20T10:06:00Z');
   assert.equal(view.records.find(r => r.sessionId === 'demo-codex')?.status, '在等我');
   assert.equal(view.records.find(r => r.sessionId === 'other')?.status, '进行中');
   assert.equal((await readOutbox(f.config.dataDir))[0]?.kind, 'waiting');
   // 等授权的是 child；只有它自己后来有新动静，才解除这次等待。
-  await appendFile(f.child, JSON.stringify(codexEvent({ type: 'function_call_output', call_id: 'child-call', output: 'ok' }, 'response_item', '2026-10-20T10:05:00Z')) + '\n');
-  assert.equal((await detect(f.config, '2026-10-20T10:06:00Z')).records.find(r => r.sessionId === 'demo-codex')?.status, '进行中');
+  await appendFile(f.child, JSON.stringify(codexEvent({ type: 'function_call_output', call_id: 'child-call', output: 'ok' }, 'response_item', '2026-10-20T10:07:00Z')) + '\n');
+  assert.equal((await detect(f.config, '2026-10-20T10:08:00Z')).records.find(r => r.sessionId === 'demo-codex')?.status, '进行中');
 });
 
 for (const ending of ['turn_end', 'session_end']) {
@@ -91,7 +91,7 @@ test('返修1：多层子会话按自己的项目/原件对账并归到根会话
     codexEvent({ type: 'function_call', name: 'shell', call_id: 'grandchild-call', arguments: '{"command":"npm run build"}' }, 'response_item')]);
   await put(f.inbox, [f.push('demo-codex', f.parent, 'turn_end', '2026-10-20T10:02:00Z'),
     { ...f.push('grandchild', grandchild), cwd: '/sample/child-worktree' }]);
-  const view = await detect(f.config, '2026-10-20T10:03:00Z');
+  const view = await detect(f.config, '2026-10-20T10:06:00Z');
   assert.equal(view.records.length, 2);
   const parent = view.records.find(r => r.sessionId === 'demo-codex')!;
   assert.equal(parent.status, '在等我');

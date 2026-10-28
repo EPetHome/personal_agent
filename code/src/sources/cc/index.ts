@@ -43,7 +43,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
       for (const b of blocks) {
         if (b.type === 'tool_result') {
           pending.delete(requiredString(b.tool_use_id, 'tool_use_id'));
-          addStep(record, { at, text: b.is_error ? '工具返回错误' : '工具结果已返回' });
+          addStep(record, { at, text: b.is_error ? '工具返回错误' : '工具结果已返回', kind: 'tool_result' });
         }
       }
     } else {
@@ -53,10 +53,10 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
         const id = requiredString(b.id, '工具调用 id');
         const step = { id, at, text: commandSummary(requiredString(b.name, '工具名'), b.input) };
         pending.set(id, step);
-        addStep(record, { at, text: step.text });
+        addStep(record, { at, text: step.text, kind: 'tool' });
       }
       if (textContent) {
-        addStep(record, { at, text: compact(textContent) });
+        addStep(record, { at, text: compact(textContent), kind: 'assistant' });
         addReply(record, { at, text: replyExcerpt(textContent) });
       }
       record.assistantFinished = message.stop_reason === 'end_turn' && !blocks.some(b => b.type === 'tool_use');

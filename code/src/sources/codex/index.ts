@@ -24,6 +24,11 @@ function humanMessage(item: JsonObject, row: JsonObject): string | null {
   return !intentText(text).trimStart().startsWith('<') && isHuman(text, row, item) ? text : null;
 }
 
+function inputActivity(record: SessionRecord, item: JsonObject, row: JsonObject): 'human' | 'explicit_human' | 'agent' {
+  // humanMessage 已优先拒绝系统/合成等元数据；子任务仍保留意图，但不能冒充真人。
+  if ([item, row].some(data => data.origin?.kind === 'human')) return 'explicit_human';
+  return record.parentSessionId ? 'agent' : 'human';
+}
 function identifyRow(row: JsonObject): SessionIdentity | null {
   const meta = row.type === 'session_meta' ? row.payload : undefined;
   if (!meta || typeof (meta.id ?? meta.session_id) !== 'string' || !(meta.id ?? meta.session_id).trim()
@@ -51,7 +56,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     let lastAgent: { text: string; phase?: string } | undefined;
     let turnCompleted = false;
     function agentMessage(message: string, phase: string | undefined, at: string) {
-      if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message) });
+      if (message && lastAgent?.text !== message) addStep(record, { at, text: compact(message), kind: 'assistant' });
       const actualPhase = phase ?? (lastAgent?.text === message ? lastAgent.phase : undefined);
       record.assistantFinished = actualPhase !== 'commentary';
       if (message) addReply(record, { at, text: replyExcerpt(message) });
@@ -71,7 +76,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
         if (item.type === 'UserMessage') {
           const userText = humanMessage(item, row);
           if (userText !== null) {
-            addIntent(record, userText, at);
+            addIntent(record, userText, at, inputActivity(record, item, row));
             turnCompleted = false;
             record.assistantFinished = false;
             record.sessionEnded = false;
@@ -84,7 +89,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           const args = item.type === 'CommandExecution' ? { command: item.command }
             : item.type === 'FileChange' ? { path: Object.keys(item.changes ?? {}).slice(0, 3).join('、') } : item.arguments;
           const step = { at, text: commandSummary(name, args) };
-          addStep(record, step);
+          addStep(record, { ...step, kind: 'tool' });
           // 本轮 task_complete 后落盘的后台完成项不重新打开这一轮。
           if (!turnCompleted || ['in_progress', 'running', 'started'].includes(item.status)) {
             record.assistantFinished = false;
@@ -101,7 +106,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           if (!hasNewUsers) {
             const userText = humanMessage(p, row);
             if (userText !== null) {
-              addIntent(record, userText, at);
+              addIntent(record, userText, at, inputActivity(record, p, row));
               turnCompleted = false;
               record.assistantFinished = false;
               record.sessionEnded = false;
@@ -117,7 +122,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
           turnCompleted = true;
           pending.clear();
           if (typeof p.last_agent_message === 'string') {
-            addStep(record, { at, text: compact(p.last_agent_message) });
+            addStep(record, { at, text: compact(p.last_agent_message), kind: 'assistant' });
             addReply(record, { at, text: replyExcerpt(p.last_agent_message) });
           }
         } else if (p.type === 'session_end') record.sessionEnded = true;
@@ -132,10 +137,10 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
         pending.set(id, step); // 调用项 status:completed 不等于对应 output 已返回。
         record.assistantFinished = false;
         record.sessionEnded = false;
-        addStep(record, { at, text: step.text });
+        addStep(record, { at, text: step.text, kind: 'tool' });
       } else if (outputs.includes(p.type)) {
         pending.delete(requiredString(p.call_id ?? p.id, 'call_id'));
-        addStep(record, { at, text: '工具结果已返回' });
+        addStep(record, { at, text: '工具结果已返回', kind: 'tool_result' });
       } else agentMessage(contentText(p.content), p.phase, at);
     }
     if (!recognized) return null;

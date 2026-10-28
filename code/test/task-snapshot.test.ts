@@ -71,7 +71,7 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`D32 A1/A2/A3/A7：${too
   const requests: JudgmentRequest[] = [];
   const judge: Judge = { async judge(request) { requests.push(request); return { answer: request.task === 'waiting' ? '是' : '否', reason: '构造分类', ...draft }; },
     async writeSnapshot() { assert.fail('等待卡片不得再调用独立起草'); } };
-  const result = await detect(f.config, at(6), { judge, channels: [] });
+  const result = await detect(f.config, at(10), { judge, channels: [] });
   assert.equal(result.noticesAdded, 1);
   assert.equal(result.projection.modelCalls.get('2026-10-20'), 2);
   assert.deepEqual(requests.map(r => r.task), ['waiting', 'drift'], '旧版该样本就是一次等待判断和一次跑偏判断');
@@ -82,11 +82,13 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`D32 A1/A2/A3/A7：${too
   const payload = JSON.parse(judgmentPrompt(request).split('材料：\n')[1]!);
   assert.deepEqual(payload.snapshotInput, request.snapshotInput); assert.deepEqual(payload.newSteps, []);
   const notice = (await readOutbox(f.config.dataDir))[0]!;
-  assert.deepEqual(notice.snapshot, { ...request.snapshotInput, ...draft, source: '模型' });
+  assert.deepEqual(notice.snapshot, { ...request.snapshotInput, ...draft,
+    actionItems: [{ text: draft.action, label: '回复会话' }], source: '模型' });
   assert.equal(notice.content.situation, draft.situation); assert.equal(notice.content.action, draft.action);
   assert.match(front(noticeCard(notice)), /商店库存管理/);
-  assert.ok(localNoticeText(notice).includes(notice.content.summary));
-  await detect(f.config, at(7), { judge, channels: [] }); await overview(f.config); await rebuild(f.config);
+  assert.ok(localNoticeText(notice).includes(notice.content.situation!));
+  assert.match(localNoticeText(notice), /共 1 件/);
+  await detect(f.config, at(11), { judge, channels: [] }); await overview(f.config); await rebuild(f.config);
   assert.equal(requests.length, 2); assert.equal((await readOutbox(f.config.dataDir)).length, 1);
 });
 
@@ -139,9 +141,9 @@ for (const copy of ['model', 'rule'] as const) test(`返修1-1：同轮先发停
 
 async function fiveKinds(t: TestContext) {
   const f = await fixture(t);
-  const waiting = ccAnswer(at(39)); waiting.message.content[0]!.text = '<file name="/synthetic/a.md">注入内容</file>\n[Attachment: /synthetic/a.pdf]\n请确认 code/src/cache.ts:95 第 95 行的缓存保留多久？';
+  const waiting = ccAnswer(at(34)); waiting.message.content[0]!.text = '<file name="/synthetic/a.md">注入内容</file>\n[Attachment: /synthetic/a.pdf]\n请确认 code/src/cache.ts:95 第 95 行的缓存保留多久？';
   const withId = (id: string, rows: ReturnType<typeof ccUser | typeof ccAnswer | typeof ccCall>[]) => rows.map(row => ({ ...row, sessionId: id }));
-  await put(join(f.config.sources.cc!, 'waiting.jsonl'), withId('waiting', [ccUser('<file name="/synthetic/task.md">不是真人要求</file>\n[Image: /synthetic/a.png]'), ccUser(goal, at(1)), ccUser(current, at(2)), ccUser('继续', at(38)), waiting]));
+  await put(join(f.config.sources.cc!, 'waiting.jsonl'), withId('waiting', [ccUser('<file name="/synthetic/task.md">不是真人要求</file>\n[Image: /synthetic/a.png]'), ccUser(goal, at(1)), ccUser(current, at(2)), ccUser('继续', at(33)), waiting]));
   await put(join(f.config.sources.cc!, 'drift.jsonl'), withId('drift', [ccUser('只改 A 模块', at(38)), ccCall(at(39), 'b', '修改 B 模块')]));
   await put(join(f.config.sources.cc!, 'stalled.jsonl'), withId('stalled', [ccUser(goal), ccCall(at(1))]));
   f.config.sources.codex = join(f.root, 'missing-codex');
@@ -159,10 +161,11 @@ test('D32 A6/A7/A8：五类卡片失败仍发、八项快照完整、注入/占�
   assert.deepEqual(notices.map(n => n.kind).sort(), ['blind', 'drift', 'loop_completed', 'stalled', 'waiting']);
   for (const notice of notices) {
     assert.ok(notice.content.situation); assert.ok(notice.content.action);
-    assert.deepEqual(Object.keys(notice.snapshot!).sort(), ['action', 'actionType', 'currentTask', 'factualStatus', 'goal', 'lastOutput', 'situation', 'source']);
+    assert.deepEqual(Object.keys(notice.snapshot!).sort(), ['action', 'actionItems', 'actionType', 'currentTask', 'factualStatus', 'goal', 'lastOutput', 'situation', 'source']);
     assert.equal(notice.snapshot!.source, '规则');
     assert.doesNotMatch(notice.content.summary, /<file|<ide|\[Image|\[Attachment|\/synthetic|code\/src|cache\.ts|第\s*\d+\s*行|:95\b/);
-    assert.ok(localNoticeText(notice).includes(notice.content.summary));
+    assert.ok(localNoticeText(notice).includes(notice.content.situation!));
+    assert.ok(localNoticeText(notice).includes(notice.snapshot!.actionItems![0]!.text));
   }
   const loopNotice = notices.find(n => n.kind === 'loop_completed')!;
   assert.match(loopNotice.content.situation!, /shop.*库存管理缓存第八批.*完成/);
@@ -432,9 +435,9 @@ test('D32 保留原判断失败的状态重试，但已发规则卡片不再起�
     assert.equal(request.draftSnapshot, false); assert.doesNotMatch(judgmentPrompt(request), /写卡片只读四项/);
     return { answer: '是', reason: '状态重试成功', ...draft };
   } };
-  await detect(f.config, at(6), { judge, channels: [] });
+  await detect(f.config, at(10), { judge, channels: [] });
   const before = await readFile(join(f.config.dataDir, 'outbox.jsonl'), 'utf8');
-  await detect(f.config, at(7), { judge, channels: [] }); await detect(f.config, at(8), { judge, channels: [] });
+  await detect(f.config, at(11), { judge, channels: [] }); await detect(f.config, at(12), { judge, channels: [] });
   assert.equal(waitingCalls, 2); assert.equal(await readFile(join(f.config.dataDir, 'outbox.jsonl'), 'utf8'), before);
   assert.equal((await readOutbox(f.config.dataDir))[0]!.snapshot!.source, '规则');
 });
