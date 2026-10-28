@@ -12,6 +12,7 @@ export class SourceReader {
   identity: SessionIdentity | null = null;
   lastRecordAt: string | undefined;
   readonly sessionIds = new Set<string>();
+  hasCoreRows = false;
   private complete = false;
   private jsonChecked = false;
   private headers = new Map<string, string>();
@@ -90,6 +91,7 @@ export class SourceReader {
         const at = new Date(row.timestamp).toISOString();
         if (!this.lastRecordAt || at > this.lastRecordAt) this.lastRecordAt = at;
       }
+      if (this.component.isCoreRow?.(row)) this.hasCoreRows = true;
       const identity = this.component.identifyRow?.(row) ?? null;
       const sessionId = this.component.sessionIdOf?.(row) ?? identity?.sessionId;
       if (sessionId) this.sessionIds.add(sessionId);
