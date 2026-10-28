@@ -23,11 +23,11 @@ async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 40000 };
   f.config.learning = false;
-  const at = new Date(Date.now() - 2000).toISOString();
+  const at = new Date(Date.now() - 12 * 60000).toISOString();
   const transcript = join(f.config.sources.cc!, 'sample.jsonl');
   await put(transcript, [ccUser('构造长检测', at), ccCall(at)]);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', at)]);
-  await detect(f.config, at);
+  await detect(f.config); // 已过等待窗口且真人不在场，便于测飞书反馈链。
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   const sent = () => readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl'));
   const message = (await sent()).find(m => m.noticeId === notice.id)!;
@@ -55,7 +55,7 @@ test('反馈 A1/A2：常驻检测实际持数据锁35秒，按钮、飞书文字
   const f = await fixture(t);
   f.config.service = { intervalMs: 100, restartWindowMs: 1000, restartThreshold: 3 };
   // 新的等待证据产生另一条提醒；第一张旧卡片留给按钮反馈。
-  const at = new Date().toISOString();
+  const at = new Date(Date.now() - 6 * 60000).toISOString();
   await appendJsonl(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(f.transcript, 'waiting_permission', at)]);
   let release!: () => void, holding = false;
   const gate = new Promise<void>(resolve => { release = resolve; });

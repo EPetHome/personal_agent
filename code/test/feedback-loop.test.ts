@@ -27,7 +27,7 @@ import { readFeedback, receiveFeedback } from '../src/core/feedback.ts';
 import { renderOverview } from '../src/core/judge.ts';
 import { ccAnswer, ccCall, ccUser, codexEvent, codexMeta, loopSummary, piHeader, piMessage, put, pushed, sandbox, start } from './fixtures.ts';
 
-const now = '2026-10-20T10:01:00.000Z';
+const now = '2026-10-20T10:06:00.000Z'; // 等待卡片需先满五分钟。
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.learning = false;
@@ -51,7 +51,7 @@ test('A1/A2：误报立即按会话和原因抑制，下一次等待不发、其
   const other = join(f.config.sources.cc!, 'two.jsonl');
   await put(other, [ccUser('另一会话'), ccCall('2026-10-20T10:03:00Z')].map(row => ({ ...row, sessionId: 'other-session' })));
   await appendJsonl(join(f.config.inboxDir!, 'cc.jsonl'), [{ ...pushed(other, 'waiting_permission', '2026-10-20T10:03:01Z'), session_id: 'other-session' }]);
-  const view = await detect(f.config, '2026-10-20T10:04:00Z');
+  const view = await detect(f.config, '2026-10-20T10:09:00Z');
   assert.equal(view.noticesAdded, 1);
   assert.equal(view.records.find(r => r.sessionId === 'demo-cc')!.notice, '因你的误报没提醒');
   assert.match(renderOverview(view.records, view.projection), /因你的误报没提醒/);
@@ -206,12 +206,13 @@ for (const first of ['合入。', '[Image: source: /synthetic/screenshot.png]'])
   assert.equal(notice.content.situation, situation); assert.equal(notice.content.action, action);
   const card = noticeCard(notice), firstBlocks = card.body.elements.slice(0, 3) as { tag: string; content: string }[];
   assert.deepEqual(firstBlocks.map(b => b.tag), ['markdown', 'markdown', 'markdown']);
-  for (const block of firstBlocks) assert.ok(block.content.split('\n').length <= 2);
+  assert.ok(firstBlocks[0]!.content.split('\n').length <= 2);
+  assert.match(firstBlocks[1]!.content, /【.*】/); // 要你做改为逐件，不再限制整区两行。
   const body = front(card); for (const label of ['**这件事**', '**要你做**', '**时间 / 回去看**']) assert.ok(body.includes(label));
   assert.doesNotMatch(body, /合入。|SYNTHETIC_PRIVATE_REASON|\[Image|<ide_|\d{4}-\d\d-\d\dT|第\s*\d+\s*行|events\.jsonl/);
   assert.match(JSON.stringify(card), /SYNTHETIC_PRIVATE_REASON/); assert.match(JSON.stringify(card), /旧缓存保留多久/);
   assert.equal((await readJsonl<string[]>(captured))[0]!.at(-1), localNoticeText(notice));
-  assert.ok(notice.content.summary.includes(situation) && notice.content.summary.includes(action));
+  assert.ok(notice.content.summary.includes(situation) && notice.content.summary.includes('旧缓存保留多久'));
 });
 
 for (const mode of ['unavailable', 'timeout', 'missing-copy'] as const) test(`A6：IDE标签开头、判断器${mode}时仍有合格兜底，末尾列表问题不丢`, async t => {
@@ -407,13 +408,13 @@ test('误报晚于开轮时刻：模型等待中收到反馈，返回后同会�
   const next = ccAnswer('2026-10-20T10:03:00Z'); next.message.content[0]!.text = '旧缓存现在删除吗？'; await appendFile(file, JSON.stringify(next) + '\n');
   let entered!: () => void, release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
-  const pending = detect(f.config, '2026-10-20T10:04:00Z', { judge: { async judge(request) {
+  const pending = detect(f.config, '2026-10-20T10:09:00Z', { judge: { async judge(request) {
     if (request.task === 'waiting') { entered(); await gate; }
     return { answer: request.task === 'waiting' ? '是' : '否', reason: '构造新等待' };
   } } });
   await started;
   try {
-    await receiveFeedback(f.config.dataDir, 'local', { noticeId: old.id, content: '误报 不用再叫我', at: '2026-10-20T10:04:30Z' });
+    await receiveFeedback(f.config.dataDir, 'local', { noticeId: old.id, content: '误报 不用再叫我', at: '2026-10-20T10:09:30Z' });
   } finally { release(); }
   const view = await pending;
   assert.equal(view.noticesAdded, 0); assert.equal(view.records[0]!.notice, '因你的误报没提醒');

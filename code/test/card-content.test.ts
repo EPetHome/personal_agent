@@ -14,7 +14,8 @@ import type { SentMessage } from '../src/channels/feishu/index.ts';
 import type { ReviewItem } from '../src/core/types.ts';
 import { ccAnswer, ccUser, codexEvent, codexMeta, piHeader, piMessage, put, sandbox } from './fixtures.ts';
 
-const now = '2026-10-20T10:01:00.000Z';
+// 版式测试在等候五分钟且离场后发卡。
+const now = '2026-10-20T10:11:00.000Z';
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 }; f.config.learning = false;
@@ -71,8 +72,8 @@ test('卡片 A6/A7：实际检测保留冒号后三项列表，时间后有空�
   await put(join(f.config.sources.cc!, 'sample.jsonl'), [ccUser('给商品列表加缓存'), answer]);
   await detect(f.config, now, { judge: { async judge(request) { return { answer: request.task === 'waiting' ? '是' : '否', reason: '构造列表提问' }; } } });
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'waiting')!;
-  const action = notice.content.summary.split('\n')[2]!;
-  for (const item of ['等你核销：', '在飞书点几张卡片的按钮', '看新卡片是不是一眼能懂', '确认这一周反馈都留得下来']) assert.ok(action.includes(item));
+  const action = notice.content.summary;
+  for (const item of ['在飞书点几张卡片的按钮', '看新卡片是不是一眼能懂', '确认这一周反馈都留得下来']) assert.ok(action.includes(item));
   assert.match(noticeTimeAndReturn(notice), /\d\d:\d\d/);
   assert.ok(!action.endsWith('：'));
 });
@@ -102,15 +103,17 @@ test('卡片 A8：单独复盘、周报多项复盘标题均只出现一次，�
   }
 });
 
-test('会话错配文案说明同工具全部状态未知，实际判断保持该范围，其他工具不受影响', async t => {
+test('会话错配只影响该会话，文案与判断一致，同工具其他会话及其他工具不受影响', async t => {
   const f = await fixture(t); f.config.judge = null; f.config.sources.codex = join(f.root, 'codex');
   await put(join(f.config.sources.cc!, 'good.jsonl'), [ccUser(), ccAnswer()]);
   for (const id of ['codex-a', 'codex-b']) await put(join(f.config.sources.codex, `${id}.jsonl`), [codexMeta(id), codexEvent({ type: 'user_message', message: '构造缓存任务' })]);
   await put(join(f.config.inboxDir!, 'codex.jsonl'), [{ tool: 'codex', event: 'waiting_permission', session_id: 'codex-a', cwd: '/sample/codex', transcript_path: join(f.config.sources.codex, 'wrong.jsonl'), at: now, detail: '构造错配' }]);
   const view = await detect(f.config, now);
-  assert.ok(view.records.filter(r => r.tool === 'codex').every(r => r.status === '看不见了'));
+  assert.equal(view.records.find(r => r.sessionId === 'codex-a')?.status, '看不见了');
+  assert.equal(view.records.find(r => r.sessionId === 'codex-b')?.status, '进行中');
+  assert.equal(view.projection.health.get('codex')?.since, null);
   assert.equal(view.records.find(r => r.tool === 'cc')!.status, '已完成');
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'blind')!;
-  assert.match(notice.content.summary, /Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/);
-  assert.doesNotMatch(notice.content.summary, /其他会话继续检测/);
+  assert.match(notice.content.summary, /只影响这一个会话，其他会话继续检测/);
+  assert.doesNotMatch(notice.content.summary, /所有会话当前状态都暂时不能确认/);
 });

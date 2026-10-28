@@ -10,7 +10,8 @@ import { readJsonl, readOutbox } from '../src/core/store.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { ccAnswer, ccUser, codexEvent, codexMeta, loopSummary, put, sandbox } from './fixtures.ts';
 
-const now = '2026-10-20T10:01:00.000Z';
+// 飞书版式用已离场且过等候窗口的时点。
+const now = '2026-10-20T10:11:00.000Z';
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 }; f.config.learning = false;
@@ -52,7 +53,7 @@ test('飞书 A4：Claude Code 等回复卡片四件事，shop/意图/原问题/�
   const body = front(await sent(f.config.dataDir, notice.id)); assertLayout(body);
   assert.match(body, /shop 的 Claude Code/);
   assert.match(body, /\*\*这件事\*\*：给商品列表加缓存/);
-  assert.match(body, /\*\*要你做\*\*：请你选择缓存保留五分钟还是十分钟？/);
+  assert.match(body, /【回复会话】请你选择缓存保留五分钟还是十分钟？/);
   assert.match(body, /claude --resume demo-cc/);
   assert.ok(!body.includes(f.config.dataDir)); assert.doesNotMatch(body, /SYNTHETIC_REASON/);
   const local = (await readJsonl<string[]>(calls))[0]!;
@@ -71,8 +72,9 @@ test('飞书 A5：单个Codex报信核对失败写清项目/会话/影响，只�
   assert.match(notice.content.title, /shop 的 Codex/);
   const body = front(await sent(f.config.dataDir, notice.id)); assertLayout(body);
   assert.match(body, /shop 的 Codex/); assert.match(body, /\*\*这件事\*\*：检查商品缓存/);
-  assert.match(body, /这个会话.*核对/); assert.match(body, /\*\*要你做\*\*：请回去看看/);
-  assert.match(notice.content.evidence.reason, /Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/);
+  assert.match(body, /这个会话.*核对/); assert.match(body, /【你去做】请回去看看/);
+  assert.match(notice.content.evidence.reason, /只影响这一个会话，同一工具的其他会话照常判断和提醒/);
+  assert.doesNotMatch(notice.content.evidence.reason, /所有会话当前状态都暂时不能确认/);
   assert.match(notice.content.returnCommand, /resume synthetic-codex-session$/);
   assert.ok(!notice.content.returnCommand.includes(f.config.sources.codex)); assert.ok(!body.includes(f.config.dataDir));
   assert.match(notice.content.evidence.reason, /第 1 行推送与已读取会话对不上/);
@@ -93,8 +95,8 @@ test('飞书 A6：首次五份历史返修只计数，新一批推一张复盘�
   assert.deepEqual((await readOutbox(f.config.dataDir)).filter(n => n.kind === 'recurrence'), []);
   assert.deepEqual(await readJsonl(join(f.config.dataDir, 'feishu-sent.jsonl')), []);
   const before = await readFile(join(f.config.dataDir, 'learning.jsonl'), 'utf8');
-  const summaryPath = await summary(6, '2026-10-20T10:02:00Z');
-  await detect(f.config, '2026-10-20T10:03:00Z');
+  const summaryPath = await summary(6, '2026-10-20T10:12:00Z');
+  await detect(f.config, '2026-10-20T10:13:00Z');
   const reviews = (await readOutbox(f.config.dataDir)).filter(n => n.kind === 'recurrence'); assert.equal(reviews.length, 1);
   const review = reviews[0]!; assert.equal(review.reviews![0]!.count, 6);
   assert.match(review.content.title, /shop 的 loop.*商品缓存第6批.*返修 2 次/);
@@ -105,7 +107,7 @@ test('飞书 A6：首次五份历史返修只计数，新一批推一张复盘�
   assert.equal(review.content.returnCommand, `open ${summaryPath}`);
   assert.ok(!review.content.returnCommand.includes('learning.jsonl'));
   assert.ok((await readFile(join(f.config.dataDir, 'learning.jsonl'), 'utf8')).startsWith(before));
-  await rebuild(f.config); await detect(f.config, '2026-10-20T10:04:00Z');
+  await rebuild(f.config); await detect(f.config, '2026-10-20T10:14:00Z');
   assert.equal((await readOutbox(f.config.dataDir)).filter(n => n.kind === 'recurrence').length, 1);
   for (const [path, content] of originals) assert.equal(await readFile(path, 'utf8'), content);
 });

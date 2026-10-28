@@ -41,9 +41,9 @@ test('停滞：29/30 分钟不发，31 分钟发，40 分钟及恢复后再次�
 test('等授权：回看命令和原文齐全；重复推送只发一次；之后有新动静就解除等待', async t => {
   const { config, transcript } = await fixture(t);
   await put(transcript, [ccUser('请保留这个完整原文\n第二行'), ccCall()]);
-  const p = pushed(transcript);
+  const p = pushed(transcript); // 五分钟窗口后才发件。
   await put(join(config.inboxDir!, 'cc.jsonl'), [p, p]);
-  const view = await detect(config, '2026-10-20T10:01:00Z');
+  const view = await detect(config, '2026-10-20T10:06:00Z');
   assert.equal(view.noticesAdded, 1);
   assert.equal(view.records[0]?.status, '在等我');
   const [notice] = await readOutbox(config.dataDir);

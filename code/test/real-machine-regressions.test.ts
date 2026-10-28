@@ -19,7 +19,7 @@ import type { ListenerAPI } from '../src/hooks/pi/index.ts';
 import { ccAnswer, ccCall, ccUser, codexEvent, codexMeta, loopSummary, piHeader, piMessage, pushed, put, sandbox } from './fixtures.ts';
 import type { Judge, JudgmentContext, JudgmentResult } from '../src/core/types.ts';
 
-const now = '2026-10-20T10:01:00Z';
+const now = '2026-10-20T10:06:00Z'; // 模型/渠道回归在五分钟等待之后。
 const no: JudgmentResult = { answer: '否', reason: '完成而非提问' };
 async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
@@ -44,9 +44,9 @@ test('真机 A1（本批兜底更新）：失败先按明确问题提醒，下�
   assert.ok(failed?.kind === 'model_checked');
   assert.deepEqual(failed.check.failure, { category: 'exit', detail: '命令退出码 17' });
   const prefix = await readFile(join(config.dataDir, 'events.jsonl'), 'utf8');
-  const second = await detect(config, '2026-10-20T10:02:00Z', { judge });
+  const second = await detect(config, '2026-10-20T10:07:00Z', { judge });
   assert.equal(second.records[0]?.status, '在等我'); assert.equal(second.noticesAdded, 0);
-  await detect(config, '2026-10-20T10:03:00Z', { judge });
+  await detect(config, '2026-10-20T10:08:00Z', { judge });
   assert.equal(waitingCalls, 2); assert.equal((await readOutbox(config.dataDir)).length, 1);
   assert.ok((await readFile(join(config.dataDir, 'events.jsonl'), 'utf8')).startsWith(prefix));
 
@@ -117,15 +117,27 @@ test('真机 A6：20个一小时内旧完成会话前面排队，新停下的问
   const latency = Number(process.env.PA_TEST_MODEL_DELAY_MS ?? 30);
   config.judge!.cycleTimeoutMs = latency >= 1000 ? 60000 : 100;
   config.judge!.timeoutMs = latency >= 1000 ? 30000 : 100;
+  // 本条验模型排序，不把并发门禁中的真实磁盘耗时当模型耗时。
+  // 预算仍是原值，只由替身推进时钟；真实超时/取消由 model-scheduling 回归覆盖。
+  let modelElapsed = 0;
+  const epoch = Date.now();
+  t.mock.method(Date, 'now', () => epoch + modelElapsed);
+  t.mock.method(performance, 'now', () => modelElapsed);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const order: string[] = [];
   const judge: Judge = { async judge(request) {
     order.push(`${request.task}:${request.context.assistantReply}`);
-    await delay(latency);
+    modelElapsed += latency; t.mock.timers.tick(latency);
     return request.task === 'waiting' && request.context.assistantReply.startsWith('新问题') ? { answer: '是', reason: '需要选择' } : no;
   } };
   const view = await detect(config, now, { judge });
   assert.match(order[0]!, /^waiting:新问题/);
-  assert.equal(view.records.find(r => r.sessionId === 'demo-cc')?.status, '在等我');
+  const newestRecord = view.records.find(r => r.sessionId === 'demo-cc')!;
+  assert.equal(newestRecord.status, '在等我');
+  assert.equal(newestRecord.modelWaiting?.result.answer, '是', '必须实际先完成新问题的模型判断，不能靠规则兜底混过');
+  if (latency < 1000) assert.ok(view.records.some(r => r.modelNotes?.includes('本轮模型时限用完，仅规则判断')), '其余候选仍受原预算限制');
+  assert.ok(order.length <= Math.ceil(config.judge!.cycleTimeoutMs! / latency), '不扩大原模型预算');
+  assert.equal(view.projection.modelCalls.get('2026-10-20'), order.length);
   assert.equal((await readOutbox(config.dataDir)).filter(n => n.kind === 'waiting').length, 1);
 });
 
@@ -191,7 +203,7 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`真机 A8：${tool} 长
   const calls = await readJsonl<string[]>(log); assert.equal(calls.length, 1);
   const body = calls[0]!.at(-1)!;
   assert.match(body.split('\n')[0]!, /^这件事：/);
-  assert.equal(body.split('\n')[2], `要你做：${question}`);
+  assert.equal(body.split('\n')[2], `要你做：【回复会话】${question}（共 1 件）`);
   assert.equal(body.split(question).length - 1, 1);
   assert.match(body.split('\n')[4]!, /^时间 \/ 回去看：/);
   assert.ok(!/\/sample|\||MODEL_REASON|。。/.test(body.split('\n时间 / 回去看：')[0]!));
@@ -295,7 +307,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`返修1-1：${tool} 有
   const notifications = join(root, 'notifications.jsonl'), notify = join(root, 'fake-notification');
   await writeFile(notify, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(notifications)},JSON.stringify(process.argv.slice(2))+'\\n');\n`);
   await chmod(notify, 0o700); config.localChannel = { executable: notify, timeoutMs: 5000 };
-  const view = await detect(config, new Date().toISOString());
+  const ready = new Date(Date.parse(push!.at) + 5 * 60000).toISOString();
+  const view = await detect(config, ready);
   assert.equal(view.projection.pushes.length, 1, '必须是实际通过对账的推送');
   const contexts = await readJsonl<JudgmentContext>(modelLog);
   const waiting = contexts.filter(context => context.assistantReply);
@@ -304,9 +317,9 @@ for (const tool of ['cc', 'codex', 'pi'] as const) test(`返修1-1：${tool} 有
   assert.ok([...waiting[0]!.assistantReply].length <= 1200);
   assert.equal(view.records[0]?.status, '在等我');
   assert.equal(view.records[0]?.modelWaiting?.evidenceAt, push!.at);
-  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1)?.split('\n')[2], `要你做：${question}`, '通知不能退化为默认占位话');
-  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary.split('\n')[2], `要你做：${question}`);
-  await detect(config, new Date().toISOString());
+  assert.equal((await readJsonl<string[]>(notifications))[0]?.at(-1)?.split('\n')[2], `要你做：【回复会话】${question}（共 1 件）`, '通知不能退化为默认占位话');
+  assert.equal((await readOutbox(config.dataDir))[0]?.content.summary.split('\n')[2], `要你做：1.【回复会话】${question}`);
+  await detect(config, ready);
   assert.equal((await readJsonl(modelLog)).length, contexts.length, '成功判断空跑不重调');
   assert.equal((await readJsonl(notifications)).length, 1, '同一条提醒继续去重');
 });

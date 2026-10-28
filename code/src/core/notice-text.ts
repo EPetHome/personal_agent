@@ -1,5 +1,5 @@
 import { compact, intentText } from './utils.ts';
-import type { Notice, NoticeContent, SessionRecord } from './types.ts';
+import type { Notice, NoticeContent, SessionRecord, TaskActionItem } from './types.ts';
 
 /** 按运行机器当地日历显示，不把 UTC 或跨夏令时的24小时差当作「昨天」。 */
 export function localTime(at: string, now: string): string {
@@ -24,6 +24,9 @@ export function humanText(text: string, project: string, now: string): string {
     .replace(/\b(?:Read|read)[:：]?\s*/g, '查看文件：').replace(/\b(?:Edit|Write|edit|write)[:：]?\s*/g, '修改文件：').replace(/\b(?:Bash|bash)[:：]?\s*/g, '运行命令：')
     .replace(/transcript(?:_path)?/gi, '会话记录').replace(/推送/g, '报信').replace(/对账/g, '核对').replace(/来源/g, '记录');
 }
+export function renderActionItems(items: readonly TaskActionItem[]): string {
+  return items.map((item, i) => `${i + 1}.【${item.label}】${item.text}${item.suggestion ? `\n   建议：${item.suggestion}` : ''}`).join('\n');
+}
 export function firstScreen(situation: string, action: string): string {
   return `这件事：${situation}\n\n要你做：${action}`;
 }
@@ -41,7 +44,7 @@ export function presentNotice(content: NoticeContent, situation: string, action:
   const todo = short(action, 58) || '请回到会话确认下一步';
   return { ...content, title: compact(humanText(content.title, project, now), 72),
     situation: what, action: todo,
-    summary: firstScreen(what, todo),
+    summary: firstScreen(what, content.actionItems?.length ? renderActionItems(content.actionItems) : todo),
     evidence: { ...content.evidence, presentation: content.evidence.presentation ?? { situation, action } } };
 }
 export function noticeTimeAndReturn(notice: Notice): string {
@@ -49,7 +52,9 @@ export function noticeTimeAndReturn(notice: Notice): string {
 }
 export function localNoticeText(notice: Notice): string {
   const raw = noticeSections(notice.content), sections = noticeSections(presentNotice(notice.content, raw.situation, raw.action, notice.at));
-  return `${firstScreen(sections.situation, sections.action)}\n\n时间 / 回去看：${noticeTimeAndReturn(notice)}`;
+  const items = notice.content.actionItems ?? notice.snapshot?.actionItems;
+  const action = items?.length ? `【${items[0]!.label}】${items[0]!.text}（共 ${items.length} 件）` : sections.action;
+  return `${firstScreen(sections.situation, action)}\n\n时间 / 回去看：${noticeTimeAndReturn(notice)}`;
 }
 /** 长会话不能拿「合入。」等操作词当任务，优先最近一条有内容的真人要求。 */
 export function currentTask(record: SessionRecord): string {

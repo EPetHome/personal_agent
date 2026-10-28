@@ -1,5 +1,5 @@
 import type { Notice } from '../../core/types.ts';
-import { localTime, noticeSections, noticeTimeAndReturn, presentNotice } from '../../core/notice-text.ts';
+import { localTime, noticeSections, noticeTimeAndReturn, presentNotice, renderActionItems } from '../../core/notice-text.ts';
 
 function markdown(content: string) { return { tag: 'markdown', content, margin: '0px 0px 12px 0px' }; }
 function button(text: string, value: Record<string, string>) {
@@ -8,15 +8,18 @@ function button(text: string, value: Record<string, string>) {
 function buttons(actions: unknown[]) {
   return { tag: 'column_set', flex_mode: 'none', columns: actions.map(action => ({ tag: 'column', width: 'auto', elements: [action] })) };
 }
-/** 第一屏三块互相分开，细节/审阅均收在证据；编号仅在按钮隐藏 value。 */
+/** 要你做逐件呈现；反馈默认收起，与回复会话的动作分开，不放输入框。 */
 export function noticeCard(notice: Notice) {
   const raw = noticeSections(notice.content);
   // 包括仍待投递的旧版卡片：兼容读取但不改写发件原件。
   const content = presentNotice(notice.content, raw.situation, raw.action, notice.at), evidence = content.evidence;
-  const elements: unknown[] = [markdown(`**这件事**：${content.situation}`), markdown(`**要你做**：${content.action}`),
+  const items = content.actionItems ?? notice.snapshot?.actionItems;
+  const elements: unknown[] = [markdown(`**这件事**：${content.situation}`), markdown(`**要你做**：${items?.length ? `\n${renderActionItems(items)}` : content.action}`),
     markdown(`**时间 / 回去看**：${noticeTimeAndReturn(notice)}`)];
   const verdicts = ['weekly', 'recurrence', 'service_restart'].includes(notice.kind) ? ['看不懂'] : ['正确', '误报', '看不懂'];
-  elements.push(buttons(verdicts.map(verdict => button(verdict, { action: 'feedback', verdict, noticeId: notice.id }))));
+  elements.push({ tag: 'collapsible_panel', expanded: false,
+    header: { title: { tag: 'plain_text', content: '给 personal agent 的反馈' } },
+    elements: [buttons(verdicts.map(verdict => button(verdict, { action: 'feedback', verdict, noticeId: notice.id })))] });
   let reason = evidence.reason;
   for (const item of notice.reviews ?? []) reason = reason.replaceAll(item.title, '');
   const details: unknown[] = [markdown([

@@ -6,6 +6,7 @@ import { receiveFeedback } from '../../core/feedback.ts';
 import { safeProcessingFailure } from '../../core/failures.ts';
 import { changeExperience } from '../../core/learning.ts';
 import { event } from '../../core/events.ts';
+import { prepareEventLog } from '../../core/event-archive.ts';
 import { withNamedLock } from '../../core/locks.ts';
 import { appendJsonl, readJsonl, readOutbox, withStoreLock } from '../../core/store.ts';
 import { hash, iso } from '../../core/utils.ts';
@@ -102,6 +103,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
           await withStoreLock(dir, async () => {
             const at = new Date().toISOString(), logPath = join(dir, 'service.log.jsonl');
             await readJsonl(logPath);
+            // 首笔连接事件也先完成格式准备，避免全新目录被下一轮误认成需迁移的旧库。
+            await prepareEventLog(dir, at);
             await appendJsonl(join(dir, 'events.jsonl'), [event({ kind: 'feishu_connection', connection }, at)]);
             await appendJsonl(logPath, [{ at, kind: connection.state === 'failed' ? 'feishu_connection_failed' : 'feishu_connection',
               state: connection.state, ...(connection.failure ?? {}) }]);

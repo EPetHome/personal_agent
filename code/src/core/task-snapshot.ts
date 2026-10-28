@@ -1,5 +1,6 @@
 import { humanText, readableLines, requestedAction, replyExcerpt } from './notice-text.ts';
 import { compact, hash, meaningfulRequest, object } from './utils.ts';
+import { buildActionItems, validActionItems } from './action-items.ts';
 import type { Notice, RequestRef, SessionRecord, TaskActionType, TaskSnapshot, TaskSnapshotDraft, TaskSnapshotInput, Step } from './types.ts';
 
 export const actionTypes: readonly TaskActionType[] = ['回答问题', '做个决定', '去看一眼', '不用管'];
@@ -40,10 +41,13 @@ function typeOf(action: string): TaskActionType {
 export function modelSnapshot(input: TaskSnapshotInput, value: unknown, project: string, now: string): TaskSnapshot | null {
   let data: Record<string, any>;
   try { data = object(value); } catch { return null; }
-  if (typeof data.situation !== 'string' || typeof data.action !== 'string' || !actionTypes.includes(data.actionType)) return null;
-  const situation = situationText(data.situation, project, now), action = clean(data.action, project, now, 58);
+  const supplied = validActionItems(data.actionItems);
+  if (typeof data.situation !== 'string' || (!supplied.length && (typeof data.action !== 'string' || !actionTypes.includes(data.actionType)))) return null;
+  const rawAction = typeof data.action === 'string' ? data.action : supplied[0]?.text ?? '';
+  const situation = situationText(data.situation, project, now), action = clean(rawAction, project, now, 58);
   if (!situation || !action) return null;
-  return { ...input, situation, action, actionType: data.actionType, source: '模型' };
+  return { ...input, situation, action, actionType: actionTypes.includes(data.actionType) ? data.actionType : typeOf(action),
+    actionItems: buildActionItems(supplied, rawAction, input, project, now), source: '模型' };
 }
 export function ruleSnapshot(input: TaskSnapshotInput, project: string, now: string): TaskSnapshot {
   const sentence = (value: string | null) => readableLines(value ?? '', project).join('；').split(/(?<=[。！？!?])\s*/)[0] ?? '';
@@ -80,7 +84,7 @@ export function ruleSnapshot(input: TaskSnapshotInput, project: string, now: str
   }
   const draft: TaskSnapshotDraft = { situation: situationText(situation, project, now) || '会话目前需要你回去看一眼',
     action: clean(action, project, now, 58) || '请回到会话确认下一步', actionType: typeOf(action) };
-  return { ...input, ...draft, source: '规则' };
+  return { ...input, ...draft, actionItems: buildActionItems(undefined, action, input, project, now), source: '规则' };
 }
 export function standaloneSnapshot(notice: Notice): boolean {
   return ['stalled', 'loop_paused', 'loop_completed', 'blind', 'unreadable'].includes(notice.kind);

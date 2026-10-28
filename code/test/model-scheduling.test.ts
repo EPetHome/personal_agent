@@ -18,8 +18,9 @@ async function fixture(t: { after(fn: () => Promise<unknown>): void }, count = 1
   t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.judge = { executable: '/test-only/fake-judge', model: 'test/fake', dailyLimit: 100, timeoutMs: 150, cycleTimeoutMs: 500 };
   const waiting = join(f.config.sources.cc!, 'waiting.jsonl');
-  await put(waiting, [ccUser(), ccCall()]);
-  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(waiting)]);
+  // 模型排队测试使用已经满五分钟的授权等待，仍须先于慢模型交付。
+  await put(waiting, [ccUser(undefined, '2026-10-20T09:50:00Z'), ccCall('2026-10-20T09:55:00Z')]);
+  await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(waiting, 'waiting_permission', '2026-10-20T09:55:01Z')]);
   for (let i = 0; i < count; i++) {
     const sessionId = `busy-${String(i).padStart(2, '0')}`;
     await put(join(f.config.sources.cc!, `${sessionId}.jsonl`), [ccUser('只改 A 文件'), ccCall(undefined, 'b', '修改 B 模块')].map(row => ({ ...row, sessionId })));

@@ -149,6 +149,7 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
     const baselineAt = existingBaseline ?? now;
     if (!existingBaseline) await appendJsonl(join(config.dataDir, 'learning-baseline.jsonl'), [{ version: 1, at: baselineAt }]);
     const input = await withStoreLock(config.dataDir, async () => ({ events: await readEvents(config.dataDir), outbox: await readOutbox(config.dataDir), feedback: await readFeedback(config.dataDir) }));
+    const projection = project(input.events);
     const lookup = new Map(input.outbox.map(n => [n.id, n]));
     const candidates: Omit<Problem, 'layer' | 'reason' | 'countermeasure' | 'experienceId'>[] = [];
     for (const [index, feedback] of input.feedback.entries()) {
@@ -167,7 +168,7 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
         ...(feedback.card ? { card: feedback.card } : notice ? { card: { title: notice.content.title, firstScreen: notice.content.summary, returnCommand: notice.content.returnCommand, at: notice.at } } : {}),
         ...(notice ? { returnCommand: notice.content.returnCommand, noticeKind: notice.kind } : {}) });
     }
-    for (const record of project(input.events).sessions.values()) {
+    for (const record of projection.sessions.values()) {
       if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || !record.loop || record.lastActivityAt > now || (record.loop.repairs < 2 && !/上限|达到.{0,8}限/.test(record.loop.conclusion))) continue;
       const source = `loop:${record.key}`;
       candidates.push({ id: hash(source), source, at: record.lastActivityAt, type: 'loop返修', tool: 'loop', project: record.project,
@@ -232,7 +233,7 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
       const firstAfterBaseline = !prior.some(p => p !== problem && p.experienceId === problem.experienceId && p.at > baselineAt);
       if (problem.at <= baselineAt || count < 2 || (count !== 2 && !problem.countermeasure && !firstAfterBaseline)) continue;
       const item = reviewItems(prior, state.experiences, problem.at, problem.at).find(r => r.experienceId === problem.experienceId);
-      if (!item || input.events.some(e => e.kind === 'notice_planned' && e.notice.dedupeKey === `recurrence:${problem.id}`)) continue;
+      if (!item || projection.notices.some(n => n.dedupeKey === `recurrence:${problem.id}`)) continue;
       const ai = `${problem.project ? `${basename(problem.project)} 的 ` : ''}${toolNames[problem.tool as keyof typeof toolNames] ?? problem.tool}`;
       const situation = problem.loop ? `${ai} · ${problem.loop.batch}：返修 ${problem.loop.repairs} 次，同类第 ${count} 次`
         : `${ai}：${problem.noticeKind ? `${kindNames[problem.noticeKind]}提醒，` : ''}${compact(problem.fact, 40)}（同类第 ${count} 次）`;

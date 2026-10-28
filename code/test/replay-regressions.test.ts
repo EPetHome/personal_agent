@@ -141,7 +141,7 @@ test('回放：首次历史等待永久不补发，但有新等待证据仍能�
   await rm(join(f.config.dataDir, 'state.json'));
   assert.equal((await rebuild(f.config)).records[0]?.status, '在等我');
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(f.transcript, 'waiting_permission', '2026-10-20T10:11:00Z')]);
-  assert.equal((await detect(f.config, '2026-10-20T10:12:00Z')).noticesAdded, 1);
+  assert.equal((await detect(f.config, '2026-10-20T10:16:00Z')).noticesAdded, 1);
   assert.equal((await readOutbox(f.config.dataDir))[0]?.kind, 'waiting');
 });
 

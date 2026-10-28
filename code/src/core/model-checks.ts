@@ -1,5 +1,6 @@
-import { membersOf, pushMatchesMember } from './sessions.ts';
-import { modelEvidenceKey } from './evidence.ts';
+import { membersOf, mismatchedMemberIds, pushMatchesMember, sourceUnavailable } from './sessions.ts';
+import { indexModelEvidence, modelEvidenceFor, sameModelEvidenceScope } from './evidence.ts';
+import { humanRequests, waitingReady } from './interaction.ts';
 import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
@@ -12,8 +13,8 @@ const ONE_DAY = 24 * 60 * 60 * 1000;
 const FIRST_LOOKBACK = 60 * 60 * 1000;
 interface Candidate { key: string; task: 'waiting' | 'drift'; sessionId: string; evidenceAt: string; fingerprint: string; context: JudgmentContext; stepIds: string[]; snapshotInput: TaskSnapshotInput; snapshotInputsByStep?: TaskSnapshotInput[] }
 function stepId(step: { at: string; text: string }): string { return hash(JSON.stringify({ at: step.at, text: step.text })); }
-function candidate(record: SessionRecord, member: SessionMember, task: Candidate['task'], reply: string, at: string, projection: Projection, config: Config): Candidate {
-  const key = `${task}:${record.key}${task === 'waiting' ? `:${member.sessionId}` : ''}`;
+function candidate(record: SessionRecord, member: SessionMember, task: Candidate['task'], reply: string, at: string, projection: Projection, config: Config, memberScoped = false): Candidate {
+  const key = `${task}:${record.key}${task === 'waiting' || memberScoped ? `:${member.sessionId}` : ''}`;
   const previous = projection.modelChecks.get(key);
   const stepIds = member.recentSteps.map(stepId);
   const newSteps = member.recentSteps.filter(step => (previous?.error === '调用失败，仅规则判断' && !previous.failure)
@@ -31,20 +32,51 @@ function candidate(record: SessionRecord, member: SessionMember, task: Candidate
     fingerprint: hash(JSON.stringify([config.judge?.executable, config.judge?.model, record.intent, member.recentSteps, reply, at])) };
 }
 function candidates(record: JudgedRecord, projection: Projection, config: Config, now: string): Candidate[] {
-  if (!config.judge || record.tool === 'loop' || ['看不见了', '已搁置'].includes(record.status) || membersOf(record).some(m => m.unavailable)) return [];
-  const result: Candidate[] = [];
+  if (!config.judge || record.tool === 'loop' || record.status === '已搁置' || sourceUnavailable(projection, record.tool)) return [];
   const source = projection.sessions.get(record.key) ?? record;
-  if (!record.waiting) for (const member of membersOf(source)) {
-    const push = projection.pushes.filter(p => p.recordKey === record.key && pushMatchesMember(p, member) && p.at <= now
+  const mismatches = mismatchedMemberIds(source, projection);
+  if (record.status === '看不见了' && !mismatches.size) return [];
+  // 组的未知展示不能阻挡健康成员；故障成员既不作等待候选，也不把动作混进跑偏材料。
+  const members = membersOf(source).filter(member => !mismatches.has(member.sessionId));
+  if (!members.length || members.some(member => member.unavailable)) return [];
+  const result: Candidate[] = [];
+  const activities = members.map(member => ({ member,
+    push: projection.pushes.filter(p => p.recordKey === record.key && pushMatchesMember(p, member) && p.at <= now
       && member.lastActivityAt !== null && p.at >= member.lastActivityAt)
-      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1);
+      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1),
+  }));
+  if (!record.waiting) for (const { member, push } of activities) {
     if (member.sessionEnded || push?.event === 'session_end' || push?.event === 'waiting_permission' || member.pendingTools.length
       || !(member.assistantFinished || push?.event === 'turn_end')) continue;
     const reply = push?.event === 'turn_end' ? push.detail : member.assistantReply?.text ?? '';
-    if (reply.trim()) result.push(candidate(record, member, 'waiting', reply, push?.at ?? member.lastActivityAt!, projection, config));
+    const at = push?.at ?? member.lastActivityAt!;
+    const known = modelEvidenceFor(projection, { recordKey: record.key, sessionId: member.sessionId, task: 'waiting', evidenceAt: at });
+    if (reply.trim() && (waitingReady(member, at, now) || (!!known?.result && !known.error))) {
+      result.push(candidate(record, member, 'waiting', reply, at, projection, config));
+    }
   }
-  if (!record.waiting && record.intent.initial && record.recentSteps.length && !membersOf(record).every(m => m.sessionEnded)) {
-    result.push(candidate(record, { ...record, lastActivityAt: record.lastActivityAt }, 'drift', '', record.lastActivityAt, projection, config));
+  if (!record.waiting && record.intent.initial && record.recentSteps.length && !members.every(m => m.sessionEnded)) {
+    // 单独的收尾问句不能绕过等待窗口花一次跑偏调用；真正的执行步骤仍立即检查。
+    // 真人已接话而尚无后续步骤时，也不能拿旧答复重调模型。
+    const actionable = activities.filter(({ member, push }) => {
+      const latestHuman = humanRequests(member).at(-1)?.at;
+      const finished = !member.pendingTools.length
+        && (member.assistantFinished || member.sessionEnded || push?.event === 'turn_end' || push?.event === 'session_end');
+      return member.recentSteps.some(step => {
+        if (latestHuman && Date.parse(step.at) < Date.parse(latestHuman)) return false;
+        // 工具与说明可在同一消息/同一毫秒；只给已结束回合的最终回复套窗口。
+        // 旧步骤没有 kind 时按文本识别最终回复，不把同时间的工具一起压住。
+        const replyStep = step.kind !== 'tool' && step.kind !== 'tool_result'
+          && step.text === compact(member.assistantReply?.text ?? '');
+        return !finished || !replyStep || waitingReady(member, push?.at ?? member.assistantReply?.at ?? step.at, now);
+      });
+    });
+    if (mismatches.size) {
+      for (const { member } of actionable) if (member.lastActivityAt !== null) {
+        // 局部故障时按成员缓存，不能把旧组级摘要/冷却或其他成员步骤带进来。
+        result.push(candidate(record, member, 'drift', '', member.lastActivityAt, projection, config, true));
+      }
+    } else if (actionable.length) result.push(candidate(record, { ...record, lastActivityAt: record.lastActivityAt }, 'drift', '', record.lastActivityAt, projection, config));
   }
   return result;
 }
@@ -71,11 +103,12 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     .sort((a, b) => b.item.evidenceAt.localeCompare(a.item.evidenceAt)
       || (a.item.task === b.item.task ? 0 : a.item.task === 'waiting' ? -1 : 1) || a.item.key.localeCompare(b.item.key));
   for (const { record, item } of queue) {
-    const evidence = projection.modelEvidence.get(modelEvidenceKey({ ...item, recordKey: record.key }));
+    const evidence = modelEvidenceFor(projection, { ...item, recordKey: record.key });
     // 同一事实已有成功的是/否答案，改提取方式、文案或模型配置都不重新花额度。
     if (evidence?.result && !evidence.error) continue;
     // 升级抑制可看各类已交代事实；文案复用只能看本次判断的同类别。
     const announced = projection.notices.filter(n => n.sessionKey === record.key
+      && sameModelEvidenceScope(n, { ...item, recordKey: record.key })
       && ['waiting', 'drift', 'stalled'].includes(n.kind) && (n.memberSessionId ?? record.sessionId) === item.sessionId
       && Date.parse(n.evidenceAt ?? '') === Date.parse(item.evidenceAt));
     if (announced.length && evidence && evidence.snapshotVersion !== 1) continue;
@@ -130,7 +163,7 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
     }
     await persist({ kind: 'model_checked', check });
     projection.modelChecks.set(item.key, check);
-    projection.modelEvidence.set(modelEvidenceKey(check), check);
+    indexModelEvidence(projection.modelEvidence, check);
     checked++;
   }
   return checked;
@@ -146,8 +179,9 @@ function ruleWaiting(record: JudgedRecord, item: Candidate, now: string): void {
 /** 纯投影：overview/rebuild 不调模型；无模型/调用失败时用最后的明确问题兜底。 */
 export function applyModelChecks(records: JudgedRecord[], projection: Projection, config: Config, now: string): void {
   for (const record of records) {
+    const locallyBlind = mismatchedMemberIds(record, projection).size > 0;
     for (const item of candidates(record, projection, config, now)) {
-      const check = projection.modelEvidence.get(modelEvidenceKey({ ...item, recordKey: record.key }));
+      const check = modelEvidenceFor(projection, { ...item, recordKey: record.key });
       if (!check) {
         const previous = projection.modelChecks.get(item.key);
         if (item.task === 'drift' && previous && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES) (record.modelNotes ??= []).push('跑偏检查间隔未到，本轮仅规则判断');
@@ -161,7 +195,7 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
       }
       if (check.result?.answer !== '是') continue;
       if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY) {
-        if (Date.parse(now) - Date.parse(record.lastActivityAt) > ONE_DAY) {
+        if (!locallyBlind && Date.parse(now) - Date.parse(record.lastActivityAt) > ONE_DAY) {
           record.status = '已搁置';
           record.reason = '模型先前判断可能需要你处理，但已超过 24 小时没有新动静；只进总览，不提醒';
         }

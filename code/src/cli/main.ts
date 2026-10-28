@@ -1,4 +1,6 @@
 import { detect, overview, rebuild } from '../core/agent.ts';
+import { restoreEventLog } from '../core/event-archive.ts';
+import { withStoreLock } from '../core/store.ts';
 import { loadConfig } from '../core/config.ts';
 import { renderOverview } from '../core/judge.ts';
 import { receiveFeedback } from '../core/feedback.ts';
@@ -14,6 +16,7 @@ import { errorMessage, iso } from '../core/utils.ts';
 const help = `personal agent（只读盯防、可选模型与渠道）
 用法：node code/src/cli/main.ts <detect|overview|rebuild|stats|feishu-poll|daemon> --config <绝对路径.json> [--now <ISO时间>] [--json]
       node code/src/cli/main.ts feedback <正确|误报|漏了|看不懂> [说明] --config <配置> [--id <提醒编号>|--unlinked] [--now <ISO时间>]
+      node code/src/cli/main.ts restore-events --output <新的绝对文件路径> --config <配置>
       node code/src/cli/main.ts evaluate --samples <样本目录> --config <配置> [--json]
       node code/src/cli/main.ts experience <list|export|confirm|revise|obsolete|revoke> [经验编号] --config <配置> [--countermeasure <对策>] [--layer <归因层>] [--reason <依据>] [--note <说明>] [--json]
       node code/src/cli/main.ts service-install --target <绝对目标目录> --config <绝对配置> [--activate] [--launchctl <可执行文件>]
@@ -28,11 +31,11 @@ async function main() {
   const args = process.argv.slice(2);
   if (args[0] === '--help' || args[0] === '-h') { console.log(help); return; }
   const command = args.shift();
-  if (!['detect', 'overview', 'rebuild', 'feedback', 'evaluate', 'stats', 'feishu-poll', 'daemon', 'experience', 'service-install', 'service-uninstall'].includes(command ?? '')) throw new Error(help);
+  if (!['detect', 'overview', 'rebuild', 'feedback', 'evaluate', 'stats', 'feishu-poll', 'daemon', 'experience', 'service-install', 'service-uninstall', 'restore-events'].includes(command ?? '')) throw new Error(help);
   const words: string[] = [];
   if (command === 'feedback' || command === 'experience') while (args[0] && !args[0].startsWith('--')) words.push(args.shift()!);
   let noticeId: string | null | undefined;
-  let sampleDir: string | undefined, configPath: string | undefined, now: string | undefined, target: string | undefined, launchctl: string | undefined;
+  let sampleDir: string | undefined, configPath: string | undefined, now: string | undefined, target: string | undefined, launchctl: string | undefined, output: string | undefined;
   let json = false, activate = false;
   const changes: Partial<Record<'layer' | 'countermeasure' | 'reason' | 'note', string>> = {};
   const seen = new Set<string>();
@@ -44,18 +47,24 @@ async function main() {
     if (arg === '--json') { json = true; continue; }
     if (arg === '--activate' && command === 'service-install') { activate = true; continue; }
     if (arg === '--unlinked' && command === 'feedback') { if (seen.has('--id')) throw new Error('--unlinked 不能和 --id 同用'); noticeId = null; continue; }
-    if (!['--config', '--now', ...(command === 'feedback' ? ['--id'] : []), ...(command === 'evaluate' ? ['--samples'] : []), ...(serviceCommand ? ['--target', '--launchctl'] : []), ...(command === 'experience' ? ['--countermeasure', '--layer', '--reason', '--note'] : [])].includes(arg)) throw new Error(`未知参数：${arg}`);
+    if (!['--config', '--now', ...(command === 'feedback' ? ['--id'] : []), ...(command === 'evaluate' ? ['--samples'] : []), ...(command === 'restore-events' ? ['--output'] : []), ...(serviceCommand ? ['--target', '--launchctl'] : []), ...(command === 'experience' ? ['--countermeasure', '--layer', '--reason', '--note'] : [])].includes(arg)) throw new Error(`未知参数：${arg}`);
     const value = args.shift();
     if (!value || value.startsWith('--')) throw new Error(`${arg} 缺少值`);
     if (arg === '--config') configPath = value;
     else if (arg === '--id') { if (seen.has('--unlinked')) throw new Error('--id 不能和 --unlinked 同用'); noticeId = value; }
     else if (arg === '--samples') sampleDir = value;
     else if (arg === '--target') target = value;
+    else if (arg === '--output') output = value;
     else if (arg === '--launchctl') launchctl = value;
     else if (arg === '--now') now = iso(value, '当前时间');
     else changes[arg.slice(2) as keyof typeof changes] = value;
   }
   const config = await loadConfig(configPath);
+  if (command === 'restore-events') {
+    if (!output) throw new Error('必须显式指定 --output，且目标文件不能已存在');
+    await withStoreLock(config.dataDir, () => restoreEventLog(config.dataDir, output!));
+    console.log(json ? JSON.stringify({ output }) : `已从封存文件和活动日志还原完整事件到 ${output}；未覆盖原日志。`); return;
+  }
   if (serviceCommand) {
     if (!target) throw new Error('必须显式指定 --target；没有真实 LaunchAgents 默认值');
     if (command === 'service-install') await installService(configPath!, target, activate, launchctl);
@@ -101,7 +110,7 @@ async function main() {
   }
   const view = command === 'detect' ? await detect(config, now)
     : command === 'rebuild' ? await rebuild(config, now) : await overview(config, now);
-  if (json) console.log(JSON.stringify({ at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}), ...('noticesAdded' in view ? { noticesAdded: view.noticesAdded } : {}) }, null, 2));
+  if (json) console.log(JSON.stringify({ at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}), ...('noticesAdded' in view ? { noticesAdded: view.noticesAdded } : {}) }, null, 2));
   else {
     if ('noticesAdded' in view) console.log(`检测完成，新增 ${view.noticesAdded} 条发件记录。`);
     if (command === 'rebuild') console.log('已从 events.jsonl 重建 state.json。');

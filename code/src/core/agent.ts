@@ -6,25 +6,33 @@ import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
 import { checkSnapshotModels } from './snapshot-model.ts';
 import { noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
+import { nextNoticeReplies, routeNotice } from './interaction.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
 import { event, project, pushIdentity } from './events.ts';
+import { isMemberScopedDriftNotice } from './evidence.ts';
+import { prepareEventLog } from './event-archive.ts';
+import { sessionDelta } from './session-delta.ts';
 import { skipAnomaly } from './health.ts';
 import { feedbackSuppressions, isFeedbackSuppressed, readFeedback } from './feedback.ts';
 import { judgeRecords, planNotices } from './judge.ts';
 import { normalize } from './normalize.ts';
 import { perceive } from './perception.ts';
-import { findPushTarget, isFailedOriginal, isIgnoredMember, isInternalSession, membersOf } from './sessions.ts';
+import { findPushTarget, isFailedOriginal, isIgnoredMember, isInternalSession, membersOf, mismatchedMemberIds } from './sessions.ts';
 import { appendJsonl, readEvents, readOutbox, withModelLock, withStoreLock, writeState } from './store.ts';
 import { iso } from './utils.ts';
 import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Notice, Projection } from './types.ts';
 
 export interface Snapshot { at: string; records: JudgedRecord[]; projection: Projection }
 function activeProjection(projection: Projection, config: Config): Projection {
+  const pushMismatches = new Map([...projection.pushMismatches].filter(([, mismatch]) => config.inboxDir !== null
+    && config.sources[mismatch.push.tool] !== null && !isIgnoredProject(mismatch.push.project, config)
+    && !isInternalSession(mismatch.push.tool, mismatch.push.sessionId, mismatch.push.project)));
   const sessions = new Map([...projection.sessions].filter(([, record]) => {
     if (config.sources[record.tool] === null || isIgnoredProject(record.project, config) || isInternalSession(record.tool, record.sessionId, record.project)) return false;
     const health = projection.health.get(record.tool);
     // 整体故障时保留最后事实并标失明；局部故障不能让坏文件的旧状态冒充本轮正常。
-    return health?.errors.length || !health?.sessionKeys || health.sessionKeys.includes(record.key);
+    return health?.errors.length || !health?.sessionKeys || health.sessionKeys.includes(record.key)
+      || [...pushMismatches.values()].some(m => m.recordKey === record.key);
   }).map(([key, record]) => {
     const members = record.members?.filter(member => !isIgnoredMember(member, record.members!, config, record.tool));
     if (!members || members.length === record.members?.length) return [key, record];
@@ -38,18 +46,25 @@ function activeProjection(projection: Projection, config: Config): Projection {
   const pushes = projection.pushes.filter(push => config.sources[push.tool] !== null
     && !isIgnoredProject(push.project, config) && findPushTarget(sessions.values(), push));
   const waitingKeys = new Set(pushes.map(push => `waiting:${push.recordKey}:${pushIdentity(push)}`));
+  const localDriftScopes = new Map([...sessions].map(([key, record]) => [key, mismatchedMemberIds(record, { pushMismatches })] as const)
+    .filter(([, ids]) => ids.size));
   return {
-    ...projection, sessions, pushes,
+    ...projection, sessions, pushes, pushMismatches,
     snapshotSessions: new Map([...projection.sessions].filter(([, r]) => config.sources[r.tool] !== null
       && !isIgnoredProject(r.project, config) && !isInternalSession(r.tool, r.sessionId, r.project))),
     feishuConnection: config.feishu ? projection.feishuConnection ?? { state: config.feishu.mode === 'fake' ? 'fake' : 'stopped', at: projection.lastScanAt ?? '' } : undefined,
     health: new Map([...projection.health].filter(([source]) => source === 'inbox' ? config.inboxDir !== null : config.sources[source] !== null)),
     notices: projection.notices.filter(notice => (notice.tool === 'agent' || (notice.tool === 'inbox' ? config.inboxDir !== null : config.sources[notice.tool] !== null))
-      && (notice.kind !== 'blind' || (notice.tool !== 'agent' && !!projection.health.get(notice.tool)?.since
-        && notice.dedupeKey === `blind:${notice.tool}:${projection.health.get(notice.tool)?.episodeId}`))
+      && (notice.kind !== 'blind' || (notice.dedupeKey.startsWith('blind:push:')
+        ? [...pushMismatches.values()].some(m => notice.dedupeKey === `blind:push:${m.push.tool}:${m.push.sessionId}:${m.episodeId}`)
+        : notice.tool !== 'agent' && !!projection.health.get(notice.tool)?.since
+          && notice.dedupeKey === `blind:${notice.tool}:${projection.health.get(notice.tool)?.episodeId}`))
       && (notice.kind !== 'unreadable' || (notice.tool !== 'agent' && !!projection.health.get(notice.tool)?.fileFailures?.count
         && notice.dedupeKey === `unreadable:${notice.tool}:${projection.health.get(notice.tool)?.fileFailureEpisodeId}`))
       && (!notice.sessionKey || sessions.has(notice.sessionKey))
+      // 局部故障下不重试旧组级跑偏卡，也不借健康成员的新结论复用它的错误快照。
+      && (notice.kind !== 'drift' || !notice.sessionKey || !localDriftScopes.has(notice.sessionKey)
+        || (isMemberScopedDriftNotice(notice) && !localDriftScopes.get(notice.sessionKey)!.has(notice.memberSessionId!)))
       && (!notice.memberSessionId || (!!notice.sessionKey && membersOf(sessions.get(notice.sessionKey)!).some(member => member.sessionId === notice.memberSessionId)))
       && (notice.kind !== 'waiting' || notice.dedupeKey.startsWith('model_waiting:') || waitingKeys.has(notice.dedupeKey))
       && (!notice.content.evidence.project || !isIgnoredProject(notice.content.evidence.project, config))),
@@ -75,7 +90,8 @@ async function snapshot(events: AgentEvent[], config: Config, now?: string): Pro
   return { at, records, projection };
 }
 function serializedState(view: Snapshot) {
-  return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()], ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}) };
+  return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()],
+    ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}) };
 }
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
 async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>, deferSnapshots = false) {
@@ -85,6 +101,9 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   const at = raw.lastScanAt && raw.lastScanAt > now ? raw.lastScanAt : now;
   const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const add = (payload: EventPayload) => { added.push(event(payload, at)); };
+  for (const reply of nextNoticeReplies(projection)) add({ kind: 'notice_reply_observed', ...reply });
+  // supplemental 通知也走同一分流；历史卡片（缺字段）绝不重新计划或改变出口。
+  for (const entry of added) if (entry.kind === 'notice_planned') entry.notice = routeNotice(entry.notice, projection, at);
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
   const suppressed: EventPayload[] = [];
@@ -141,7 +160,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
 }
 export async function publishNotices(config: Config, notices: Notice[], now: string, channels = configuredChannels(config), attempted = new Set<string>()) {
   return withStoreLock(config.dataDir, async () => {
-    const events = await readEvents(config.dataDir), known = new Set(project(events).notices.map(n => n.id));
+    const events = await prepareEventLog(config.dataDir, now), known = new Set(project(events).notices.map(n => n.id));
     const added = notices.filter(n => !known.has(n.id)).map(notice => event({ kind: 'notice_planned', notice }, now));
     return settle(config, events, added, now, channels, attempted);
   });
@@ -163,14 +182,15 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
     return { ...settled, noticesAdded: view.noticesAdded + settled.noticesAdded };
   };
   const ruleView = await withStoreLock(config.dataDir, async () => {
-    const events = await readEvents(config.dataDir);
+    const events = await prepareEventLog(config.dataDir, now);
     const previous = project(events);
     const input = normalize(await perceive(config), previous.sessions.values(), config);
     const available = new Map([...previous.sessions, ...input.records.map(r => [r.key, r] as const)]);
     const added: AgentEvent[] = [];
     const add = (payload: EventPayload) => { added.push(event(payload, now)); };
     for (const record of input.records) {
-      if (JSON.stringify(previous.sessions.get(record.key)) !== JSON.stringify(record)) add({ kind: 'session_observed', record });
+      const delta = sessionDelta(previous.sessions.get(record.key), record);
+      if (delta) add({ kind: 'session_delta', delta });
     }
     const seenSessions = new Set(previous.seenSessions);
     for (const record of input.records) for (const member of membersOf(record)) seenSessions.add(`${record.tool}:${member.sessionId}`);
@@ -178,11 +198,12 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       const key = `${identity.tool}:${identity.sessionId}`;
       if (!seenSessions.has(key)) { add({ kind: 'session_seen', ...identity }); seenSessions.add(key); }
     }
-    const ids = new Set(events.map(e => e.id));
-    const emptyPushes = new Set(events.flatMap(e => e.kind === 'push_empty' ? [e.pushId] : []));
-    const observedPushes = new Set(events.flatMap(e => e.kind === 'push_observed' ? [event({ kind: 'push_observed', push: e.push }, now).id] : []));
+    const ids = new Set([...previous.rawPushes.keys(), ...previous.validatedPushIds]);
+    const emptyPushes = previous.emptyPushIds;
+    const observedPushes = new Set([...previous.rawPushes.values()].map(push => event({ kind: 'push_observed', push }, now).id));
     const unhealthySources = new Set(input.health.filter(report => report.errors.length).map(report => report.source));
-    const deferred = new Map(events.flatMap(e => e.kind === 'push_deferred' ? [[e.pushId, e.rounds] as const] : []));
+    const deferred = previous.deferredPushes;
+    const mismatches = new Map<string, Extract<EventPayload, { kind: 'push_mismatches' }>['mismatches'][number]>();
     for (const push of input.pushes) {
       const entry = event({ kind: 'push_observed', push }, now);
       if (!ids.has(entry.id)) { added.push(entry); ids.add(entry.id); }
@@ -192,7 +213,6 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       if (!unwritten && isFailedOriginal(push.tool, push.transcriptPath, input.failedPaths)) continue;
       const record = unwritten ? undefined : findPushTarget(input.records, push, true);
       if (!record) {
-        const report = input.health.find(h => h.source === push.tool);
         const root = config.sources[push.tool];
         const path = root ? relative(root, push.transcriptPath) : '..';
         const knownMembers = [...available.values()].filter(r => r.tool === push.tool).flatMap(membersOf);
@@ -217,21 +237,22 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
           }
           continue;
         }
-        report?.errors.push(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上；未跟随 transcript_path 读取其他文件`);
-        if (report && (report.affectedSessions?.length ?? 0) < 3 && !report.affectedSessions?.some(s => s.sessionId === push.sessionId)) {
-          const known = [...available.values()].find(r => r.tool === push.tool && membersOf(r).some(m => m.sessionId === push.sessionId));
-          (report.affectedSessions ??= []).push({ sessionId: push.sessionId, project: push.project, intentOriginal: known?.intent.initial ?? null });
-        }
+        const known = [...available.values()].find(r => r.tool === push.tool && membersOf(r).some(m => m.sessionId === push.sessionId));
+        mismatches.set(entry.id, { pushId: entry.id, ...(known ? { recordKey: known.key } : {}),
+          reason: `${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上；未跟随 transcript_path 读取其他文件` });
         continue;
       }
-      const recovered = observedPushes.has(entry.id) && previous.health.get(push.tool)?.errors.some(error =>
-        error.startsWith(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上`));
+      const recovered = observedPushes.has(entry.id) && (previous.pushMismatches.has(entry.id) || previous.health.get(push.tool)?.errors.some(error =>
+        error.startsWith(`${push.original.path}：第 ${push.original.line} 行推送与已读取会话对不上`)));
       const validated = event({ kind: 'push_validated', pushId: entry.id, recordKey: record.key, ...(recovered ? { recovered: true } : {}) }, now);
       if (!ids.has(validated.id)) { added.push(validated); ids.add(validated.id); }
     }
+    const previousMismatches = [...previous.pushMismatches.values()].map(({ pushId, recordKey, reason }) => ({ pushId, ...(recordKey ? { recordKey } : {}), reason }));
+    const mismatchRows = [...mismatches.values()];
+    if (JSON.stringify(previousMismatches) !== JSON.stringify(mismatchRows)) add({ kind: 'push_mismatches', mismatches: mismatchRows });
     for (const cursor of input.cursors) {
       if (cursor.kind !== 'push_cursor') continue;
-      const previousCursor = events.findLast(e => e.kind === 'push_cursor' && e.path === cursor.path);
+      const previousCursor = previous.pushCursors.get(cursor.path);
       if (!previousCursor || previousCursor.kind !== 'push_cursor' || previousCursor.lines !== cursor.lines || previousCursor.fingerprint !== cursor.fingerprint) add(cursor);
     }
     for (const report of input.health) {
@@ -241,7 +262,7 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile, last.affectedSessions]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile, report.affectedSessions])) add({ kind: 'source_health', report });
     }
     add({ kind: 'scan_completed' });
-    // 授权等待等已确定提醒先交付并写当前状态，绝不等待其他会话的模型。
+    // 已过等候间隔的授权等待等确定提醒先交付，绝不等待其他会话的模型。
     return settle(config, events, added, now, channels, attempted, deferSnapshots);
   });
   if (!config.judge) return finish(ruleView);
@@ -280,7 +301,8 @@ export async function overview(configInput: Config, now?: string): Promise<Snaps
 export async function rebuild(configInput: Config, now?: string): Promise<Snapshot> {
   const config = await validateConfig(configInput);
   return withStoreLock(config.dataDir, async () => {
-    const view = await snapshot(await readEvents(config.dataDir), config, now);
+    const at = now ?? project(await readEvents(config.dataDir)).lastScanAt ?? new Date().toISOString();
+    const view = await snapshot(await prepareEventLog(config.dataDir, at), config, now);
     await writeState(config.dataDir, serializedState(view));
     return view;
   });
