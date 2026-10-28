@@ -200,8 +200,10 @@ export interface SourceComponent {
   /** 失败文件的核心身份，仅用于忽略/不可用关联，不能证明正常状态或授权新推送对账。 */
   identify?(text: string): SessionIdentity | null;
   identifyRow?(row: Record<string, any>): SessionIdentity | null;
-  /** 只用于记住身份曾在文件中出现、排除空会话；不证明正文/项目可读。 */
+  /** 记住身份曾在文件中出现，保护文件缺失时的判空；不证明正文/项目可读。 */
   sessionIdOf?(row: Record<string, any>): string | null;
+  /** 不依赖身份识别核心消息/动作，区分无内容文件与有对话但无法生成会话的文件。 */
+  isCoreRow?(row: Record<string, any>): boolean;
   /** 来源读取使用可重复遍历的惰性行流，不加载整份原件。 */
   parseRows?(rows: Iterable<Record<string, any>>, original: Original): SessionRecord | null;
   parseLines?(lines: Iterable<string>, original: Original, context: SourceReadContext): SessionRecord | null;

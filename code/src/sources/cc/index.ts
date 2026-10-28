@@ -8,10 +8,13 @@ function identifyRow(row: JsonObject): SessionIdentity | null {
     && typeof row.sessionId === 'string' && row.sessionId.trim().length > 0 && typeof row.cwd === 'string' && row.cwd.trim().length > 0
     ? { sessionId: row.sessionId, project: row.cwd } : null;
 }
+function isCoreRow(row: JsonObject): boolean {
+  return (['user', 'assistant'].includes(row.type) && ['user', 'assistant'].includes(row.message?.role))
+    || row.type === 'session_end' || row.subtype === 'session_end';
+}
 function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord | null {
   const rows = filterRows(all, r => r.isSidechain !== true);
-  const coreRows = filterRows(rows, r => (['user', 'assistant'].includes(r.type) && ['user', 'assistant'].includes(r.message?.role))
-    || r.type === 'session_end' || r.subtype === 'session_end');
+  const coreRows = filterRows(rows, isCoreRow);
   if (!findRow(coreRows, r => ['user', 'assistant'].includes(r.type))) return null;
   const meta = findRow(coreRows, r => typeof r.sessionId === 'string' && r.sessionId.trim().length > 0 && typeof r.cwd === 'string' && r.cwd.trim().length > 0);
   if (!meta) return null; // 完整可解析但没有身份的产物不是会话。
@@ -65,7 +68,7 @@ function parseRows(all: Iterable<JsonObject>, original: Original): SessionRecord
   return finishRecord(record);
 }
 export const cc: SourceComponent = {
-  tool: 'cc', extension: '.jsonl', identifyRow, parseRows,
+  tool: 'cc', extension: '.jsonl', identifyRow, isCoreRow, parseRows,
   sessionIdOf(row) { return typeof row.sessionId === 'string' && row.sessionId.trim() ? row.sessionId : null; },
   identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
   parse(text, original) { return parseRows(jsonLines(text), original); },

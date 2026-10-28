@@ -5,6 +5,7 @@ import type { Original, SessionIdentity, SessionRecord, SourceComponent } from '
 
 const metadataNodes = new Set(['branch_summary', 'compaction', 'model_change', 'thinking_level_change', 'custom', 'custom_message', 'session_info', 'context_edit']);
 const messageRoles = new Set(['user', 'assistant', 'toolResult']);
+function isCoreRow(row: JsonObject): boolean { return row.type === 'message' && messageRoles.has(row.message?.role); }
 function identifyRow(row: JsonObject): SessionIdentity | null {
   return row.type === 'session' && typeof row.id === 'string' && row.id.trim() && typeof row.cwd === 'string' && row.cwd.trim()
     ? { sessionId: row.id, project: row.cwd } : null;
@@ -45,7 +46,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     if (source.type === 'session') continue;
     const row = node(source);
     const predecessor = prior; prior = row;
-    const coreMessage = row.type === 'message' && messageRoles.has(row.message?.role);
+    const coreMessage = isCoreRow(row);
     if (coreMessage) messages++;
     const meaningful = coreMessage || metadataNodes.has(row.type);
     if (typeof row.id !== 'string' || !row.id || (row.parentId !== null && typeof row.parentId !== 'string')) {
@@ -55,7 +56,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     if (entries.has(row.id)) {
       if (!meaningful) continue;
       const previous = entries.get(row.id)!;
-      if (metadataNodes.has(previous.type) || (previous.type === 'message' && messageRoles.has(previous.message?.role))) throw new Error('Pi 树节点 id 重复');
+      if (metadataNodes.has(previous.type) || isCoreRow(previous)) throw new Error('Pi 树节点 id 重复');
     }
     entries.set(row.id, row);
     if (row.type === 'message' && row.message?.role === 'assistant' && typeof predecessor?.id === 'string'
@@ -66,7 +67,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
   }
   if (!messages) return null;
   const broken = [...entries.values()].filter(row => row.parentId !== null && !entries.has(row.parentId)
-    && (metadataNodes.has(row.type) || (row.type === 'message' && messageRoles.has(row.message?.role))));
+    && (metadataNodes.has(row.type) || isCoreRow(row)));
   if (broken.length) {
     const orphan = broken[0]!;
     const parent = bridges.get(orphan.id);
@@ -124,6 +125,8 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
 }
 export const pi: SourceComponent = {
   tool: 'pi', extension: '.jsonl', identifyRow, parseRows,
+  // v1 顶层对话仍不参与正常解析，但不能因格式被跳过而伪装成空文件。
+  isCoreRow(row) { return isCoreRow(row) || (row.type === undefined && messageRoles.has(row.role)); },
   sessionIdOf(row) { return row.type === 'session' && typeof row.id === 'string' && row.id.trim() ? row.id : null; },
   identify(text) { const row = findJsonObject(text, row => identifyRow(row) !== null); return row ? identifyRow(row) : null; },
   parse(text, original) { return parseRows(jsonLines(text), original); },

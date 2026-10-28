@@ -24,6 +24,8 @@ export interface Perception {
   failedPaths: Set<string>;
   /** 已列到但尚无会话内容的文件，与真正解析失败分开，推送对账有界等待。 */
   unwrittenPaths: Set<string>;
+  /** 完整读取且校验成功、没有核心消息的非会话文件；不能用通用跳过集合代替。 */
+  emptyPaths: Set<string>;
   presentPaths: Set<string>;
   seenSessions: { tool: Tool; sessionId: string }[];
 }
@@ -78,7 +80,8 @@ async function readComponent(path: string, component: SourceComponent) {
     } catch (cause) { error = cause; }
     try { reader.finish(); } catch (cause) { error ??= cause; }
     original.fingerprint = reader.fingerprint;
-    return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, lastRecordAt: reader.lastRecordAt, modifiedAt: stat.mtime.toISOString(), error: reader.error ?? error };
+    return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, hasCoreRows: reader.hasCoreRows,
+      lastRecordAt: reader.lastRecordAt, modifiedAt: stat.mtime.toISOString(), error: reader.error ?? error };
   } finally { await handle.close(); }
 }
 function parsePush(value: unknown, path: string, line: number, fingerprint: string): PushRecord {
@@ -93,7 +96,7 @@ function parsePush(value: unknown, path: string, line: number, fingerprint: stri
   };
 }
 export async function perceive(config: Config): Promise<Perception> {
-  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set(), presentPaths: new Set(), seenSessions: [] };
+  const result: Perception = { records: [], pushes: [], health: [], cursors: [], failedSessions: [], failedPaths: new Set(), unwrittenPaths: new Set(), emptyPaths: new Set(), presentPaths: new Set(), seenSessions: [] };
   const reports = new Map<HealthSource, HealthReport>();
   const ignoredSessions = new Set<string>();
   const activity = new Map<string, { at: string; intent: string | null; record: SessionRecord | null }>();
@@ -135,6 +138,7 @@ export async function perceive(config: Config): Promise<Perception> {
           // 空/非会话记录不能给推送对账，也不能把过去已知子任务误当完成。
           result.failedPaths.add(`${component.tool}:${path}`);
           result.unwrittenPaths.add(`${component.tool}:${path}`);
+          if (component.isCoreRow && !observed.hasCoreRows) result.emptyPaths.add(`${component.tool}:${path}`);
         }
       } catch (error) {
         if (component.tool === 'loop' && permissionDenied(error)) continue;

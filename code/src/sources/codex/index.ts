@@ -11,6 +11,14 @@ function completedItem(row: JsonObject): JsonObject | undefined {
   if (row.type === 'event_msg' && row.payload?.type === 'item_completed') return row.payload.item;
   if (row.type === 'item_completed') return row.item ?? row.payload?.item ?? row.payload;
 }
+function coreKind(row: JsonObject): 'item' | 'event' | 'response' | null {
+  const item = completedItem(row), p = row.payload;
+  if (item && items.includes(item.type)) return 'item';
+  if (row.type === 'event_msg' && p && events.includes(p.type)) return 'event';
+  if (['response_item', 'item_completed'].includes(row.type) && p
+    && (calls.includes(p.type) || outputs.includes(p.type) || (p.type === 'message' && p.role === 'assistant'))) return 'response';
+  return null;
+}
 function humanMessage(item: JsonObject, row: JsonObject): string | null {
   const text = contentText(item.content ?? item.message);
   return !intentText(text).trimStart().startsWith('<') && isHuman(text, row, item) ? text : null;
@@ -52,17 +60,14 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     for (const row of rows) {
       observeCwd(record, row.cwd);
       if (row.type === 'session_meta' || row.type === 'turn_context') observeCwd(record, row.payload?.cwd);
-      const item = completedItem(row);
+      const kind = coreKind(row);
+      if (!kind) continue; // 噪音的 payload、时间等字段也不校验。
       const p = row.payload;
-      const isItem = item && items.includes(item.type);
-      const isEvent = row.type === 'event_msg' && p && events.includes(p.type);
-      const isResponse = ['response_item', 'item_completed'].includes(row.type) && p
-        && (calls.includes(p.type) || outputs.includes(p.type) || (p.type === 'message' && p.role === 'assistant'));
-      if (!isItem && !isEvent && !isResponse) continue; // 噪音的 payload、时间等字段也不校验。
       const at = iso(row.timestamp);
       record.lastActivityAt = at > record.lastActivityAt ? at : record.lastActivityAt;
       recognized++;
-      if (isItem) {
+      if (kind === 'item') {
+        const item = completedItem(row)!;
         if (item.type === 'UserMessage') {
           const userText = humanMessage(item, row);
           if (userText !== null) {
@@ -91,7 +96,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
             pending.set(id, { ...step, id });
           } else if (typeof (item.call_id ?? item.id) === 'string') pending.delete(item.call_id ?? item.id);
         }
-      } else if (isEvent) {
+      } else if (kind === 'event') {
         if (p.type === 'user_message') {
           if (!hasNewUsers) {
             const userText = humanMessage(p, row);
@@ -139,6 +144,7 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
 }
 export const codex: SourceComponent = {
   tool: 'codex', extension: '.jsonl', identifyRow, parseRows,
+  isCoreRow(row) { return coreKind(row) !== null; },
   sessionIdOf(row) {
     const id = row.type === 'session_meta' ? row.payload?.id ?? row.payload?.session_id : undefined;
     return typeof id === 'string' && id.trim() ? id : null;

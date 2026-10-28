@@ -187,26 +187,32 @@ export async function detect(configInput: Config, currentTime = new Date().toISO
       const entry = event({ kind: 'push_observed', push }, now);
       if (!ids.has(entry.id)) { added.push(entry); ids.add(entry.id); }
       // 原件/目录/归并本轮已失败：仅留原始推送，不借缓存成员对账，也不放大局部故障。
-      const unwritten = input.unwrittenPaths.has(`${push.tool}:${push.transcriptPath}`);
+      const transcriptKey = `${push.tool}:${push.transcriptPath}`;
+      const unwritten = input.unwrittenPaths.has(transcriptKey);
       if (!unwritten && isFailedOriginal(push.tool, push.transcriptPath, input.failedPaths)) continue;
       const record = unwritten ? undefined : findPushTarget(input.records, push, true);
       if (!record) {
         const report = input.health.find(h => h.source === push.tool);
         const root = config.sources[push.tool];
         const path = root ? relative(root, push.transcriptPath) : '..';
-        const conflicting = [...available.values()].filter(r => r.tool === push.tool).flatMap(membersOf)
-          .some(m => (m.sessionId === push.sessionId && !m.originals.some(o => o.path === push.transcriptPath))
-            || (m.sessionId !== push.sessionId && m.originals.some(o => o.path === push.transcriptPath)));
+        const knownMembers = [...available.values()].filter(r => r.tool === push.tool).flatMap(membersOf);
+        const conflicting = knownMembers.some(m => (m.sessionId === push.sessionId && !m.originals.some(o => o.path === push.transcriptPath))
+          || (m.sessionId !== push.sessionId && m.originals.some(o => o.path === push.transcriptPath)));
         // 身份/路径冲突仍立即报；仅目录尚未写到文件时，也按推送早到给最多两轮。
         const canDefer = path && path !== '..' && !path.startsWith('../') && !isAbsolute(path) && !conflicting && !unhealthySources.has(push.tool);
         if (canDefer && (deferred.get(entry.id) ?? 0) < 2) {
           add({ kind: 'push_deferred', pushId: entry.id, rounds: (deferred.get(entry.id) ?? 0) + 1 });
           continue;
         }
-        if (canDefer && push.event === 'session_end' && push.transcriptPath.endsWith('.jsonl')
-          && !seenSessions.has(`${push.tool}:${push.sessionId}`) && !input.presentPaths.has(`${push.tool}:${push.transcriptPath}`)) {
+        // 元数据里的身份不等于读过真实会话；但已有对话/子成员的历史不能被空文件抹掉。
+        const knownSession = knownMembers.some(m => m.sessionId === push.sessionId || m.originals.some(o => o.path === push.transcriptPath));
+        const emptyReason = input.emptyPaths.has(transcriptKey) && !knownSession
+          ? '两轮宽限后文件存在，但完整校验后只有元数据/噪音、没有核心消息'
+          : !seenSessions.has(`${push.tool}:${push.sessionId}`) && !input.presentPaths.has(transcriptKey)
+            ? '从未在会话文件读到此身份；两轮宽限后文件仍不存在' : null;
+        if (canDefer && push.event === 'session_end' && push.transcriptPath.endsWith('.jsonl') && emptyReason) {
           if (!emptyPushes.has(entry.id)) {
-            add({ kind: 'push_empty', pushId: entry.id, reason: '空会话：会话结束推送；从未在会话文件读到此身份；两轮宽限后文件仍不存在，不生成会话或提醒' });
+            add({ kind: 'push_empty', pushId: entry.id, reason: `空会话，放过：会话结束推送；${emptyReason}；不生成会话或提醒` });
             emptyPushes.add(entry.id);
           }
           continue;

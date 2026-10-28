@@ -142,10 +142,13 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 0);
   });
 
-  test(`空会话严认：${tool} 文件存在但为空，session_end 宽限后仍报警`, async t => {
+  test(`空会话：${tool} 文件存在但无核心消息，session_end 宽限后放过`, async t => {
     const f = await fixture(t, tool); await put(f.transcript, ''); await put(f.inbox, [f.push('session_end')]);
-    await threeRounds(f.config);
-    assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
+    const views = await threeRounds(f.config);
+    assert.ok(views.every(view => !view.projection.health.get(tool)?.since));
+    assert.equal((await readOutbox(f.config.dataDir)).length, 0);
+    const empty = (await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty');
+    assert.equal(empty.length, 1); assert.match(empty[0]!.reason, /文件存在.*没有核心消息/);
   });
 
   for (const event of ['waiting_permission', 'turn_end']) test(`空会话严认：${tool} 无文件的 ${event} 仍于第三轮报警`, async t => {
