@@ -1,0 +1,16 @@
+{
+  "name": "减负与封存-20261028",
+  "branch": "feat/减负与封存",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "甲-提醒与卡片": {
+      "prompt": "../../prompt/提示词-减负与封存-甲-提醒与卡片.md",
+      "scope": { "allow": ["code/", "docs/batches/减负与封存-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    },
+    "乙-数据与感知": {
+      "prompt": "../../prompt/提示词-减负与封存-乙-数据与感知.md",
+      "scope": { "allow": ["code/", "docs/batches/减负与封存-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["甲-提醒与卡片"], ["乙-数据与感知"]]
+}

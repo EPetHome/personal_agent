@@ -4,7 +4,7 @@
   "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
   "stages": {
     "空会话不致盲": {
-      "prompt": "../../prompt/提示词-空会话不致盲.md",
+      "prompt": "../../prompt/xx/提示词-空会话不致盲.md",
       "scope": { "allow": ["code/", "docs/batches/空会话不致盲-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
     }
   },
