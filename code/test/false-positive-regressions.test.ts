@@ -315,6 +315,8 @@ test('同轮隔离：一个真实冲突不能让另一条空会话跳过宽限�
   await threeRounds(f.config);
   const events = await readEvents(f.config.dataDir);
   assert.equal(events.filter(e => e.kind === 'push_empty').length, 1);
-  const health = (await overview(f.config)).projection.health.get('cc')!;
-  assert.equal(health.errors.length, 1); assert.match(health.errors[0]!, /第 1 行/);
+  const projection = (await overview(f.config)).projection;
+  assert.deepEqual(projection.health.get('cc')?.errors, []);
+  assert.equal(projection.pushMismatches.size, 1);
+  assert.match([...projection.pushMismatches.values()][0]!.reason, /第 1 行/);
 });

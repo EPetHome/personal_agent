@@ -103,15 +103,17 @@ test('卡片 A8：单独复盘、周报多项复盘标题均只出现一次，�
   }
 });
 
-test('会话错配文案说明同工具全部状态未知，实际判断保持该范围，其他工具不受影响', async t => {
+test('会话错配只影响该会话，文案与判断一致，同工具其他会话及其他工具不受影响', async t => {
   const f = await fixture(t); f.config.judge = null; f.config.sources.codex = join(f.root, 'codex');
   await put(join(f.config.sources.cc!, 'good.jsonl'), [ccUser(), ccAnswer()]);
   for (const id of ['codex-a', 'codex-b']) await put(join(f.config.sources.codex, `${id}.jsonl`), [codexMeta(id), codexEvent({ type: 'user_message', message: '构造缓存任务' })]);
   await put(join(f.config.inboxDir!, 'codex.jsonl'), [{ tool: 'codex', event: 'waiting_permission', session_id: 'codex-a', cwd: '/sample/codex', transcript_path: join(f.config.sources.codex, 'wrong.jsonl'), at: now, detail: '构造错配' }]);
   const view = await detect(f.config, now);
-  assert.ok(view.records.filter(r => r.tool === 'codex').every(r => r.status === '看不见了'));
+  assert.equal(view.records.find(r => r.sessionId === 'codex-a')?.status, '看不见了');
+  assert.equal(view.records.find(r => r.sessionId === 'codex-b')?.status, '进行中');
+  assert.equal(view.projection.health.get('codex')?.since, null);
   assert.equal(view.records.find(r => r.tool === 'cc')!.status, '已完成');
   const notice = (await readOutbox(f.config.dataDir)).find(n => n.kind === 'blind')!;
-  assert.match(notice.content.summary, /Codex 的所有会话当前状态都暂时不能确认；其他工具继续检测/);
-  assert.doesNotMatch(notice.content.summary, /其他会话继续检测/);
+  assert.match(notice.content.summary, /只影响这一个会话，其他会话继续检测/);
+  assert.doesNotMatch(notice.content.summary, /所有会话当前状态都暂时不能确认/);
 });

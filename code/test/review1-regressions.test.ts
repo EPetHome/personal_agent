@@ -70,8 +70,9 @@ test('本批返修第1条：真正错误的推送路径仍报对账故障，不�
   const view = await detect(f.config, '2026-10-20T10:01:00Z');
   assert.equal(view.records.find(r => r.sessionId === 'other')?.status, '看不见了');
   assert.equal(view.projection.pushes.length, 0);
-  assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
-  assert.match(view.projection.health.get('codex')!.errors.join('\n'), /推送与已读取会话对不上/);
+  assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind', 'unreadable']);
+  assert.equal(view.projection.health.get('codex')?.since, null);
+  assert.match([...view.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
 });
 
 for (const waiting of [false, true]) {

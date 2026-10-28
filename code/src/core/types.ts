@@ -300,7 +300,21 @@ export interface ReviewItem {
   countermeasure: string;
   status: string;
 }
+export interface PushMismatch {
+  pushId: string;
+  recordKey?: string;
+  reason: string;
+  push: PushRecord;
+  since: string;
+  episodeId: string;
+}
+export type ProjectionState = { [K in keyof Omit<Projection, 'snapshotSessions'>]:
+  Projection[K] extends Map<infer A, infer B> ? [A, B][] : Projection[K] extends Set<infer V> ? V[] : Projection[K] };
 export type EventPayload =
+  | { kind: 'store_format'; format: 2; backup?: string }
+  | { kind: 'store_checkpoint'; format: 2; sequence: number; archive: string; archives: string[]; state: ProjectionState }
+  | { kind: 'session_delta'; delta: import('./session-delta.ts').SessionDelta }
+  | { kind: 'push_mismatches'; mismatches: Pick<PushMismatch, 'pushId' | 'recordKey' | 'reason'>[] }
   | { kind: 'session_observed'; record: SessionRecord }
   | { kind: 'session_seen'; tool: Tool; sessionId: string }
   | { kind: 'push_observed'; push: PushRecord }
@@ -327,6 +341,14 @@ export interface Projection {
   seenSessions: Set<string>;
   feishuConnection?: FeishuConnection & { at: string };
   pushes: ValidatedPushRecord[];
+  /** 对账/去重所需的紧凑索引也进封存检查点，不再依赖归档原件。 */
+  rawPushes: Map<string, PushRecord>;
+  validatedPushIds: Set<string>;
+  emptyPushIds: Set<string>;
+  deferredPushes: Map<string, number>;
+  pushCursors: Map<string, Extract<EventPayload, { kind: 'push_cursor' }>>;
+  pushMismatches: Map<string, PushMismatch>;
+  legacyChecks: Map<string, ModelCheck>;
   health: Map<HealthSource, HealthState>;
   notices: Notice[];
   deliveredNoticeIds: Set<string>;

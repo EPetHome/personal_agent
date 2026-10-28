@@ -83,7 +83,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
       else delete (tool === 'codex' ? rows[0]!.payload : rows[0]!)[missing];
       await put(f.transcript, rows); await put(f.inbox, [f.push()]);
       const views = await threeRounds(f.config);
-      assert.match(views[2]!.projection.health.get(tool)!.errors.join('\n'), /推送与已读取会话对不上/);
+      assert.equal(views[2]!.projection.health.get(tool)?.since, null);
+      assert.match([...views[2]!.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
       assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
       assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 0);
     });
@@ -96,7 +97,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
       await put(f.transcript, conversation(tool)); await put(emptyPath, [metadata(tool)]);
       await put(f.inbox, [mismatch === 'session' ? f.push('session_end', 'wrong-id') : f.push('session_end', `empty-${tool}`, emptyPath)]);
       const view = await detect(f.config, at(1));
-      assert.match(view.projection.health.get(tool)!.errors.join('\n'), /推送与已读取会话对不上/);
+      assert.equal(view.projection.health.get(tool)?.since, null);
+      assert.match([...view.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
       assert.equal(view.projection.pushes.length, 0);
       assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
       assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 0);
@@ -119,7 +121,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     await put(f.transcript, conversation(tool)); await detect(f.config, '2026-10-20T10:00:30Z');
     await put(f.transcript, [metadata(tool)]); await put(f.inbox, [f.push()]);
     const views = await threeRounds(f.config);
-    assert.match(views[2]!.projection.health.get(tool)!.errors.join('\n'), /推送与已读取会话对不上/);
+    assert.equal(views[2]!.projection.health.get(tool)?.since, null);
+    assert.match([...views[2]!.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
     assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
     assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 0);
   });
@@ -153,7 +156,8 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 1);
     await put(f.transcript, conversation(tool, 'different-session'));
     const view = await detect(f.config, at(4));
-    assert.match(view.projection.health.get(tool)!.errors.join('\n'), /推送与已读取会话对不上/);
+    assert.equal(view.projection.health.get(tool)?.since, null);
+    assert.match([...view.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
     assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
     assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 1);
   });
@@ -228,7 +232,8 @@ test('旧格式保护：Pi v1 有顶层对话而非只有元数据，不能因�
   await put(f.transcript, [{ type: 'header', version: 1, cwd: project }, { role: 'user', content: '旧格式里的真实对话' }]);
   await put(f.inbox, [f.push()]);
   const views = await threeRounds(f.config);
-  assert.match(views[2]!.projection.health.get('pi')!.errors.join('\n'), /推送与已读取会话对不上/);
+  assert.equal(views[2]!.projection.health.get('pi')?.since, null);
+  assert.match([...views[2]!.projection.pushMismatches.values()].map(m => m.reason).join('\n'), /推送与已读取会话对不上/);
   assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['blind']);
   assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'push_empty').length, 0);
 });

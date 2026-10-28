@@ -1,13 +1,13 @@
 import { basename } from 'node:path';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
-import { modelEvidenceKey } from './evidence.ts';
+import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
 import { routeNotice, waitingReady } from './interaction.ts';
 import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
 import { toolNames } from './types.ts';
-import { membersOf, pushMatchesMember } from './sessions.ts';
+import { membersOf, mismatchedMemberIds, pushMatchesMember, sourceUnavailable } from './sessions.ts';
 import type { Config, EventPayload, JudgedRecord, Notice, NoticeContent, Projection, PushRecord, SessionRecord, TaskSnapshot, TaskSnapshotInput } from './types.ts';
 
 const THIRTY_MINUTES = 30 * 60 * 1000;
@@ -21,20 +21,26 @@ export function judgeRecords(projection: Projection, now: string): JudgedRecord[
   return [...projection.sessions.values()].map(record => {
     const judged: JudgedRecord = { ...record, status: '进行中', reason: '会话有新记录，尚未答完' };
     // 推送属于具体成员。父/兄弟的新动静不能解除这个子会话的等待，子会话结束也不能结束父会话。
+    const mismatches = mismatchedMemberIds(record, projection);
     const activities = membersOf(record).map(member => {
       const latest = projection.pushes.filter(p => p.recordKey === record.key && p.tool === record.tool && pushMatchesMember(p, member) && p.at <= now)
         .sort(comparePushes).at(-1);
-      const push = latest && member.lastActivityAt !== null && latest.at >= member.lastActivityAt ? latest : undefined;
+      const unmatched = mismatches.has(member.sessionId);
+      const push = !unmatched && latest && member.lastActivityAt !== null && latest.at >= member.lastActivityAt ? latest : undefined;
       const waiting = push?.event === 'waiting_permission' ? push : undefined;
-      const completed = !member.unavailable && !waiting && (member.sessionEnded || push?.event === 'session_end' || push?.event === 'turn_end' || (member.assistantFinished && !member.pendingTools.length));
+      const completed = !unmatched && !member.unavailable && !waiting && (member.sessionEnded || push?.event === 'session_end' || push?.event === 'turn_end' || (member.assistantFinished && !member.pendingTools.length));
       return { member, push, waiting, completed, lastActivityAt: push?.at ?? member.lastActivityAt };
     });
     judged.lastActivityAt = activities.reduce((last, activity) => activity.lastActivityAt !== null && activity.lastActivityAt > last ? activity.lastActivityAt : last, record.lastActivityAt);
     judged.pendingTools = activities.filter(a => !a.completed).flatMap(a => a.member.pendingTools);
     const waiting = activities.filter(a => a.waiting).sort((a, b) => comparePushes(a.waiting!, b.waiting!)).at(-1);
-    if (projection.health.get(record.tool)?.since || (record.tool !== 'loop' && projection.health.get('inbox')?.since)) {
+    if (sourceUnavailable(projection, record.tool)) {
       judged.status = '看不见了';
       judged.reason = '来源或推送读取失败，保留最后一次读到的事实，当前状态不能确认';
+    } else if (mismatches.size && !waiting) {
+      // 聚合展示的兜底未知态；模型阶段仍按健康成员判断，可展示其等待/跑偏，故障另按成员报。
+      judged.status = '看不见了';
+      judged.reason = '这个会话的报信与记录对不上，当前状态不能确认；同一工具的其他会话照常判断';
     } else if (!activities.some(a => a.member.unavailable) && !activities.every(a => a.completed)
       && Date.parse(now) - Date.parse(judged.lastActivityAt) > ONE_DAY) {
       judged.status = '已搁置';
@@ -109,7 +115,8 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     let title = '';
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
     const waitingId = record.waiting?.sessionId ?? record.modelWaiting?.sessionId ?? record.ruleWaiting?.sessionId;
-    const waitingMember = waitingId ? membersOf(record).find(member => member.sessionId === waitingId) : undefined;
+    const targetId = waitingId ?? (record.drift && mismatchedMemberIds(record, projection).size ? record.drift.sessionId : undefined);
+    const waitingMember = targetId ? membersOf(record).find(member => member.sessionId === targetId) : undefined;
     const modelReply = record.modelWaiting ? projection.pushes.findLast(p => p.recordKey === record.key && p.sessionId === record.modelWaiting!.sessionId
       && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
     const last = record.loop?.phase ?? modelReply ?? record.ruleWaiting?.reply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
@@ -150,6 +157,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       continue;
     }
     const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.modelWaiting || record.ruleWaiting || record.drift)
+      && (!record.drift || sameModelEvidenceScope(n, record.drift))
       && n.kind === kind && n.sessionKey === record.key && (n.memberSessionId ?? record.sessionId) === memberId
       && Date.parse(n.evidenceAt ?? '') === Date.parse(evidenceAt)));
     const already = !!existing;
@@ -163,7 +171,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     }
     if (already) { record.notice = projection.deliveredNoticeIds.has(existing.id) ? '已提醒，本轮去重' : '待写发件记录'; continue; }
     const content: NoticeContent = {
-      title, summary: '', returnCommand: returnCommand(record, config, waitingId),
+      title, summary: '', returnCommand: returnCommand(record, config, memberId),
       evidence: {
         project: waitingMember?.project ?? record.project, intentOriginal: record.intent.initial,
         additionalRequirements: record.intent.additions, recentSteps: waitingMember?.recentSteps ?? record.recentSteps,
@@ -188,6 +196,39 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     notice.memberSessionId = memberId;
     record.notice = '待写发件记录';
     candidates.push(notice);
+  }
+  const unmatchedSessions = new Set<string>();
+  for (const mismatch of projection.pushMismatches.values()) {
+    const push = mismatch.push, scope = `${push.tool}:${push.sessionId}`;
+    if (unmatchedSessions.has(scope)) continue;
+    unmatchedSessions.add(scope);
+    // 真正的来源整体故障仍用原来的来源告警，不重复把一条推送另报一次。
+    if (projection.health.get(push.tool)?.since || projection.health.get('inbox')?.since) continue;
+    const key = `blind:push:${scope}:${mismatch.episodeId}`;
+    const record = [...(projection.snapshotSessions ?? projection.sessions).values()].find(r => r.tool === push.tool
+      && membersOf(r).some(member => member.sessionId === push.sessionId));
+    const member = record && membersOf(record).find(m => m.sessionId === push.sessionId);
+    const feedbackKey = feedbackSuppressionKey({ tool: push.tool, kind: 'blind', feedbackScope: scope });
+    if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) {
+      const judged = records.find(r => r.key === record?.key);
+      if (judged) judged.notice = '因你的误报没提醒';
+      continue;
+    }
+    if (projection.notices.some(n => n.dedupeKey === key)) continue;
+    const content: NoticeContent = {
+      title: `${basename(member?.project ?? push.project)} 的 ${toolNames[push.tool]} 的盯防看不见了`, summary: '',
+      returnCommand: `${shellQuote(config.commands[push.tool])} ${push.tool === 'cc' ? '--resume' : push.tool === 'codex' ? 'resume' : '--session'} ${shellQuote(push.sessionId)}`,
+      evidence: { project: member?.project ?? push.project, intentOriginal: record?.intent.initial ?? null,
+        additionalRequirements: [], recentSteps: [], originals: [],
+        reason: `从 ${localTime(mismatch.since, now)} 起，这个会话的报信与记录对不上；只影响这一个会话，同一工具的其他会话照常判断和提醒。\n${mismatch.reason}` },
+    };
+    const notice = { ...createNotice(push.tool, 'blind', key, now, content, record?.key, mismatch.since),
+      feedbackScope: scope, ...(record ? { memberSessionId: push.sessionId } : {}) };
+    const seen = member?.assistantReply?.text ?? member?.recentSteps.at(-1)?.text;
+    const lastOutput = `这个会话报信与记录未核对上；只影响这一个会话，其他会话继续检测${seen ? `；最后看到：${seen}` : ''}`;
+    const input = record ? snapshotInput(record, lastOutput, '看不见了', mismatch.since)
+      : { goal: null, currentTask: null, lastOutput, factualStatus: '看不见了' as const };
+    candidates.push(attachSnapshot(notice, ruleSnapshot(input, push.project, now), projection));
   }
   for (const health of projection.health.values()) {
     const kind = health.since ? 'blind' : health.fileFailures?.count ? 'unreadable' : null;
@@ -250,6 +291,13 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   for (const health of projection.health.values()) {
     if (health.since) lines.push(`盯防异常：${toolNames[health.source]}，从 ${health.since} 起看不见；${projection.notices.some(n => n.kind === 'blind' && n.dedupeKey === `blind:${health.source}:${health.episodeId}` && projection.deliveredNoticeIds.has(n.id)) ? '已提醒，本轮去重' : '待写发件记录'}`);
     else if (health.fileFailures?.count) lines.push(`${toolNames[health.source]} 有 ${health.fileFailures.count} 份会话读不了，其余会话照常显示。`);
+  }
+  const unmatched = new Set<string>();
+  for (const { push, since } of projection.pushMismatches.values()) {
+    const scope = `${push.tool}:${push.sessionId}`;
+    if (unmatched.has(scope)) continue;
+    unmatched.add(scope);
+    lines.push(`会话看不见了：${toolNames[push.tool]} · ${push.project}，从 ${since} 起报信与记录对不上；仅这个会话，其他会话照常。`);
   }
   const day = projection.lastScanAt?.slice(0, 10);
   if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);

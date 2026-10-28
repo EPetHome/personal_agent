@@ -1,6 +1,6 @@
 import { dirname } from 'node:path';
 import { isIgnoredProject } from './config.ts';
-import type { Config, PushRecord, SessionIdentity, SessionMember, SessionRecord, Tool } from './types.ts';
+import type { Config, Projection, PushRecord, SessionIdentity, SessionMember, SessionRecord, Tool } from './types.ts';
 
 export function isInternalSession(tool: Tool, sessionId: string, project = ''): boolean {
   // 只做词法目录边界匹配，不访问个人目录；流水线整批验收的会话号可能是普通 UUID。
@@ -28,6 +28,15 @@ export function isFailedOriginal(tool: SessionRecord['tool'], path: string, fail
 }
 export function membersOf(record: SessionRecord): readonly SessionMember[] {
   return record.members?.length ? record.members : [record];
+}
+/** 整体信号不可用才阻断整个工具；局部推送错配不能冒充来源整体失明。 */
+export function sourceUnavailable(projection: Pick<Projection, 'health'>, tool: Tool): boolean {
+  return !!(projection.health.get(tool)?.since || (tool !== 'loop' && projection.health.get('inbox')?.since));
+}
+export function mismatchedMemberIds(record: SessionRecord, projection: Pick<Projection, 'pushMismatches'>): Set<string> {
+  const members = new Set(membersOf(record).map(member => member.sessionId));
+  return new Set([...projection.pushMismatches.values()].filter(m => m.push.tool === record.tool && members.has(m.push.sessionId))
+    .map(m => m.push.sessionId));
 }
 export function memberSnapshot(record: SessionRecord): SessionMember {
   const { sessionId, project, cwdHistory, originals, lastActivityAt, recentSteps, pendingTools, assistantFinished, sessionEnded, assistantReply, parentSessionId, unavailable, requestRefs, humanRequestRefs } = record;
