@@ -5,7 +5,7 @@ import { toolNames } from './types.ts';
 import { localTime } from './notice-text.ts';
 import type { Feedback, Notice } from './types.ts';
 
-export const kindNames: Record<Notice['kind'], string> = { waiting: '在等你', drift: '疑似跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成', weekly: '每周小结', recurrence: '同类问题', service_restart: '常驻重启' };
+export const kindNames: Record<Notice['kind'], string> = { waiting: '在等你', drift: '疑似跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成', weekly: '每周小结', recurrence: '同类问题', service_restart: '常驻重启', delivery_failed: '提醒未送达', storage_full: '磁盘已满' };
 export function localDate(value: Date | string): string {
   const date = typeof value === 'string' ? new Date(value) : value;
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;

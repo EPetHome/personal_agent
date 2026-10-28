@@ -126,7 +126,7 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
       at: now, evidenceAt: item.evidenceAt, fingerprint: item.fingerprint, stepIds: item.stepIds, snapshotVersion: 1,
       summary: compact([...([previous?.summary ?? '', ...item.context.newSteps.map(s => s.text)].filter(Boolean).join('；'))].slice(-500).join(''), 500) };
     const used = projection.modelCalls.get(day) ?? 0;
-    if (used >= config.judge.dailyLimit) check.error = '每日额度用完，仅规则判断';
+    if (used >= (config.judge.dailyLimit ?? Infinity)) check.error = '每日额度用完，仅规则判断';
     else if (performance.now() >= deadline) {
       check.error = DEFERRED;
       // 尚未调用，不能吞掉这些新步骤或启动跑偏冷却；下轮继续而不是永远按缓存跳过。

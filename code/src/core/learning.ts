@@ -184,7 +184,7 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
       if (!model || !config.judge || Date.now() >= deadline) return;
       const reserved = await withStoreLock(config.dataDir, async () => {
         const used = project(await readEvents(config.dataDir)).modelCalls.get(now.slice(0, 10)) ?? 0;
-        if (used >= config.judge!.dailyLimit) return false;
+        if (used >= (config.judge!.dailyLimit ?? Infinity)) return false;
         await appendJsonl(join(config.dataDir, 'events.jsonl'), [event({ kind: 'model_call_started', task, key }, now)]); return true;
       });
       if (!reserved) return;

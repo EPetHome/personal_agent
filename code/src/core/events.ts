@@ -4,7 +4,8 @@ import { indexModelEvidence, restoreModelEvidence } from './evidence.ts';
 import { findPushTarget, membersOf } from './sessions.ts';
 import { learnSkipBaseline } from './health.ts';
 import { applySessionDelta } from './session-delta.ts';
-import type { AgentEvent, EventPayload, Projection, ProjectionState, PushRecord } from './types.ts';
+import { isSafeFailure, OperationFailure } from './failures.ts';
+import type { AgentEvent, ChannelDeliveryState, EventPayload, Projection, ProjectionState, PushRecord } from './types.ts';
 
 export function pushIdentity(push: PushRecord): string {
   return hash(JSON.stringify([push.tool, push.sessionId, push.event, push.at, push.detail]));
@@ -22,17 +23,25 @@ function emptyProjection(): Projection {
     emptyPushIds: new Set(), deferredPushes: new Map(), pushCursors: new Map(), pushMismatches: new Map(), legacyChecks: new Map(),
     health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(),
     modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), noticeReplies: new Map(), feedbackSuppressions: new Set(),
-    modelCalls: new Map(), channelDeliveries: new Map() };
+    modelCalls: new Map(), channelDeliveries: new Map(), channelDeliveryStates: new Map(), deliveryAlerted: new Set() };
 }
 export function packProjection(projection: Projection): ProjectionState {
   return Object.fromEntries(Object.entries(projection).filter(([key]) => key !== 'snapshotSessions').map(([key, value]) =>
     [key, value instanceof Map || value instanceof Set ? [...value] : value])) as ProjectionState;
+}
+export function isChannelDeliveryState(value: unknown): value is ChannelDeliveryState {
+  const state = value as ChannelDeliveryState | null;
+  return !!state && typeof state.failures === 'number' && Number.isSafeInteger(state.failures) && state.failures >= 0
+    && (state.failure === undefined || isSafeFailure(state.failure))
+    && (state.historyUnknown === undefined || state.historyUnknown === true);
 }
 export function unpackProjection(state: ProjectionState): Projection {
   const result = emptyProjection();
   if (!state || typeof state !== 'object') throw new Error('封存状态结构损坏');
   for (const [key, initial] of Object.entries(result)) {
     const value = (state as any)[key];
+    // 丙段前的检查点缺计数/告警索引；允许读取，但下方把缺历史的待发渠道显式标为未知。
+    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted'].includes(key)) continue;
     if (initial instanceof Map || initial instanceof Set || Array.isArray(initial)) {
       if (!Array.isArray(value)) throw new Error(`封存状态 ${key} 结构损坏`);
       (result as any)[key] = initial instanceof Map ? new Map(value) : initial instanceof Set ? new Set(value) : [...value];
@@ -41,6 +50,13 @@ export function unpackProjection(state: ProjectionState): Projection {
       (result as any)[key] = value;
     }
   }
+  for (const [key, value] of result.channelDeliveryStates) if (typeof key !== 'string' || !isChannelDeliveryState(value)) {
+    throw new OperationFailure('data_corrupt', '封存渠道失败状态损坏，保留现场');
+  }
+  for (const [key, ok] of result.channelDeliveries) if (!ok && !result.channelDeliveryStates.has(key)) {
+    result.channelDeliveryStates.set(key, { failures: 0, historyUnknown: true });
+  }
+  if ([...result.deliveryAlerted].some(id => typeof id !== 'string')) throw new OperationFailure('data_corrupt', '封存通知去重状态损坏，保留现场');
   if (state.feishuConnection) result.feishuConnection = state.feishuConnection;
   result.modelEvidence = restoreModelEvidence(result);
   return result;
@@ -131,7 +147,29 @@ export function project(events: AgentEvent[]): Projection {
       case 'notice_reply_observed':
         if (!result.noticeReplies.has(entry.noticeId)) result.noticeReplies.set(entry.noticeId, entry.reply);
         break;
-      case 'channel_delivery': result.channelDeliveries.set(`${entry.channel}:${entry.noticeId}`, entry.ok); break;
+      case 'channel_delivery': {
+        const key = `${entry.channel}:${entry.noticeId}`;
+        // 成功即终态；后来的旧队列/失败记录不能让同张卡再次投递。
+        if (result.channelDeliveries.get(key) === true) break;
+        const previous = result.channelDeliveryStates.get(key) ?? { failures: 0 };
+        // 旧版第一条 false 是排队，其后每条 false 才是实际发送失败。
+        const attempted = entry.phase === 'attempted' || (entry.phase === undefined && result.channelDeliveries.has(key));
+        result.channelDeliveries.set(key, entry.ok);
+        result.channelDeliveryStates.set(key, entry.ok ? { failures: 0 }
+          : attempted ? { failures: previous.failures + 1, ...(entry.failure ? { failure: entry.failure } : {}),
+            ...(previous.historyUnknown ? { historyUnknown: true } : {}) } : previous);
+        break;
+      }
+      case 'channel_delivery_history_restored':
+        for (const [key, restored] of entry.states) {
+          const previous = result.channelDeliveryStates.get(key);
+          // 完整原事件重放已有准确计数时不再叠加；也不能覆盖已成功渠道。
+          if (result.channelDeliveries.get(key) !== false || !previous?.historyUnknown) continue;
+          if (restored.historyUnknown || restored.failures < previous.failures) throw new OperationFailure('data_corrupt', '历史失败恢复与已知后缀不符');
+          result.channelDeliveryStates.set(key, { ...restored });
+        }
+        break;
+      case 'notice_delivery_alerted': result.deliveryAlerted.add(entry.noticeId); break;
       case 'feishu_connection': result.feishuConnection = { ...entry.connection, at: entry.at }; break;
       case 'push_empty': result.emptyPushIds.add(entry.pushId); break;
       case 'push_cursor': result.pushCursors.set(entry.path, entry); break;

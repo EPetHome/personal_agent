@@ -33,7 +33,8 @@ export interface FeishuConnection {
 export interface JudgeConfig {
   executable: string;
   model: string;
-  dailyLimit: number;
+  /** 缺省不限次数；显式 0 仍为纯规则。 */
+  dailyLimit?: number;
   timeoutMs: number;
   /** 单轮模型阶段总时限；缺省 60 秒，不包括来源读取/渠道投递。 */
   cycleTimeoutMs?: number;
@@ -273,7 +274,7 @@ export interface Notice {
   dedupeKey: string;
   at: string;
   tool: HealthSource | 'agent';
-  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed' | 'weekly' | 'recurrence' | 'service_restart';
+  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed' | 'weekly' | 'recurrence' | 'service_restart' | 'delivery_failed' | 'storage_full';
   level: '现在就要你' | '有空看';
   sessionKey?: string;
   memberSessionId?: string;
@@ -308,6 +309,12 @@ export interface PushMismatch {
   since: string;
   episodeId: string;
 }
+export interface ChannelDeliveryState {
+  /** historyUnknown 时仅为已知后缀次数，不是完整历史的总数。 */
+  failures: number;
+  failure?: import('./failures.ts').SafeFailure;
+  historyUnknown?: true;
+}
 export type ProjectionState = { [K in keyof Omit<Projection, 'snapshotSessions'>]:
   Projection[K] extends Map<infer A, infer B> ? [A, B][] : Projection[K] extends Set<infer V> ? V[] : Projection[K] };
 export type EventPayload =
@@ -331,7 +338,9 @@ export type EventPayload =
   | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot }
   | { kind: 'notice_reply_observed'; noticeId: string; reply: RequestRef }
   | { kind: 'model_checked'; check: ModelCheck }
-  | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean }
+  | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean; phase?: 'queued' | 'attempted'; failure?: import('./failures.ts').SafeFailure }
+  | { kind: 'notice_delivery_alerted'; noticeId: string; ok?: boolean; failure?: import('./failures.ts').SafeFailure }
+  | { kind: 'channel_delivery_history_restored'; checkpointId: string; states: [string, ChannelDeliveryState][]; backup: string }
   | { kind: 'feishu_connection'; connection: FeishuConnection };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
 export interface Projection {
@@ -364,6 +373,10 @@ export interface Projection {
   feedbackSuppressions: Set<string>;
   modelCalls: Map<string, number>;
   channelDeliveries: Map<string, boolean>;
+  /** 按卡片和渠道累计实际连续失败；不把排队算成一次尝试。 */
+  channelDeliveryStates: Map<string, ChannelDeliveryState>;
+  /** 本机停发告警按卡片去重，不因另一渠道停发或重启重复弹。 */
+  deliveryAlerted: Set<string>;
 }
 export interface ChannelReply {
   /** undefined 指最近一条；null 仅供「漏了」明确不关联提醒。 */

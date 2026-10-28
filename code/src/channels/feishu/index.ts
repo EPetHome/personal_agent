@@ -1,9 +1,10 @@
 import { join } from 'node:path';
 import { noticeCard } from './card.ts';
-import { feishuFailure, realTransport, safeFeishuFailure } from './transport.ts';
+import { feishuFailure, realTransport, safeFeishuDeliveryFailure, safeFeishuFailure } from './transport.ts';
 import type { FeishuTransport } from './transport.ts';
 import { receiveFeedback } from '../../core/feedback.ts';
-import { safeProcessingFailure } from '../../core/failures.ts';
+import { OperationFailure, safeProcessingFailure } from '../../core/failures.ts';
+import { reportStorageFailure } from '../../core/alerts.ts';
 import { changeExperience } from '../../core/learning.ts';
 import { event } from '../../core/events.ts';
 import { prepareEventLog } from '../../core/event-archive.ts';
@@ -110,7 +111,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
               state: connection.state, ...(connection.failure ?? {}) }]);
           });
           connectionSignature = signature;
-        } catch { break; } // 只保留最新待写状态；失败的 Promise 绝不留给检测/收件。
+        } catch (error) { await reportStorageFailure(config, error); break; } // 状态仍独立重试，不拖垮检测/收件。
       }
     })().finally(() => {
       connectionWrite = undefined;
@@ -138,8 +139,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       if (options!.mode === 'fake' && !injected) messageId = `om_fake_${requestKey.slice(0, 24)}`;
       else {
         let timer: NodeJS.Timeout | undefined;
-        try { messageId = await Promise.race([(await getTransport()).send(type, JSON.stringify(content), requestKey), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('飞书投递超时')), options!.timeoutMs); })]); }
-        catch { throw new Error('飞书投递失败或超时（凭证不输出）'); }
+        try { messageId = await Promise.race([getTransport().then(transport => transport.send(type, JSON.stringify(content), requestKey)), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OperationFailure('channel_timeout', '飞书投递超时')), options!.timeoutMs); })]); }
+        catch (error) { const failure = safeFeishuDeliveryFailure(error); throw new OperationFailure(failure.category, failure.reason); }
         finally { clearTimeout(timer); }
       }
       await withNamedLock(dir, '.feishu-sent.lock', async () => {
@@ -196,6 +197,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       ingress = saved;
       let timer: NodeJS.Timeout | undefined;
       try { await Promise.race([saved, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('入站暂未持久化，请重试')), 2500); })]); }
+      catch (error) { await reportStorageFailure(config, error); throw error; }
       finally { clearTimeout(timer); }
       setImmediate(() => { void channel.drain().catch(() => {}); });
       return {};
@@ -220,6 +222,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
             const at = now ?? new Date().toISOString();
             try { receipt = { id: input.id, at, status: 'processed', response: await handle(input) }; }
             catch (error) {
+              await reportStorageFailure(config, error);
               const { category, reason } = error instanceof IncomingFailure ? { category: error.category, reason: error.message } : safeProcessingFailure(error);
               receipt = { id: input.id, at, status: 'failed', category, response: `这条没处理成，原因：${reason}` };
             }
@@ -234,7 +237,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
             await send('text', { text: receipt.response }, `reply:${input.id}`);
             receipt = { ...receipt, reply: 'sent' };
             await appendJsonl(receiptsPath, [{ id: input.id, at: now ?? new Date().toISOString(), reply: 'sent' }]);
-          } catch {
+          } catch (error) {
+            await reportStorageFailure(config, error);
             if (receipt.reply !== 'pending') await appendJsonl(receiptsPath, [{ id: input.id, at: now ?? new Date().toISOString(), reply: 'pending', replyCategory: 'reply_delivery' }]);
             receipt = { ...receipt, reply: 'pending' };
           }

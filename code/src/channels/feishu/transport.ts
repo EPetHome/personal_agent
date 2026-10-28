@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { parseEnv } from 'node:util';
 import { assertRegularFile } from '../../core/config.ts';
+import { OperationFailure, safeDeliveryFailure, safeProcessingFailure } from '../../core/failures.ts';
 import type { FeishuConfig, FeishuConnection, FeishuFailureCategory } from '../../core/types.ts';
 
 export interface FeishuTransport {
@@ -41,6 +42,14 @@ export function safeFeishuFailure(error: unknown): NonNullable<FeishuConnection[
   if (data.name === 'ConnectionConfigError' || /configuration|config.*invalid|invalid.*config|应用类型|连接配置/i.test(text)) return feishuFailure('configuration');
   return feishuFailure('unknown');
 }
+/** 发卡失败另分类，不混同长连接状态；所有说明仍来自程序白名单。 */
+export function safeFeishuDeliveryFailure(error: unknown) {
+  const failure = safeDeliveryFailure(error);
+  if (failure.category !== 'channel_unknown') return failure;
+  const connection = safeFeishuFailure(error);
+  return safeProcessingFailure(new OperationFailure(connection.category === 'network' ? 'channel_connection'
+    : connection.category === 'unknown' ? 'channel_unknown' : `channel_${connection.category}`, ''));
+}
 const quiet = { trace() {}, debug() {}, info() {}, warn() {}, error(..._args: unknown[]) {} };
 type Sdk = typeof import('@larksuiteoapi/node-sdk');
 /** 替身入口只供离线验证；正常运行仅从显式 .env/进程环境取凭证，假渠道永不调用。 */
@@ -64,7 +73,10 @@ export async function realTransport(config: FeishuConfig, dependencies: {
     return {
       async send(type, content, key) {
         const result = await client.im.message.create({ params: { receive_id_type: 'open_id' }, data: { receive_id: config.receiverId, msg_type: type, content, uuid: key.slice(0, 32) } });
-        if (result.code !== 0 || !result.data?.message_id) throw new Error('飞书投递失败');
+        if (result.code !== 0 || !result.data?.message_id) {
+          const failure = safeFeishuDeliveryFailure({ response: { data: result } });
+          throw new OperationFailure(failure.category === 'channel_unknown' ? 'channel_rejected' : failure.category, '飞书拒收（未保存原始响应）');
+        }
         return result.data.message_id;
       },
       start(handlers, connection = () => {}) {

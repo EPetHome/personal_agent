@@ -93,7 +93,8 @@ test('反馈 A1/A2：常驻检测实际持数据锁35秒，按钮、飞书文字
     const scans = (await readJsonl<{ kind: string; durationMs: number; storeLockHeldMs: number }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed');
     assert.ok(scans.every(r => Number.isFinite(r.durationMs) && Number.isFinite(r.storeLockHeldMs) && r.durationMs >= r.storeLockHeldMs && r.storeLockHeldMs >= 0));
     assert.ok(scans[0]!.storeLockHeldMs >= 35000, '检测主流程仍持有同一把数据锁35秒，只量不改');
-    await feishuChannel(f.config).drain();
+    // 常驻仍在轮询，复用同一实例的在途收件；另建实例会和自己抢零等待收件锁。
+    await channel.drain();
     assert.equal((await readFeedback(f.config.dataDir)).length, 3);
     t.diagnostic(`三路反馈在 ${feedbackMs} ms 内全部落盘并确认；长轮检测 ${scans[0]!.durationMs} ms、持数据锁 ${scans[0]!.storeLockHeldMs} ms；同事件只记一次。`);
   } finally { release(); controller.abort(); await running; }

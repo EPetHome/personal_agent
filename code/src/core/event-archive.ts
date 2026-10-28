@@ -7,13 +7,14 @@ import { promisify } from 'node:util';
 import { assertRegularFile } from './config.ts';
 import { event, packProjection, project } from './events.ts';
 import { acquireLock } from './locks.ts';
-import { readEvents } from './store.ts';
+import { parseEventLog, readEvents } from './store.ts';
+import { OperationFailure } from './failures.ts';
 import { hash, iso } from './utils.ts';
-import type { AgentEvent } from './types.ts';
+import type { AgentEvent, ChannelDeliveryState } from './types.ts';
 
 const compress = promisify(gzip), decompress = promisify(gunzip);
 const RETENTION_MS = 7 * 86400000;
-export type ArchiveStage = 'migration_synced' | 'migration_published' | 'archive_synced' | 'archive_published' | 'log_synced' | 'log_replaced';
+export type ArchiveStage = 'migration_synced' | 'migration_published' | 'delivery_history_synced' | 'delivery_history_published' | 'archive_synced' | 'archive_published' | 'log_synced' | 'log_replaced';
 export interface ArchiveOptions { onStage?: (stage: ArchiveStage) => Promise<void> }
 async function readSafe(path: string): Promise<Buffer> {
   await assertRegularFile(path);
@@ -76,7 +77,53 @@ async function cleanStateTemps(dataDir: string): Promise<void> {
     if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) await unlink(path);
   }
 }
-/** 调用方必须持有 .detect.lock。正常检测只读活动日志，不读取任何已封存文件。 */
+async function readCommittedArchive(dataDir: string, name: string): Promise<Buffer> {
+  const stat = await lstat(join(dataDir, 'archives'));
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new OperationFailure('unsafe_file', '封存目录不可信，保留现场');
+  const raw = await decompress(await readSafe(join(dataDir, 'archives', name)));
+  if (hash(raw.toString('utf8')) !== name.slice(20, 84)) throw new OperationFailure('data_corrupt', '封存文件校验失败，未修改原日志');
+  return raw;
+}
+/** 仅旧检查点缺待发渠道历史时运行。成功恢复以追加事件提交，后续检测不再读取归档。 */
+async function restoreDeliveryHistory(dataDir: string, events: AgentEvent[], now: string, options: ArchiveOptions): Promise<AgentEvent[]> {
+  const checkpoint = events[0]?.kind === 'store_checkpoint' ? events[0] : undefined;
+  if (!checkpoint) return events;
+  const baseStates = new Map(checkpoint.state.channelDeliveryStates ?? []);
+  if (!checkpoint.state.channelDeliveries.some(([key, ok]) => !ok && (!baseStates.has(key) || baseStates.get(key)!.historyUnknown))) return events;
+  const current = project(events), unknown = [...current.channelDeliveryStates].filter(([, state]) => state.historyUnknown);
+  if (!unknown.length) return events;
+  const history: AgentEvent[] = [];
+  for (const name of checkpoint.archives) {
+    const rows = parseEventLog((await readCommittedArchive(dataDir, name)).toString('utf8'));
+    if (rows.some(row => row.kind === 'store_checkpoint')) throw new OperationFailure('data_corrupt', '原始归档不应包含派生检查点');
+    for (const row of rows) if (row.kind === 'channel_delivery') history.push(row);
+  }
+  const archived = project(history), baseDeliveries = new Map(checkpoint.state.channelDeliveries);
+  // 不只核对 gzip 和哈希：缺少这张卡的原始交付历史，也不能把未知当作零。
+  for (const [key] of unknown) if (baseDeliveries.get(key) !== false || archived.channelDeliveries.get(key) !== false) {
+    throw new OperationFailure('data_corrupt', '已提交归档与检查点的渠道历史不符，已暂停发送');
+  }
+  const replay = project([...history, ...events.slice(1).filter(row => row.kind === 'channel_delivery')]);
+  const states: [string, ChannelDeliveryState][] = unknown.map(([key, suffix]) => {
+    const state = replay.channelDeliveryStates.get(key);
+    if (!state || state.historyUnknown || state.failures < suffix.failures || replay.channelDeliveries.get(key) !== false) {
+      throw new OperationFailure('data_corrupt', '渠道历史恢复不完整，已暂停发送');
+    }
+    return [key, state];
+  });
+  const backup = await backupData(dataDir, now);
+  const restored = event({ kind: 'channel_delivery_history_restored', checkpointId: checkpoint.id, states, backup }, now);
+  const path = join(dataDir, 'events.jsonl'), temporary = join(dataDir, `.events-${randomUUID()}.tmp`);
+  try {
+    // 先备份，再原子追加完整恢复事件。SIGKILL 不会留下半行，且发送永远在提交之后。
+    await writeSynced(temporary, Buffer.concat([await readSafe(path), Buffer.from(JSON.stringify(restored) + '\n')]));
+    await options.onStage?.('delivery_history_synced');
+    await rename(temporary, path); await syncDirectory(dataDir);
+    await options.onStage?.('delivery_history_published');
+  } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
+  return [...events, restored];
+}
+/** 调用方必须持有 .detect.lock。仅旧库首次恢复失败计数读归档；正常检测只读活动日志。 */
 export async function prepareEventLog(dataDir: string, nowInput: string, options: ArchiveOptions = {}): Promise<AgentEvent[]> {
   const now = iso(nowInput);
   let events = await readEvents(dataDir);
@@ -94,6 +141,7 @@ export async function prepareEventLog(dataDir: string, nowInput: string, options
     } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
     events = [...events, marker];
   }
+  events = await restoreDeliveryHistory(dataDir, events, now, options);
   await cleanStateTemps(dataDir);
   const previousCheckpoint = events[0]?.kind === 'store_checkpoint' ? events[0] : undefined;
   // 每天至多成功封存一次，避免稳定运行后每分钟生成一份小归档、重写整个检查点。
@@ -156,8 +204,7 @@ export async function restoreEventLog(dataDir: string, output: string): Promise<
   const file = await open(output, 'wx', 0o600);
   try {
     for (const name of checkpoint?.archives ?? []) {
-      const raw = await decompress(await readSafe(join(dataDir, 'archives', name)));
-      if (hash(raw.toString('utf8')) !== name.slice(20, 84)) throw new Error('封存文件校验失败，未完成恢复；未修改原日志');
+      const raw = await readCommittedArchive(dataDir, name);
       await file.writeFile(raw);
     }
     const active = (await readSafe(join(dataDir, 'events.jsonl'))).toString('utf8');

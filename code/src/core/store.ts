@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertRegularFile } from './config.ts';
 import { acquireLock } from './locks.ts';
-import { OperationFailure } from './failures.ts';
-import { unpackProjection } from './events.ts';
+import { isSafeFailure, OperationFailure } from './failures.ts';
+import { isChannelDeliveryState, unpackProjection } from './events.ts';
 import { validateSessionDelta } from './session-delta.ts';
 import type { AgentEvent, Notice } from './types.ts';
 
@@ -20,6 +20,9 @@ export async function readJsonl<T>(path: string): Promise<T[]> {
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   let text: string;
   try { text = await handle.readFile('utf8'); } finally { await handle.close(); }
+  return parseJsonl<T>(text, path);
+}
+function parseJsonl<T>(text: string, path: string): T[] {
   const rows: T[] = [];
   for (const [index, line] of text.split('\n').entries()) {
     if (!line.trim()) continue;
@@ -39,8 +42,14 @@ export async function appendJsonl(path: string, rows: unknown[]): Promise<void> 
   } finally { await handle.close(); }
 }
 export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
-  const rows = await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl'));
-  const kinds = ['store_format', 'store_checkpoint', 'session_delta', 'push_mismatches', 'session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'notice_reply_observed', 'channel_delivery'];
+  return validateEvents(await readJsonl<AgentEvent>(join(dataDir, 'events.jsonl')));
+}
+/** 升级恢复读取已校验归档时，使用与活动日志完全相同的行/事件校验。 */
+export function parseEventLog(text: string): AgentEvent[] {
+  return validateEvents(parseJsonl<AgentEvent>(text, '封存事件'));
+}
+function validateEvents(rows: AgentEvent[]): AgentEvent[] {
+  const kinds = ['store_format', 'store_checkpoint', 'session_delta', 'push_mismatches', 'session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'notice_reply_observed', 'channel_delivery', 'notice_delivery_alerted', 'channel_delivery_history_restored'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
@@ -79,7 +88,16 @@ export async function readEvents(dataDir: string): Promise<AgentEvent[]> {
       || !['回答问题', '做个决定', '去看一眼', '不用管'].includes(row.snapshot.actionType)
       || !['模型', '规则'].includes(row.snapshot.source))) throw new Error('事情快照事件结构损坏');
     if (row.kind === 'model_checked' && (!row.check || typeof row.check.key !== 'string' || typeof row.check.fingerprint !== 'string' || !Array.isArray(row.check.stepIds))) throw new Error('模型判断事件结构损坏');
-    if (row.kind === 'channel_delivery' && (typeof row.channel !== 'string' || typeof row.noticeId !== 'string' || typeof row.ok !== 'boolean')) throw new Error('渠道交付事件结构损坏');
+    if (row.kind === 'channel_delivery' && (typeof row.channel !== 'string' || typeof row.noticeId !== 'string' || typeof row.ok !== 'boolean'
+      || (row.phase !== undefined && !['queued', 'attempted'].includes(row.phase))
+      || (row.failure !== undefined && (!isSafeFailure(row.failure) || row.ok)))) throw new Error('渠道交付事件结构损坏');
+    if (row.kind === 'channel_delivery_history_restored' && (typeof row.checkpointId !== 'string' || !row.checkpointId
+      || typeof row.backup !== 'string' || !row.backup || !Array.isArray(row.states) || !row.states.length
+      || row.states.some(item => !Array.isArray(item) || item.length !== 2 || typeof item[0] !== 'string' || !item[0]
+        || !isChannelDeliveryState(item[1]) || item[1].historyUnknown)
+      || new Set(row.states.map(([key]) => key)).size !== row.states.length)) throw new OperationFailure('data_corrupt', '渠道历史恢复事件损坏');
+    if (row.kind === 'notice_delivery_alerted' && (typeof row.noticeId !== 'string' || !row.noticeId
+      || (row.ok !== undefined && typeof row.ok !== 'boolean') || (row.failure !== undefined && !isSafeFailure(row.failure)))) throw new Error('渠道停发告警结构损坏');
     if (row.kind === 'notices_delivered' && (!Array.isArray(row.ids) || row.ids.some(id => typeof id !== 'string'))) throw new Error('发件确认事件结构损坏');
   }
   return rows;
