@@ -112,6 +112,8 @@ export interface ModelCheck {
   snapshot?: TaskSnapshot;
   /** 区分旧版判断，升级不重试已交代的旧事实。 */
   snapshotVersion?: 1;
+  /** 跑偏核验步骤的时间和实际成员；不改变既有 evidenceAt/去重身份。 */
+  triggerStep?: { at: string; sessionId: string };
   error?: '调用失败，仅规则判断' | '每日额度用完，仅规则判断' | '本轮模型时限用完，仅规则判断';
   failure?: { category: import('./process.ts').FailureCategory; detail: string };
 }
@@ -177,6 +179,8 @@ export interface SessionRecord {
   /** 本轮原件/归并失败，仅保留已知关联或历史事实，不得据此确认完成。 */
   unavailable?: boolean;
   loop?: LoopFacts;
+  /** 明确的暂停时间；来源未提供时，检测首次看到暂停的时间，持续暂停不重置。 */
+  loopPausedAt?: string;
   /** 归并会话保留每个成员自己的事实，不能用聚合时间/原件替代子会话身份。 */
   members?: SessionMember[];
 }
@@ -285,7 +289,7 @@ export interface Notice {
   /** 健康提醒能定位会话时的反馈作用域；未知会话不得压住整个来源。 */
   feedbackScope?: string;
   snapshot?: TaskSnapshot;
-  /** 发卡时确定并保留，重试不因人在场与否变化而改走另一出口。旧卡仍按级别。 */
+  /** 新卡按级别选出口，在场仅留痕；旧决定/重试不改出口，缺字段的旧卡仍按级别。 */
   delivery?: { presence: '在场' | '不在场'; channels: ('local' | 'feishu')[]; decidedAt: string; lastHumanAt?: string };
   content: NoticeContent;
   text: string;

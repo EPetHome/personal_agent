@@ -454,6 +454,9 @@ test('乙 返修1：健康子成员的实际步骤继续即时判断跑偏，不
   assert.doesNotMatch(JSON.stringify(requests[0]!.context), /BROKEN_MEMBER_ONLY/);
   assert.match(JSON.stringify(requests[0]!.context.newSteps), /HEALTHY_MEMBER_ACTION/);
   assert.equal(view.records[0]?.drift?.sessionId, f.childId);
+  assert.equal((await readOutbox(f.config.dataDir)).some(n => n.kind === 'drift'), false, '已判断但仍需等五分钟');
+  await detect(f.config, '2026-10-20T10:06:00Z', { judge });
+  assert.equal(requests.length, 1, '等候结束复用原判断');
   const notices = await readOutbox(f.config.dataDir), drift = notices.find(n => n.kind === 'drift')!;
   assert.equal(drift.memberSessionId, f.childId); assert.match(drift.content.returnCommand, /resume family-child$/);
   assert.equal(notices.find(n => n.kind === 'blind')?.memberSessionId, f.parentId);
@@ -488,7 +491,7 @@ test('乙 返修1：父子成员均错配时只保留各自失明提醒，不调
 });
 
 async function collidingEvidenceFixture(t: TestContext, parentDrifts = false) {
-  const f = await memberFaultFixture(t, 'child');
+  const f = { ...await memberFaultFixture(t, 'child'), at: '2026-10-20T10:07:00.000Z' };
   const parentAt = '2026-10-20T10:02:00Z', childAt = '2026-10-20T10:01:00Z';
   await put(f.parent, [codexMeta(f.parentId), codexEvent({ type: 'user_message', message: '仅检查构造接口，不得修改无关模块' }),
     codexEvent({ type: 'function_call', call_id: 'parent-call', name: 'shell', arguments: JSON.stringify({ command: parentDrifts
@@ -498,7 +501,7 @@ async function collidingEvidenceFixture(t: TestContext, parentDrifts = false) {
   await put(f.inbox, []);
   const sent: string[] = []; let fail = true;
   const channel = { name: 'local', async send(notice: { id: string }) { sent.push(notice.id); if (fail) throw new Error('构造旧卡渠道失败'); }, async receive() { return '已记下'; } };
-  const warm = await detect(f.config, '2026-10-20T10:03:00Z', { channels: [channel], judge: { async judge(request) {
+  const warm = await detect(f.config, '2026-10-20T10:06:00Z', { channels: [channel], judge: { async judge(request) {
     const step = request.context.newSteps.find(step => step.text.includes('BROKEN_CHILD_STEP'))!;
     return { answer: '是', reason: '旧组级判断实际引用子成员', intentQuote: '仅检查构造接口', stepQuote: step.text };
   } } });

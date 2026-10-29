@@ -11,7 +11,7 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   let project: string | undefined;
   let conclusion: string | undefined;
   let sessionId: string | undefined;
-  let lastRound: string | undefined;
+  let lastRound: string | undefined, pausedAt: string | undefined;
   let batch: string | undefined, phase: string | undefined, reviewSession: string | undefined;
   const acceptanceSessions: string[] = [];
   let lastConclusion = '';
@@ -23,6 +23,8 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
     if (/^#\s+自动评审总结/.test(line) || /^- 状态[：:]/.test(line)) recognized = true;
     project ??= line.match(/^- 项目[：:]\s*(.+)$/)?.[1]?.trim();
     conclusion ??= line.match(/^- 状态[：:]\s*(.+)$/)?.[1]?.trim();
+    const pauseTime = line.match(/^- 暂停时间[：:]\s*(.+)$/)?.[1]?.trim();
+    if (pauseTime && Number.isFinite(Date.parse(pauseTime))) pausedAt = new Date(pauseTime).toISOString();
     sessionId ??= line.match(/^- 开发会话[：:]\s*(\S+)/)?.[1];
     reviewSession ??= line.match(/评审会话[：:]\s*(\S+)/)?.[1];
     const acceptance = line.match(/验收会话[：:]\s*(\S+)/)?.[1];
@@ -60,6 +62,7 @@ function parseLines(lines: Iterable<string>, original: Original, context?: Sourc
   const at = lastRound ? new Date(lastRound).toISOString() : iso(context?.modifiedAt, 'loop 原件修改时间');
   const record = emptyRecord('loop', sessionId ?? basename(original.path, '.md'), actualProject, at, original);
   record.type = 'loop_run';
+  if (status === '暂停' && pausedAt) record.loopPausedAt = pausedAt;
   const reviews = Number(counts[1]);
   record.loop = { status, conclusion: actualConclusion, ...(lastConclusion ? { summary: compact(lastConclusion.replace(/^结论[：:]\s*/, ''), 600) } : {}), reviews, repairs: Number(counts[2]), needs, needsProvided: true,
     ...(batch ? { batch } : {}), phase: phase ?? (status === '完成' ? '已完成' : /需返修|不通过/.test(lastConclusion) || !reviews ? '开发' : /通过/.test(lastConclusion) ? '验收' : `评审第 ${reviews + 1} 轮`),

@@ -202,7 +202,7 @@ test('loop 用总结内项目路径，暂停叫你，完成附次数和未完事
   config.sources.cc = null;
   config.sources.loop = join(root, 'loop');
   const path = join(config.sources.loop, 'wrong-directory-name', '11111111-1111-4111-8111-111111111111.md');
-  await put(path, loopSummary('暂停（开发方需要你决定）'));
+  await put(path, loopSummary('暂停（开发方需要你决定）') + `- 暂停时间：${start}\n`);
   assert.equal((await detect(config, later)).noticesAdded, 1);
   const paused = (await readOutbox(config.dataDir))[0]!;
   assert.equal(paused.level, '现在就要你');

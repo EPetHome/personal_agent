@@ -94,6 +94,8 @@ test('回放返修 A3 / R4：loop 只读项目下会话号总结，忽略资料�
   const s = await scene('R4-loop目录');
   const view = s.detect('2026-10-20T13:30:00Z');
   assert.equal(view.records.length, 2);
+  assert.deepEqual((await s.outbox()).map(n => n.kind), ['loop_completed']);
+  assert.equal(s.detect('2026-10-20T13:35:00Z').noticesAdded, 1, '无明确暂停时间，从首次看到等五分钟');
   const notices = await s.outbox();
   assert.deepEqual(notices.map(n => [n.kind, n.level]).sort(), [
     ['loop_completed', '有空看'], ['loop_paused', '现在就要你'],
@@ -174,6 +176,8 @@ test('回放返修 A9 / R10：首次只提醒一小时内的事，旧记录留�
   const s = await scene('R10-首次接入');
   const first = s.detect('2026-10-20T18:00:00Z');
   assert.equal(first.records.length, 4);
+  assert.deepEqual((await s.outbox()).map(n => n.kind), ['waiting'], 'loop 暂停先等五分钟，旧完成/等待仍不补发');
+  assert.equal(s.detect('2026-10-20T18:05:00Z').noticesAdded, 1);
   assert.deepEqual((await s.outbox()).map(n => [n.tool, n.kind, n.content.evidence.project]).sort(), [
     ['cc', 'waiting', '/demo/shop'], ['loop', 'loop_paused', '/demo/blog'],
   ]);

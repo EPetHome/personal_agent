@@ -105,7 +105,9 @@ test('A3 协调场景：Codex 看不见，Claude Code 正常显示已完成', op
 
 test('A4 协调场景：loop 暂停有真实项目、暂停原因和总结路径', options, async () => {
   const s = await scene('04-loop暂停');
-  assert.equal(s.detect('2026-10-20T13:10:00Z').noticesAdded, 1);
+  assert.equal(s.detect('2026-10-20T13:10:00Z').noticesAdded, 0);
+  assert.equal(s.detect('2026-10-20T13:15:00Z').noticesAdded, 1, '从首次看到暂停等五分钟');
+  assert.equal(s.detect('2026-10-20T13:16:00Z').noticesAdded, 0);
   const [notice] = await s.outbox();
   assert.equal(notice?.level, '现在就要你');
   assert.equal(notice?.content.evidence.project, '/demo/shop');

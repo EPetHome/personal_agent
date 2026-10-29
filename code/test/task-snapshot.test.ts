@@ -144,7 +144,7 @@ async function fiveKinds(t: TestContext) {
   const waiting = ccAnswer(at(34)); waiting.message.content[0]!.text = '<file name="/synthetic/a.md">注入内容</file>\n[Attachment: /synthetic/a.pdf]\n请确认 code/src/cache.ts:95 第 95 行的缓存保留多久？';
   const withId = (id: string, rows: ReturnType<typeof ccUser | typeof ccAnswer | typeof ccCall>[]) => rows.map(row => ({ ...row, sessionId: id }));
   await put(join(f.config.sources.cc!, 'waiting.jsonl'), withId('waiting', [ccUser('<file name="/synthetic/task.md">不是真人要求</file>\n[Image: /synthetic/a.png]'), ccUser(goal, at(1)), ccUser(current, at(2)), ccUser('继续', at(33)), waiting]));
-  await put(join(f.config.sources.cc!, 'drift.jsonl'), withId('drift', [ccUser('只改 A 模块', at(38)), ccCall(at(39), 'b', '修改 B 模块')]));
+  await put(join(f.config.sources.cc!, 'drift.jsonl'), withId('drift', [ccUser('只改 A 模块', at(33)), ccCall(at(34), 'b', '修改 B 模块')]));
   await put(join(f.config.sources.cc!, 'stalled.jsonl'), withId('stalled', [ccUser(goal), ccCall(at(1))]));
   f.config.sources.codex = join(f.root, 'missing-codex');
   f.config.sources.loop = join(f.root, 'loop');
@@ -204,9 +204,12 @@ for (const mode of ['missing-field', 'timeout', 'daily-limit'] as const) test(`D
     calls++; return mode === 'timeout' ? new Promise(() => {}) : { situation: '缺少动作字段' } as TaskSnapshotDraft;
   } };
   await detect(f.config, at(6), { judge, channels: [] });
+  assert.deepEqual(await readOutbox(f.config.dataDir), [], '暂停先等五分钟，不提前起草');
+  assert.equal(calls, 0);
+  await detect(f.config, at(11), { judge, channels: [] });
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   assert.equal(notice.snapshot!.source, '规则'); assert.equal(notice.kind, 'loop_paused');
-  await detect(f.config, at(7), { judge, channels: [] });
+  await detect(f.config, at(12), { judge, channels: [] });
   assert.equal(calls, mode === 'daily-limit' ? 0 : 1); assert.equal((await readOutbox(f.config.dataDir)).length, 1);
 });
 
@@ -220,6 +223,8 @@ test('D32 跑偏起草与判定分开材料、仍核对原句，不拿模型重�
     return { answer: '是', reason: 'B 不在 A 的范围内', intentQuote: '只改 A 模块', stepQuote: '修改 B 模块', ...draft };
   }, async writeSnapshot() { assert.fail('跑偏不得单独再起草'); } } });
   assert.equal(view.records[0]!.status, '疑似跑偏');
+  assert.deepEqual(await readOutbox(f.config.dataDir), [], '跑偏卡仍需等触发步骤满五分钟');
+  await detect(f.config, at(7), { channels: [], judge: { async judge() { assert.fail('等候不得重调'); } } });
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   assert.equal(notice.snapshot!.factualStatus, '跑偏'); assert.equal(notice.snapshot!.source, '模型');
 });
@@ -242,12 +247,15 @@ for (const tail of ['tool-result', 'normal-step'] as const) for (const copy of [
       } : {}) };
     }, async writeSnapshot() { writes++; return draft; } };
     const result = await detect(f.config, at(5), { judge, channels: [] });
-    const notice = (await readOutbox(f.config.dataDir))[0]!;
-    assert.equal(notice.kind, 'drift');
-    assert.deepEqual({ goal: notice.snapshot!.goal, currentTask: notice.snapshot!.currentTask, lastOutput: notice.snapshot!.lastOutput, factualStatus: notice.snapshot!.factualStatus },
+    // 后来的真人要求已经处理了这轮事实：保留核验快照，不再发跑偏提醒。
+    assert.deepEqual(await readOutbox(f.config.dataDir), []);
+    const persisted = (await readEvents(f.config.dataDir)).find(e => e.kind === 'model_checked' && e.check.task === 'drift');
+    assert.ok(persisted?.kind === 'model_checked');
+    const snapshot = persisted.check.snapshot!;
+    assert.deepEqual({ goal: snapshot.goal, currentTask: snapshot.currentTask, lastOutput: snapshot.lastOutput, factualStatus: snapshot.factualStatus },
       { goal, currentTask: requirement, lastOutput: 'Bash：修改 B 模块', factualStatus: '跑偏' });
-    assert.equal(notice.snapshot!.source, copy === 'model' ? '模型' : '规则');
-    assert.match(notice.content.situation!, /修改.*B 模块/); assert.doesNotMatch(notice.content.summary, /工具结果已返回|检查 A 模块测试报告/);
+    assert.equal(snapshot.source, copy === 'model' ? '模型' : '规则');
+    assert.match(snapshot.situation, /修改.*B 模块/); assert.doesNotMatch(snapshot.situation, /工具结果已返回|检查 A 模块测试报告/);
     const request = requests[0]!, index = request.context.newSteps.findIndex(step => step.text.includes('修改 B 模块'));
     assert.equal(request.context.newSteps.at(-1)!.text, tail === 'tool-result' ? '工具结果已返回' : 'Bash：检查 A 模块测试报告');
     const input = request.snapshotInputsByStep![index]!;
@@ -256,11 +264,9 @@ for (const tail of ['tool-result', 'normal-step'] as const) for (const copy of [
     const material = JSON.parse(judgmentPrompt(request).split('材料：\n')[1]!);
     assert.deepEqual(material.snapshotInputsByStep[index], input);
     assert.equal(material.snapshotInput, undefined, '跑偏起草不再提供容易误用的末步默认材料');
-    const persisted = (await readEvents(f.config.dataDir)).find(e => e.kind === 'model_checked' && e.check.task === 'drift');
-    assert.ok(persisted?.kind === 'model_checked'); assert.deepEqual(persisted.check.snapshot, notice.snapshot);
     assert.equal(result.projection.modelCalls.get('2026-10-20'), 1); assert.equal(writes, 0); assert.equal(requests.length, 1);
-    await detect(f.config, at(6), { judge, channels: [] });
-    assert.equal(requests.length, 1); assert.equal((await readOutbox(f.config.dataDir)).length, 1);
+    await detect(f.config, at(7), { judge, channels: [] });
+    assert.equal(requests.length, 1); assert.equal((await readOutbox(f.config.dataDir)).length, 0);
   });
 
 for (const source of [cc, codex, pi]) test(`返修1-2：${source.tool} 检测时记住越界步骤对应的真人要求，不倒用后来的要求`, () => {
@@ -292,7 +298,7 @@ test('返修1-2：步骤要求索引仅随最近8步保留，不复制要求正�
 
 test('返修1-2：旧判断尚未发卡且缺快照时，规则展示也按引文步骤取材料，不重新调用', async t => {
   const f = await fixture(t);
-  const rows = [ccUser(goal), ccUser('只改 A 模块', at(1)), ccCall(at(2), 'b', '修改 B 模块'), ccUser('接下来只读检查 A 模块测试报告', at(3)), ccCall(at(4), 'normal', '检查 A 模块测试报告')];
+  const rows = [ccUser(goal), ccUser('只改 A 模块', at(1)), ccCall(at(2), 'b', '修改 B 模块'), ccCall(at(4), 'normal', '检查 A 模块测试报告')];
   const path = join(f.config.sources.cc!, 'sample.jsonl'); await put(path, rows);
   const record = cc.parse(rows.map(row => JSON.stringify(row)).join('\n'), { path, fingerprint: 'synthetic' })!;
   await withStoreLock(f.config.dataDir, () => appendJsonl(join(f.config.dataDir, 'events.jsonl'), [
@@ -301,7 +307,7 @@ test('返修1-2：旧判断尚未发卡且缺快照时，规则展示也按引�
       fingerprint: 'synthetic-old', stepIds: [], summary: '', result: { answer: '是', reason: '旧版核验出越界', intentQuote: '只改 A 模块', stepQuote: '修改 B 模块' } } }, at(5)),
   ]));
   let calls = 0;
-  const result = await detect(f.config, at(6), { channels: [], judge: { async judge() { calls++; return { answer: '否', reason: '不应重调' }; } } });
+  const result = await detect(f.config, at(7), { channels: [], judge: { async judge() { calls++; return { answer: '否', reason: '不应重调' }; } } });
   assert.equal(result.noticesAdded, 1); assert.equal(calls, 0);
   const snapshot = (await readOutbox(f.config.dataDir))[0]!.snapshot!;
   assert.equal(snapshot.currentTask, '只改 A 模块'); assert.equal(snapshot.lastOutput, 'Bash：修改 B 模块'); assert.equal(snapshot.source, '规则');

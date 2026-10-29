@@ -187,7 +187,7 @@ test('回放：流块边界上的 UTF-8 表情不被截断，CRLF 原件指纹�
   assert.equal(view.records[0]?.originals[0]?.fingerprint, createHash('sha256').update(text).digest('hex'));
 });
 
-test('回放：首次未发送的旧 loop 交代，有新轮次时间后可以正常提醒', async t => {
+test('回放：loop 没有暂停时间时按首次看到算，新轮次时间不重置五分钟等候', async t => {
   const f = await fixture(t);
   f.config.sources.cc = null;
   f.config.sources.loop = join(f.root, 'loop');
@@ -195,9 +195,10 @@ test('回放：首次未发送的旧 loop 交代，有新轮次时间后可以�
   await put(file, loopSummary('暂停（需要决定）'));
   assert.equal((await detect(f.config, '2026-10-20T13:00:00Z')).noticesAdded, 0);
   await put(file, loopSummary('暂停（需要决定）', '/sample/real-project', '- A2 需人工确认文案', '2026-10-20T12:55:00Z'));
-  assert.equal((await detect(f.config, '2026-10-20T13:01:00Z')).noticesAdded, 1);
+  assert.equal((await detect(f.config, '2026-10-20T13:01:00Z')).noticesAdded, 0);
+  assert.equal((await detect(f.config, '2026-10-20T13:05:00Z')).noticesAdded, 1);
   assert.equal((await readOutbox(f.config.dataDir))[0]?.kind, 'loop_paused');
-  assert.equal((await detect(f.config, '2026-10-20T13:02:00Z')).noticesAdded, 0);
+  assert.equal((await detect(f.config, '2026-10-20T13:06:00Z')).noticesAdded, 0);
 });
 
 test('回放：旧停滞未提醒不占终身一次额度，新活动后再次停滞可以提醒', async t => {

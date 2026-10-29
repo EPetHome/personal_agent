@@ -57,11 +57,13 @@ test('A6 可核对的意图与新步骤才发可能跑偏；10分钟、新动静
   const { judge, calls } = stubJudge(r => r.task === 'drift' ? { answer: '是', reason: 'A 的范围不包含 B', intentQuote: '只改 A 文件', stepQuote: '修改不相关的 B 模块' } : no);
   const first = await detect(config, '2026-10-20T10:01:00Z', { judge });
   assert.equal(first.records[0]?.status, '疑似跑偏');
+  assert.deepEqual(await readOutbox(config.dataDir), [], '判断立即做，提醒先等五分钟');
+  await detect(config, '2026-10-20T10:05:00Z', { judge });
   const notice = (await readOutbox(config.dataDir))[0]!;
   assert.equal(notice.kind, 'drift'); assert.equal(notice.level, '现在就要你');
   assert.match(notice.content.summary, /这件事：只改 A 文件.*实际.*B 模块.*可能偏离/);
   assert.match(notice.content.evidence.reason, /只改 A 文件.*修改不相关的 B 模块/);
-  await detect(config, '2026-10-20T10:02:00Z', { judge });
+  await detect(config, '2026-10-20T10:05:30Z', { judge });
   assert.equal(calls.length, 1);
   await appendFile(transcript, JSON.stringify(ccCall('2026-10-20T10:05:00Z', 'b2', '修改不相关的 B 模块的测试')) + '\n');
   const cooled = await detect(config, '2026-10-20T10:06:00Z', { judge });
