@@ -1,0 +1,12 @@
+{
+  "name": "提醒都发飞书-20261028",
+  "branch": "fix/提醒都发飞书",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "提醒都发飞书": {
+      "prompt": "../../prompt/提示词-提醒都发飞书.md",
+      "scope": { "allow": ["code/", "docs/batches/提醒都发飞书-20261028/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples"] }
+    }
+  },
+  "steps": [["提醒都发飞书"]]
+}
