@@ -1,6 +1,9 @@
 // 构造时效/并发回归，不调用真实模型或通知，不读取真实工具配置。
 import { test } from 'node:test';
+import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { appendFile, chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -33,6 +36,15 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
+}
+// 只控制模型阶段读取的墙钟/单调时钟；真实 setTimeout 与 3 秒外层兜底仍照常运行。
+// 不让临时目录读写耗时意外吃掉「判断器已开始、随后超时」用例的前置预算。
+function modelClock(t: TestContext) {
+  const wall = Date.now(), monotonic = performance.now();
+  let elapsed = 0;
+  t.mock.method(Date, 'now', () => wall + elapsed);
+  t.mock.method(performance, 'now', () => monotonic + elapsed);
+  return { advance(milliseconds: number) { elapsed += milliseconds; } };
 }
 async function within<T>(promise: Promise<T>, milliseconds = 3000): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
@@ -138,11 +150,40 @@ test('返修2-2 模型等待时另一轮仍可感知/交付，迟到答案不覆
 test('返修2-2 判断器即使忽略取消信号、永不返回，单轮总时限仍能结束等待', async t => {
   const { config, channel } = await fixture(t, 3);
   config.judge!.timeoutMs = 30000; config.judge!.cycleTimeoutMs = 80;
-  let calls = 0;
-  const view = await within(detect(config, now, { channels: [channel], judge: { judge() { calls++; return new Promise(() => {}); } } }));
+  const clock = modelClock(t);
+  let calls = 0, signal: AbortSignal | undefined;
+  const view = await within(detect(config, now, { channels: [channel], judge: { judge(_request, options) {
+    calls++; signal = options?.signal;
+    // 确认判断器实际进入以后再耗尽整轮预算；仍由真实的 80 ms 超时结束等待。
+    clock.advance(81);
+    return new Promise(() => {});
+  } } }));
   assert.equal(calls, 1);
+  assert.equal(signal?.aborted, true, '判断器忽略信号时，程序仍须发出取消并结束等待');
   assert.ok(view.records.some(r => r.modelNotes?.includes('调用失败，仅规则判断')));
   assert.ok(view.records.some(r => r.modelNotes?.includes('本轮模型时限用完，仅规则判断')));
+  assert.equal((await readEvents(config.dataDir)).filter(e => e.kind === 'model_call_started').length, 1);
+});
+
+test('模型准备读写已耗尽整轮预算时全部延期，不启动判断器、不扣调用额度', async t => {
+  const { config, channel } = await fixture(t, 3);
+  config.judge!.timeoutMs = 30000; config.judge!.cycleTimeoutMs = 80;
+  const clock = modelClock(t), mkdir = fs.promises.mkdir;
+  let prepared = false, calls = 0;
+  t.mock.method(fs.promises, 'mkdir', async (...args: Parameters<typeof mkdir>) => {
+    if (String(args[0]).includes('/.model.lock.owned-')) { prepared = true; clock.advance(81); }
+    return mkdir(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const view = await within(detect(config, now, { channels: [channel], judge: { judge() { calls++; return new Promise(() => {}); } } }));
+  assert.equal(prepared, true, '必须实际经过模型阶段的锁准备');
+  assert.equal(calls, 0);
+  const events = await readEvents(config.dataDir), checks = events.filter(e => e.kind === 'model_checked');
+  assert.equal(events.filter(e => e.kind === 'model_call_started').length, 0);
+  assert.equal(view.projection.modelCalls.get('2026-10-20') ?? 0, 0);
+  assert.equal(checks.length, 3);
+  assert.ok(checks.every(e => e.check.error === '本轮模型时限用完，仅规则判断'));
 });
 
 test('返修2-2 总时限取消真实子进程替身，30秒单次超时不会突破2秒模型预算', async t => {
