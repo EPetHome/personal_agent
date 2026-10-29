@@ -15,6 +15,8 @@ export interface Config {
   judge?: JudgeConfig | null;
   localChannel?: { executable: string; timeoutMs: number } | null;
   feishu?: FeishuConfig | null;
+  /** IM 原话转达；缺省关闭，目录必须显式配置，绝不推导真实主目录。 */
+  relay?: { enabled: boolean; ccSessionsDir?: string; timeoutMs?: number };
   service?: { intervalMs: number; restartWindowMs: number; restartThreshold: number };
   learning?: boolean;
 }

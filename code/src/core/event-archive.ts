@@ -35,9 +35,10 @@ async function directory(path: string): Promise<void> {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('归档/备份目录必须是普通目录，不跟随链接');
 }
 const writerLocks = ['.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock',
-  '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock'];
+  '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock'];
 const knownLocks = ['.detect.lock', '.service.lock', '.launchd.lock', ...writerLocks];
 function transientLock(name: string): boolean {
+  if (/^\.relay-session-[a-f0-9]{64}\.lock(?:\.(?:owned|released)-[a-f0-9-]+|\.recovery(?:\.owned-[a-f0-9-]+)?)?$/.test(name)) return true;
   return knownLocks.some(lock => name === lock || name === `${lock}.recovery`
     || (name.startsWith(`${lock}.`) && /^(?:owned|released)-[a-f0-9-]+$|^recovery\.owned-[a-f0-9-]+$/.test(name.slice(lock.length + 1))));
 }
