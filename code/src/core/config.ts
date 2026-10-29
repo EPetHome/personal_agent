@@ -75,6 +75,14 @@ export async function validateConfig(value: unknown): Promise<Config> {
     config.feishu = { mode: channel.mode, receiverId: requiredString(channel.receiverId, 'feishu.receiverId'),
       timeoutMs: integer(channel.timeoutMs, 5000, 'feishu.timeoutMs', 1), ...(envFile ? { envFile } : {}) };
   }
+  if (data.relay != null) {
+    const relay = object(data.relay, 'relay');
+    if (typeof relay.enabled !== 'boolean') throw new Error('relay.enabled 必须是布尔值');
+    config.relay = { enabled: relay.enabled, timeoutMs: integer(relay.timeoutMs, 600000, 'relay.timeoutMs', 1),
+      ...(relay.ccSessionsDir === undefined ? {} : { ccSessionsDir: absolute(relay.ccSessionsDir, 'relay.ccSessionsDir') }) };
+    if (relay.enabled && (!config.relay.ccSessionsDir || !config.feishu || sources.cc === null))
+      throw new Error('开启 relay 必须配置 feishu、sources.cc 和 relay.ccSessionsDir');
+  }
   if (data.service != null) {
     const service = object(data.service, 'service');
     config.service = { intervalMs: integer(service.intervalMs, 60000, 'service.intervalMs', 1),
@@ -86,7 +94,7 @@ export async function validateConfig(value: unknown): Promise<Config> {
     config.learning = data.learning;
   }
   for (const tool of tools) config.sources[tool] = sources[tool] === null ? null : absolute(sources[tool], `sources.${tool}`);
-  const readPaths = [...Object.values(config.sources), config.inboxDir].filter((p): p is string => p !== null);
+  const readPaths = [...Object.values(config.sources), config.inboxDir, config.relay?.ccSessionsDir].filter((p): p is string => typeof p === 'string');
   const dataPath = await canonical(config.dataDir);
   const repository = await canonical(resolve(import.meta.dirname, '../../..'));
   if (contains(repository, dataPath)) throw new Error('数据目录必须放在仓库外，不能把运行数据写进仓库');

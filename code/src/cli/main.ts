@@ -83,7 +83,9 @@ async function main() {
     const result = await statistics(config.dataDir, now); console.log(json ? JSON.stringify(result, null, 2) : renderStatistics(result)); return;
   }
   if (command === 'feishu-poll') {
-    const count = await feishuChannel(config).drain(now); console.log(json ? JSON.stringify({ processed: count }) : `已处理 ${count} 条渠道事件`); return;
+    const channel = feishuChannel(config), count = await channel.drain(now);
+    await channel.settled();
+    console.log(json ? JSON.stringify({ processed: count }) : `已处理 ${count} 条渠道事件`); return;
   }
   if (command === 'experience') {
     const action = words[0] ?? 'list';

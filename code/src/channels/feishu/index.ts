@@ -3,6 +3,7 @@ import { noticeCard } from './card.ts';
 import { feishuFailure, realTransport, safeFeishuDeliveryFailure, safeFeishuFailure } from './transport.ts';
 import type { FeishuTransport } from './transport.ts';
 import { receiveFeedback } from '../../core/feedback.ts';
+import { relayController } from '../../core/relay.ts';
 import { OperationFailure, safeProcessingFailure } from '../../core/failures.ts';
 import { reportStorageFailure } from '../../core/alerts.ts';
 import { changeExperience } from '../../core/learning.ts';
@@ -17,6 +18,8 @@ export interface Incoming {
   id: string; at: string; actor: string; type: 'text' | 'action'; messageId: string;
   ref?: string; text?: string; value?: Record<string, string>; chatType?: string;
   timeNote?: string;
+  /** 仅卡片表单的这一个输入；保留空白，不复制其余表单或平台 token。 */
+  relayText?: string;
 }
 interface Receipt {
   id: string; at: string; status?: 'processed' | 'failed'; category?: string;
@@ -39,13 +42,17 @@ export interface SentMessage {
   key: string; messageId: string; at: string; noticeId?: string; type: 'interactive' | 'text';
   /** 只有假渠道保留完整发出内容。 */
   content?: unknown;
+  operation?: 'update';
 }
 // 动态 JSON 仅停留在 I/O 边界；逐个字段校验后才构成领域 Incoming。
 function obj(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 function str(value: unknown): string | undefined { return typeof value === 'string' ? value : undefined; }
+function relayText(raw: unknown): string | undefined {
+  return typeof raw === 'string' && Array.from(raw).length <= 4000 ? raw : undefined;
+}
 function actionValue(raw: unknown): Record<string, string> {
   const input = obj(raw), value: Record<string, string> = {};
-  for (const name of ['action', 'verdict', 'noticeId', 'experienceId', 'experienceRevision']) { const text = str(input[name]); if (text && text.length < 200) value[name] = text; }
+  for (const name of ['action', 'verdict', 'noticeId', 'experienceId', 'experienceRevision', 'draftId']) { const text = str(input[name]); if (text && text.length < 200) value[name] = text; }
   return value;
 }
 /** 同时接受官方原始 envelope 和 SDK 展平事件。只持久化所需字段，不保存 token。 */
@@ -55,7 +62,7 @@ export function normalizeIncoming(raw: unknown, type?: string, now = new Date().
   if (storedType === 'text' || storedType === 'action') {
     const id = str(envelope.id), actor = str(envelope.actor), messageId = str(envelope.messageId), at = str(envelope.at);
     if (!id || !actor || !messageId || !at) return null;
-    return { id, actor, messageId, ...incomingTime(at, now, true), ...(envelope.timeNote === TIME_FALLBACK ? { timeNote: TIME_FALLBACK } : {}), type: storedType, text: str(envelope.text), ref: str(envelope.ref), chatType: str(envelope.chatType), value: actionValue(envelope.value) };
+    return { id, actor, messageId, ...incomingTime(at, now, true), ...(envelope.timeNote === TIME_FALLBACK ? { timeNote: TIME_FALLBACK } : {}), type: storedType, text: str(envelope.text), ref: str(envelope.ref), chatType: str(envelope.chatType), value: actionValue(envelope.value), relayText: relayText(envelope.relayText) };
   }
   const eventType = type ?? header.event_type ?? envelope.event_type;
   let result: Omit<Incoming, 'id' | 'at'>;
@@ -68,7 +75,7 @@ export function normalizeIncoming(raw: unknown, type?: string, now = new Date().
     result = { type: 'text', actor: str(obj(sender.sender_id).open_id) ?? '', messageId: str(message.message_id) ?? '', chatType: str(message.chat_type), text, ref: str(message.parent_id) || str(message.root_id) };
   } else if (eventType === 'card.action.trigger') {
     const action = obj(data.action), context = obj(data.context);
-    result = { type: 'action', actor: str(obj(data.operator).open_id) ?? '', messageId: str(context.open_message_id) ?? str(data.open_message_id) ?? '', value: actionValue(action.value) };
+    result = { type: 'action', actor: str(obj(data.operator).open_id) ?? '', messageId: str(context.open_message_id) ?? str(data.open_message_id) ?? '', value: actionValue(action.value), relayText: relayText(obj(action.form_value).relay_text) };
   } else return null;
   if (!result.actor || !result.messageId) return null;
   const timestamp = header.create_time ?? envelope.create_time ?? obj(data.message).create_time;
@@ -80,6 +87,8 @@ export interface FeishuChannel extends Channel {
   drain(now?: string): Promise<number>;
   start(): Promise<void>;
   stop(): Promise<void>;
+  /** 仅一次性 CLI/离线测试等待后台转达；检测与收件不调用。 */
+  settled(): Promise<void>;
 }
 export function feishuChannel(config: Config, injected?: FeishuTransport): FeishuChannel {
   const options = config.feishu;
@@ -149,6 +158,33 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       }, 30000);
     });
   }
+  const relay = relayController(config, async row => {
+    const key = `relay-view:${row.id}`;
+    if ((await readSent()).some(message => message.key === key)) return;
+    const notice = (await readOutbox(dir)).find(notice => notice.id === row.noticeId);
+    if (!notice) throw new IncomingFailure('notice_not_found', '转达卡片对应的提醒已无法找到');
+    const view = config.relay?.enabled || row.view.stage === 'done' ? row.view : { stage: 'done' as const, message: '没送到：转达总开关已关闭' };
+    const card = noticeCard(notice, view);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      if (options.mode === 'real' || injected) {
+        await Promise.race([getTransport().then(transport => {
+          if (!transport.update) throw new OperationFailure('channel_configuration', '飞书替身未提供卡片更新');
+          return transport.update(row.messageId, JSON.stringify(card));
+        }), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new OperationFailure('channel_timeout', '飞书卡片更新超时')), options.timeoutMs); })]);
+      }
+      await withNamedLock(dir, '.feishu-sent.lock', async () => {
+        await readJsonl(sentPath);
+        await appendJsonl(sentPath, [{ key, messageId: row.messageId, at: new Date().toISOString(), type: 'interactive', noticeId: row.noticeId,
+          operation: 'update', ...(options.mode === 'fake' ? { content: card } : {}) } satisfies SentMessage]);
+      }, 30000);
+    } catch (error) {
+      // 只补一条状态说明，不重发 CC，也不让坏预览看起来已经确认。
+      const failure = safeFeishuDeliveryFailure(error);
+      await send('text', { text: `卡片更新失败：${failure.reason}。${view.message ?? '尚未完成预览确认，不会发送；请回电脑核对。'}` }, `relay-update-failed:${row.id}`);
+      throw error;
+    } finally { clearTimeout(timer); }
+  }, error => reportStorageFailure(config, error));
   async function handle(input: Incoming) {
     if (input.actor !== options!.receiverId || (input.type === 'text' && input.chatType !== 'p2p')) return;
     const sent = await readSent();
@@ -159,6 +195,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       if (!mapped?.noticeId) throw new IncomingFailure('notice_not_found', '找不到这张卡片对应的提醒，请打开最新卡片再试。');
       const notice = (await readOutbox(dir)).find(n => n.id === mapped.noticeId);
       if (!notice) throw new IncomingFailure('notice_not_found', '这条提醒已无法找到，请打开最新卡片再试。');
+      if (value.action?.startsWith('relay_')) return relay.handle(input, notice);
       if (value.action === 'feedback' && value.noticeId === notice.id && ['正确', '误报', '看不懂'].includes(value.verdict ?? '') && (value.verdict === '看不懂' || !['weekly', 'recurrence', 'service_restart'].includes(notice.kind))) {
         response = await receiveFeedback(dir, 'feishu', { noticeId: notice.id, content: value.verdict!, at: input.at, replyId: input.id });
       } else if (['agree', 'revise'].includes(value.action ?? '')) {
@@ -183,7 +220,15 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
   }
   const channel: FeishuChannel = {
     name: 'feishu', levels: ['现在就要你', '有空看'],
-    send: notice => send('interactive', noticeCard(notice), `notice:${notice.id}`, notice.id),
+    async send(notice) {
+      let view;
+      try { view = await relay.card(notice); }
+      catch (error) {
+        await reportStorageFailure(config, error);
+        view = { stage: 'done' as const, message: '没送到：转达记录暂不可用，未开放发送；盯防与反馈照常。请回电脑检查。' };
+      }
+      await send('interactive', noticeCard(notice, view), `notice:${notice.id}`, notice.id);
+    },
     receive: reply => receiveFeedback(dir, 'feishu', reply),
     async capture(raw, type) {
       if (stopped) return {};
@@ -199,7 +244,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       try { await Promise.race([saved, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('入站暂未持久化，请重试')), 2500); })]); }
       catch (error) { await reportStorageFailure(config, error); throw error; }
       finally { clearTimeout(timer); }
-      setImmediate(() => { void channel.drain().catch(() => {}); });
+      setImmediate(() => { if (!stopped) void channel.drain().catch(() => {}); });
       return {};
     },
     drain(now) {
@@ -244,6 +289,8 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
           }
           receipts.set(input.id, receipt);
         }
+        // UI 更新和 CC 续话都不等待；轮询只做独立短记录，不能卡住检测/反馈。
+        void relay.poll();
         return count;
       }).finally(() => { draining = undefined; });
       return draining;
@@ -261,11 +308,14 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       }
       await flushConnection();
     },
+    settled: () => relay.settled(),
     async stop() {
       stopped = true;
+      await relay.stop();
       clearTimeout(connectionRetry); connectionRetry = undefined;
       if (transport) { const ready = await transport.catch(() => undefined); ready?.stop?.(); }
       await ingress; if (draining) await draining; await channel.drain();
+      await relay.settled();
       await reportConnection({ state: 'stopped' });
     },
   };

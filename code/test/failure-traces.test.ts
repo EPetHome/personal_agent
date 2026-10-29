@@ -360,7 +360,7 @@ test('丙 A6：很久前的单次异常也留痕，已知原因重分类；正�
   assert.ok(!JSON.stringify(log).includes(raw));
 });
 
-test('丙 A7：实际状态写入ENOSPC，连续失败本机只告警一次；完整恢复后再次满盘可再告警', async t => {
+test('丙 A7：实际状态写入时磁盘写满，连续失败本机只告警一次；完整恢复后再次满盘可再告警', async t => {
   const f = await fixture(t); f.config.feishu = null; let full = true;
   faultOpen(t, path => full && path.startsWith(join(f.config.dataDir, '.state-')));
   for (let i = 0; i < 3; i++) await assert.rejects(detect(f.config, at(i), { channels: [f.local] }), { code: 'ENOSPC' });

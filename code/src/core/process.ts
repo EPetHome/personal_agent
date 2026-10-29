@@ -19,11 +19,11 @@ export function safeFailure(error: unknown): { category: FailureCategory; detail
 }
 
 /** 不经 shell；调用者决定如何降级，外部 stderr（可能带敏感数据）不进入记录。 */
-export function runCommand(executable: string, args: string[], timeoutMs: number, input?: string, signal?: AbortSignal): Promise<string> {
+export function runCommand(executable: string, args: string[], timeoutMs: number, input?: string, signal?: AbortSignal, cwd?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: componentPath(process.env.PATH) };
     delete env.FEISHU_APP_ID; delete env.FEISHU_APP_SECRET;
-    const child = execFile(executable, args, { env, encoding: 'utf8', timeout: timeoutMs, signal, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+    const child = execFile(executable, args, { env, cwd, encoding: 'utf8', timeout: timeoutMs, signal, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
       if (!error) { resolve(stdout); return; }
       const code = error.code;
       if (error.name === 'AbortError') reject(new ComponentFailure('cancelled', '本轮时限到达，已取消调用'));

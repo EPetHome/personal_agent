@@ -6,6 +6,7 @@ import type { FeishuConfig, FeishuConnection, FeishuFailureCategory } from '../.
 
 export interface FeishuTransport {
   send(type: 'interactive' | 'text', content: string, key: string): Promise<string>;
+  update?(messageId: string, content: string): Promise<void>;
   start?(handlers: Record<string, (raw: unknown) => unknown>, connection?: (state: FeishuConnection) => void): void | Promise<void>;
   stop?(): void;
 }
@@ -78,6 +79,13 @@ export async function realTransport(config: FeishuConfig, dependencies: {
           throw new OperationFailure(failure.category === 'channel_unknown' ? 'channel_rejected' : failure.category, '飞书拒收（未保存原始响应）');
         }
         return result.data.message_id;
+      },
+      async update(messageId, content) {
+        const result = await client.im.message.patch({ path: { message_id: messageId }, data: { content } });
+        if (result.code !== 0) {
+          const failure = safeFeishuDeliveryFailure({ response: { data: result } });
+          throw new OperationFailure(failure.category === 'channel_unknown' ? 'channel_rejected' : failure.category, '飞书卡片更新失败（未保存原始响应）');
+        }
       },
       start(handlers, connection = () => {}) {
         stopped = false;
