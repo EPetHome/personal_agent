@@ -3,7 +3,7 @@ import { channelName, undeliveredNotices } from './delivery.ts';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
-import { routeNotice, waitingReady } from './interaction.ts';
+import { driftTrigger, routeNotice, waitingReady, WAITING_INTERVAL_MS } from './interaction.ts';
 import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
@@ -43,7 +43,7 @@ export function judgeRecords(projection: Projection, now: string): JudgedRecord[
       judged.status = '看不见了';
       judged.reason = '这个会话的报信与记录对不上，当前状态不能确认；同一工具的其他会话照常判断';
     } else if (!activities.some(a => a.member.unavailable) && !activities.every(a => a.completed)
-      && Date.parse(now) - Date.parse(judged.lastActivityAt) > ONE_DAY) {
+      && Date.parse(now) - Date.parse(record.loop?.status === '暂停' ? record.loopPausedAt ?? now : judged.lastActivityAt) > ONE_DAY) {
       judged.status = '已搁置';
       judged.reason = '尚无全部结束证据，超过 24 小时没有新动静；只进总览，不提醒';
     } else if (record.loop?.status === '暂停') {
@@ -148,9 +148,16 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       title = `${ai}${record.loop ? `（${batch}）` : ''} 干到一半没动静了`;
     }
     if (!kind) continue;
-    // 授权等待同样先等五分钟；期间推进已由具体成员的事实/推送解除。
-    if (kind === 'waiting' && waitingMember && record.waiting && !waitingReady(waitingMember, record.waiting.at, now)) continue;
-    const evidenceAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
+    // 三类需用户处理的事实先等五分钟；只看目标成员，其他会话的真人输入不解除。
+    if (kind === 'waiting' && waitingMember && !waitingReady(waitingMember,
+      record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting!.evidenceAt, now)) continue;
+    if (kind === 'drift' && record.drift) {
+      const trigger = driftTrigger(record, record.drift), member = membersOf(record).find(member => member.sessionId === trigger.sessionId);
+      if (!member || !waitingReady(member, trigger.at, now)) continue;
+    }
+    if (kind === 'loop_paused' && Date.parse(now) - Date.parse(record.loopPausedAt ?? now) < WAITING_INTERVAL_MS) continue;
+    const evidenceAt = kind === 'loop_paused' ? record.loopPausedAt ?? now
+      : record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     const memberId = waitingId ?? record.drift?.sessionId ?? record.sessionId;
     const feedbackKey = feedbackSuppressionKey({ tool: record.tool, kind, sessionKey: record.key, memberSessionId: memberId });
     if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) {

@@ -53,25 +53,26 @@ test('甲 A2：五分钟边界才判断，离场双通道；重试/重建不重�
   assert.equal(f.calls.length, calls); assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 1);
 });
 
-test('甲 A3：第四分钟另一会话发短句即在场，只本机；超十分钟不补发飞书', async t => {
+test('提醒出口更新：第四分钟另一会话发短句，在场仍双发；超十分钟不重发', async t => {
   const f = await fixture(t);
   await detect(f.config, at(0), f.components);
   await put(join(f.config.sources.cc!, 'other.jsonl'), [{ ...ccUser('好的', at(4)), sessionId: 'other' }]);
   await detect(f.config, at(5), f.components);
-  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 0);
+  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 1);
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   assert.equal(notice.delivery!.presence, '在场'); assert.equal(notice.delivery!.lastHumanAt, at(4));
-  assert.equal(accepts(f.components.channels[1]!, notice), false);
-  assert.equal((await readEvents(f.config.dataDir)).some(e => e.kind === 'channel_delivery' && e.channel === 'feishu'), false);
+  assert.equal(accepts(f.components.channels[1]!, notice), true);
+  assert.equal((await readEvents(f.config.dataDir)).some(e => e.kind === 'channel_delivery' && e.channel === 'feishu'), true);
   await detect(f.config, at(16), f.components);
-  assert.equal(f.feishu.length, 0);
+  assert.equal(f.feishu.length, 1);
 });
 
 for (const minutes of [-5, -5.001]) test(`甲 在场十分钟边界：最后输入在 ${minutes} 分钟，按发卡时刻判断`, async t => {
   const f = await fixture(t);
   await put(join(f.config.sources.cc!, 'other.jsonl'), [{ ...ccUser('继续', at(minutes)), sessionId: 'other' }]);
   await detect(f.config, at(5), f.components);
-  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, minutes === -5 ? 0 : 1);
+  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 1);
+  assert.equal(f.local[0]!.delivery!.presence, minutes === -5 ? '在场' : '不在场', '在场仅留痕，不影响出口');
 });
 
 test('甲 被忽略会话和系统输入不能冒充在场；跨工具的真人输入可以', async t => {
@@ -87,7 +88,7 @@ test('甲 被忽略会话和系统输入不能冒充在场；跨工具的真人�
   await appendFile(f.file, JSON.stringify(answer) + '\n');
   await put(join(f.config.sources.codex, 'visible.jsonl'), [codexMeta('visible'), codexEvent({ type: 'user_message', message: '继续' }, 'event_msg', at(10))]);
   await detect(f.config, at(11), f.components);
-  assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 1);
+  assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 2);
 });
 
 test('甲 A4：授权等待两分钟内推进不发；未处理的授权同样等五分钟且不调模型', async t => {
@@ -150,7 +151,7 @@ test('甲 A8：下轮多句真人输入时记第一句原文索引，追加不�
   assert.deepEqual((await rebuild(f.config)).projection.noticeReplies.get(f.notice.id), reply);
 });
 
-test('甲 A9：跑偏、loop 暂停和看不见了不等，在场仅本机；有空看仍只飞书', async t => {
+test('提醒出口更新：看不见了马上双发，跑偏/loop 暂停五分钟后双发；有空看仍只飞书', async t => {
   const f = await fixture(t);
   await put(f.file, [ccUser('只改 A 模块', at(0)), ccCall(at(0), 'b', '修改 B 模块')]);
   f.config.sources.loop = join(f.root, 'loop');
@@ -158,10 +159,12 @@ test('甲 A9：跑偏、loop 暂停和看不见了不等，在场仅本机；有
   f.config.sources.pi = join(f.root, 'missing-pi');
   f.components.judge = { async judge() { return { answer: '是', reason: 'B 越过 A 范围', intentQuote: '只改 A 模块', stepQuote: '修改 B 模块' }; } };
   await detect(f.config, at(1), f.components);
-  assert.deepEqual(f.local.map(n => n.kind).sort(), ['blind', 'drift', 'loop_paused']); assert.equal(f.feishu.length, 0);
-  await put(join(f.config.sources.loop, 'shop/00000000-0000-4000-8000-000000000001.md'), loopSummary('完成', '/sample/shop', '- 无', at(2)));
-  await detect(f.config, at(3), f.components);
-  assert.deepEqual(f.feishu.map(n => n.kind), ['loop_completed']);
+  assert.deepEqual(f.local.map(n => n.kind), ['blind']); assert.deepEqual(f.feishu.map(n => n.kind), ['blind']);
+  await detect(f.config, at(6), f.components);
+  assert.deepEqual(f.local.map(n => n.kind).sort(), ['blind', 'drift', 'loop_paused']); assert.equal(f.feishu.length, 3);
+  await put(join(f.config.sources.loop, 'shop/00000000-0000-4000-8000-000000000001.md'), loopSummary('完成', '/sample/shop', '- 无', at(7)));
+  await detect(f.config, at(8), f.components);
+  assert.equal(f.local.length, 3); assert.deepEqual(f.feishu.map(n => n.kind).sort(), ['blind', 'drift', 'loop_completed', 'loop_paused']);
 });
 
 for (const tool of ['cc', 'codex', 'pi'] as const) test(`甲 真人时间 ${tool}：短词计在场，系统注入/工具结果不算真人`, async t => {
@@ -217,7 +220,7 @@ test('甲 等待模型迟到时已经接话，不发过期卡片、不覆盖新�
   assert.deepEqual(await readOutbox(f.config.dataDir), []);
 });
 
-test('甲 已答完但有真实越界执行步骤，跑偏也不等回复间隔', async t => {
+test('提醒等候更新：已答完但有真实越界执行步骤，立即判断但五分钟后才提醒', async t => {
   const f = await fixture(t);
   await put(f.file, [ccUser('只改 A 模块', at(0)), ccCall(at(0), 'b', '修改 B 模块'), ccAnswer(at(1))]);
   f.components.judge = { async judge(request) {
@@ -225,11 +228,13 @@ test('甲 已答完但有真实越界执行步骤，跑偏也不等回复间隔'
     return { answer: '是', reason: '真实越界步骤', intentQuote: '只改 A 模块', stepQuote: '修改 B 模块' };
   } };
   await detect(f.config, at(2), f.components);
-  assert.deepEqual(f.local.map(n => n.kind), ['drift']); assert.equal(f.feishu.length, 0);
+  assert.equal(f.local.length, 0); assert.equal(f.feishu.length, 0);
+  await detect(f.config, at(5), f.components);
+  assert.deepEqual(f.local.map(n => n.kind), ['drift']); assert.equal(f.feishu.length, 1);
 });
 
 for (const format of ['legacy', 'event-item', 'top-item'] as const) for (const parentField of ['source', 'parent_session_id'] as const)
-  test(`返修1-1：Codex 子任务 ${format}/${parentField} 不算在场，明确真人回复仍可跨会话分流`, async t => {
+  test(`返修1-1：Codex 子任务 ${format}/${parentField} 不冒充真人，明确真人回复也不压住其他会话的出口`, async t => {
     const f = await fixture(t);
     f.config.sources.codex = join(f.root, 'codex');
     await put(join(f.config.sources.codex, 'parent.jsonl'), [codexMeta(), codexEvent({ type: 'user_message', message: '父任务' }, 'event_msg', at(-20))]);
@@ -258,14 +263,14 @@ for (const format of ['legacy', 'event-item', 'top-item'] as const) for (const p
     await appendFile(f.file, JSON.stringify(answer) + '\n');
     await appendFile(childFile, JSON.stringify(input('实际真人的回复', 10, true)) + '\n');
     const second = await detect(f.config, at(11), f.components);
-    assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 1, '明确真人回复仍应使另一会话只弹本机');
+    assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 2, '明确真人回复不能压住另一会话的飞书提醒');
     assert.equal(f.local[1]!.delivery!.lastHumanAt, at(10));
     const updated = second.records.find(r => r.tool === 'codex')!.members!.find(m => m.sessionId === 'child')!;
     assert.equal(humanRequests(updated).length, 1); assert.equal(humanRequests(updated)[0]!.at, at(10));
   });
 
 for (const state of ['tool_use', 'end_turn-with-tool', 'completed'] as const)
-  test(`返修1-2：CC 同时刻说明与越界工具 ${state} 即时跑偏，不套收尾问句窗口`, async t => {
+  test(`返修1-2：CC 同时刻说明与越界工具 ${state} 立即判断跑偏、满五分钟才提醒，不推迟执行判断`, async t => {
     const f = await fixture(t), call = ccCall(at(1), 'b', '修改 B 模块');
     const mixed = { ...call, message: { ...call.message,
       stop_reason: state === 'end_turn-with-tool' ? 'end_turn' : 'tool_use',
@@ -274,13 +279,16 @@ for (const state of ['tool_use', 'end_turn-with-tool', 'completed'] as const)
     if (state === 'completed') rows.push({ ...ccUser('', at(1)), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: '构造执行结果' }] } }, ccAnswer(at(1)));
     await put(f.file, rows);
     f.components.judge = { async judge(request) {
-      f.calls.push(request); assert.equal(request.task, 'drift');
+      f.calls.push(request);
+      if (request.task === 'waiting') return { answer: '否', reason: '构造的正常收尾' };
       return { answer: '是', reason: '真实执行越界', intentQuote: '只改 A 模块', stepQuote: 'Bash：修改 B 模块' };
     } };
     const view = await detect(f.config, at(2), f.components);
     assert.equal(f.calls.length, 1); assert.equal(view.records[0]!.status, '疑似跑偏');
-    assert.deepEqual(f.local.map(n => n.kind), ['drift']); assert.equal(f.feishu.length, 0);
+    assert.equal(f.local.length, 0); assert.equal(f.feishu.length, 0);
     assert.equal(view.records[0]!.pendingTools.length, state === 'completed' ? 0 : 1);
+    await detect(f.config, at(6), f.components);
+    assert.deepEqual(f.local.map(n => n.kind), ['drift']); assert.equal(f.feishu.length, 1);
   });
 
 test('甲 升级：已发旧卡缺新字段，未重发/重调/重写旧日志', async t => {

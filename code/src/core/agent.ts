@@ -106,7 +106,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const add = (payload: EventPayload) => { added.push(event(payload, at)); };
   for (const reply of nextNoticeReplies(projection)) add({ kind: 'notice_reply_observed', ...reply });
-  // supplemental 通知也走同一分流；历史卡片（缺字段）绝不重新计划或改变出口。
+  // supplemental 通知也按级别选择出口；历史卡片绝不重新计划或改变出口。
   for (const entry of added) if (entry.kind === 'notice_planned') entry.notice = routeNotice(entry.notice, projection, at);
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
@@ -216,7 +216,10 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
     const added: AgentEvent[] = [];
     const add = (payload: EventPayload) => { added.push(event(payload, now)); };
     for (const record of input.records) {
-      const delta = sessionDelta(previous.sessions.get(record.key), record);
+      const last = previous.sessions.get(record.key);
+      if (record.loop?.status === '暂停') record.loopPausedAt = last?.loop?.status === '暂停'
+        ? last.loopPausedAt ?? record.loopPausedAt ?? now : record.loopPausedAt ?? now;
+      const delta = sessionDelta(last, record);
       if (delta) add({ kind: 'session_delta', delta });
     }
     const seenSessions = new Set(previous.seenSessions);

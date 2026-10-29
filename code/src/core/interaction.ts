@@ -1,5 +1,5 @@
 import { membersOf } from './sessions.ts';
-import type { Notice, Projection, RequestRef, SessionMember } from './types.ts';
+import type { ModelFinding, Notice, Projection, RequestRef, SessionMember, SessionRecord, Step } from './types.ts';
 
 export const WAITING_INTERVAL_MS = 5 * 60 * 1000;
 export const PRESENCE_INTERVAL_MS = 10 * 60 * 1000;
@@ -14,7 +14,17 @@ export function waitingReady(member: SessionMember, evidenceAt: string, now: str
   return Date.parse(now) - evidence >= WAITING_INTERVAL_MS
     && !humanRequests(member).some(ref => Date.parse(ref.at) > evidence && Date.parse(ref.at) <= Date.parse(now));
 }
-/** 路由在新卡片落盘前决定；旧卡无此字段时仍按原有级别投递。 */
+/** 跑偏从核验引文的实际步骤计时，不用最后活动或模型返回时间代替；旧判断按引文追溯。 */
+export function driftTrigger(record: SessionRecord, finding: ModelFinding, step?: Step): { at: string; sessionId: string } {
+  if (finding.triggerStep) return finding.triggerStep;
+  const members = membersOf(record).filter(member => finding.key !== `drift:${record.key}:${finding.sessionId}` || member.sessionId === finding.sessionId);
+  const matches = members.flatMap(member => member.recentSteps
+    .filter(candidate => step ? candidate.at === step.at && candidate.text === step.text
+      : !!finding.result.stepQuote && candidate.text.includes(finding.result.stepQuote))
+    .map(candidate => ({ at: candidate.at, sessionId: member.sessionId }))).sort((a, b) => a.at.localeCompare(b.at));
+  return matches.at(-1) ?? { at: finding.evidenceAt, sessionId: finding.sessionId };
+}
+/** 仅新卡片选择出口；在场信息保留作历史兼容，不参与分流。旧决定一律原样保留。 */
 export function routeNotice(notice: Notice, projection: Projection, now: string): Notice {
   if (notice.delivery) return notice;
   const time = Date.parse(now);
@@ -24,7 +34,7 @@ export function routeNotice(notice: Notice, projection: Projection, now: string)
   }
   const present = !!last && time - Date.parse(last.at) <= PRESENCE_INTERVAL_MS;
   return { ...notice, delivery: { presence: present ? '在场' : '不在场',
-    channels: notice.level === '有空看' ? ['feishu'] : present ? ['local'] : ['local', 'feishu'],
+    channels: notice.level === '有空看' ? ['feishu'] : ['local', 'feishu'],
     decidedAt: now, ...(last ? { lastHumanAt: last.at } : {}) } };
 }
 /** 首次看到的下一句，按卡片目标成员关联；在会话变化时追加引用，原卡/原文不改。 */

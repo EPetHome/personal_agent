@@ -192,7 +192,10 @@ for (const tool of ['cc', 'codex', 'pi'] as const) {
     await put(join(f.config.sources[tool]!, 'autoreview-crit-unreadable.jsonl'), '{broken\n');
     await put(f.inbox, [f.push('waiting_permission', '/demo/r3', 'autoreview-acc-no-file')]);
     const calls: JudgmentRequest[] = [];
-    const view = await detect(f.config, now, { judge: { async judge(request) { calls.push(request); return driftJudge.judge(request); } } });
+    const judge: Judge = { async judge(request) { calls.push(request); return driftJudge.judge(request); } };
+    const view = await detect(f.config, now, { judge });
+    assert.deepEqual(await readOutbox(f.config.dataDir), [], '等候期间仍判断普通会话，但不提前发卡');
+    await detect(f.config, '2026-10-20T10:06:00Z', { judge });
     assert.equal(view.records.length, 1); assert.equal(view.records[0]?.sessionId, `demo-${tool}`);
     assert.equal(view.records[0]?.status, '疑似跑偏'); assert.equal(calls.length, 1);
     assert.deepEqual((await readOutbox(f.config.dataDir)).map(n => n.kind), ['drift']);

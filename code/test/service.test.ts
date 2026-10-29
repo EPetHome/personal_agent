@@ -65,7 +65,7 @@ test('返修1-1 最小PATH仍能运行 env node 的Pi替身；plist仅登记可�
   await put(configPath, JSON.stringify(config));
   const before = spawnSync(executable, [], { encoding: 'utf8', env: { PATH: emptyBin }, input: '' });
   assert.notEqual(before.status, 0, '空PATH的对照应无法找到 shebang 的 node');
-  const detected = spawnSync(process.execPath, [cli, 'detect', '--config', configPath, '--now', '2026-10-20T10:01:00Z', '--json'], { encoding: 'utf8', env: { PATH: emptyBin, HOME: root }, timeout: 15000 });
+  const detected = spawnSync(process.execPath, [cli, 'detect', '--config', configPath, '--now', '2026-10-20T10:06:00Z', '--json'], { encoding: 'utf8', env: { PATH: emptyBin, HOME: root }, timeout: 15000 });
   assert.equal(detected.status, 0, detected.stderr);
   assert.equal(JSON.parse(detected.stdout).records[0].status, '疑似跑偏');
   assert.equal((await readOutbox(config.dataDir)).filter(n => n.kind === 'drift').length, 1);

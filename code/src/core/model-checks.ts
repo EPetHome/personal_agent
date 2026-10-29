@@ -1,12 +1,12 @@
 import { membersOf, mismatchedMemberIds, pushMatchesMember, sourceUnavailable } from './sessions.ts';
-import { indexModelEvidence, modelEvidenceFor, sameModelEvidenceScope } from './evidence.ts';
-import { humanRequests, waitingReady } from './interaction.ts';
+import { indexModelEvidence, modelEvidenceFor, modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
+import { driftTrigger, humanRequests, waitingReady } from './interaction.ts';
 import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, piJudge, validateJudgment } from './model.ts';
 import { compact, hash } from './utils.ts';
 import { ComponentFailure, safeFailure } from './process.ts';
-import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, Projection, SessionMember, SessionRecord, TaskSnapshotInput } from './types.ts';
+import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, ModelFinding, Projection, SessionMember, SessionRecord, TaskSnapshotInput } from './types.ts';
 
 const TEN_MINUTES = 10 * 60 * 1000;
 const ONE_DAY = 24 * 60 * 60 * 1000;
@@ -148,6 +148,7 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
           // validateJudgment 已核验引文；选其对应步骤/当时要求，不用末步或本轮最后活动代替。
           const index = item.task === 'drift' ? context.newSteps.findLastIndex(step => step.text.includes(check.result!.stepQuote!)) : -1;
           const input = item.snapshotInputsByStep?.[index] ?? item.snapshotInput;
+          if (item.task === 'drift') check.triggerStep = driftTrigger(record, { ...check, result: check.result }, context.newSteps[index]);
           check.snapshot = (sameKind?.snapshot?.factualStatus === input.factualStatus ? sameKind.snapshot : null)
             ?? (sameKind ? null : modelSnapshot(input, check.result, record.project, now))
             ?? ruleSnapshot(input, record.project, now);
@@ -176,6 +177,11 @@ function ruleWaiting(record: JudgedRecord, item: Candidate, now: string): void {
   record.status = '在等我';
   record.reason = '判断模型不可用，仅按助手最后一个明确问题兜底；尚需你回复或确认';
 }
+function applyDrift(record: JudgedRecord, finding: ModelFinding): void {
+  record.drift = finding;
+  record.status = '疑似跑偏';
+  record.reason = `可能偏离意图「${finding.result.intentQuote}」；实际步骤「${finding.result.stepQuote}」；${finding.result.reason}`;
+}
 /** 纯投影：overview/rebuild 不调模型；无模型/调用失败时用最后的明确问题兜底。 */
 export function applyModelChecks(records: JudgedRecord[], projection: Projection, config: Config, now: string): void {
   for (const record of records) {
@@ -194,7 +200,7 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
         continue;
       }
       if (check.result?.answer !== '是') continue;
-      if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY) {
+      if (Date.parse(now) - Date.parse(check.evidenceAt) > ONE_DAY) {
         if (!locallyBlind && Date.parse(now) - Date.parse(record.lastActivityAt) > ONE_DAY) {
           record.status = '已搁置';
           record.reason = '模型先前判断可能需要你处理，但已超过 24 小时没有新动静；只进总览，不提醒';
@@ -206,11 +212,27 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
         record.modelWaiting = finding;
         record.status = '在等我';
         record.reason = `模型判断可能在等你回复：${check.result.reason}`;
-      } else if (!record.modelWaiting && !record.ruleWaiting && !record.waiting) {
-        record.drift = finding;
-        record.status = '疑似跑偏';
-        record.reason = `可能偏离意图「${check.result.intentQuote}」；实际步骤「${check.result.stepQuote}」；${check.result.reason}`;
-      }
+      } else if (!record.modelWaiting && !record.ruleWaiting && !record.waiting) applyDrift(record, finding);
+    }
+    // 待发事实不依赖「还能否发起新判断」：session_end 可以关闭候选，不能解除已核验的跑偏。
+    // 仍保留当前等待优先、来源/成员可读性、组/成员缓存隔离；只读最新缓存，不补旧的已发事实。
+    if (!config.judge || record.tool === 'loop' || record.status === '已搁置' || sourceUnavailable(projection, record.tool)
+      || record.modelWaiting || record.ruleWaiting || record.waiting || record.drift) continue;
+    const source = projection.sessions.get(record.key) ?? record;
+    const mismatches = mismatchedMemberIds(source, projection);
+    if (record.status === '看不见了' && !mismatches.size) continue;
+    const members = membersOf(source).filter(member => !mismatches.has(member.sessionId));
+    if (!members.length || members.some(member => member.unavailable)) continue;
+    const keys = mismatches.size ? members.map(member => `drift:${record.key}:${member.sessionId}`) : [`drift:${record.key}`];
+    for (const key of keys) {
+      const check = projection.modelChecks.get(key);
+      if (!check?.result || check.result.answer !== '是' || check.error || Date.parse(now) - Date.parse(check.evidenceAt) > ONE_DAY
+        || projection.notices.some(notice => notice.dedupeKey === `drift:${record.key}:${modelEvidenceKey(check)}`)) continue;
+      const finding = { ...check, result: check.result }, trigger = driftTrigger(source, finding);
+      const member = members.find(member => member.sessionId === trigger.sessionId);
+      if (!member || !waitingReady(member, trigger.at, now)) continue;
+      applyDrift(record, finding);
+      break;
     }
   }
 }
