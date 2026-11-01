@@ -53,18 +53,18 @@ test('甲 A2：五分钟边界才判断，离场双通道；重试/重建不重�
   assert.equal(f.calls.length, calls); assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 1);
 });
 
-test('提醒出口更新：第四分钟另一会话发短句，在场仍双发；超十分钟不重发', async t => {
+test('叫与不叫：第四分钟另一会话发短句，普通等待只发本机；超十分钟不补飞书', async t => {
   const f = await fixture(t);
   await detect(f.config, at(0), f.components);
   await put(join(f.config.sources.cc!, 'other.jsonl'), [{ ...ccUser('好的', at(4)), sessionId: 'other' }]);
   await detect(f.config, at(5), f.components);
-  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 1);
+  assert.equal(f.local.length, 1); assert.equal(f.feishu.length, 0);
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   assert.equal(notice.delivery!.presence, '在场'); assert.equal(notice.delivery!.lastHumanAt, at(4));
-  assert.equal(accepts(f.components.channels[1]!, notice), true);
-  assert.equal((await readEvents(f.config.dataDir)).some(e => e.kind === 'channel_delivery' && e.channel === 'feishu'), true);
+  assert.equal(accepts(f.components.channels[1]!, notice), false);
+  assert.equal((await readEvents(f.config.dataDir)).some(e => e.kind === 'channel_delivery' && e.channel === 'feishu'), false);
   await detect(f.config, at(16), f.components);
-  assert.equal(f.feishu.length, 1);
+  assert.equal(f.feishu.length, 0);
 });
 
 for (const minutes of [-5, -5.001]) test(`甲 在场十分钟边界：最后输入在 ${minutes} 分钟，按发卡时刻判断`, async t => {
@@ -88,20 +88,20 @@ test('甲 被忽略会话和系统输入不能冒充在场；跨工具的真人�
   await appendFile(f.file, JSON.stringify(answer) + '\n');
   await put(join(f.config.sources.codex, 'visible.jsonl'), [codexMeta('visible'), codexEvent({ type: 'user_message', message: '继续' }, 'event_msg', at(10))]);
   await detect(f.config, at(11), f.components);
-  assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 2);
+  assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 1);
 });
 
-test('甲 A4：授权等待两分钟内推进不发；未处理的授权同样等五分钟且不调模型', async t => {
+test('叫与不叫红线：授权等待马上发，推进后不重发，新一次授权仍马上叫且不调模型', async t => {
   const f = await fixture(t); f.config.judge = null;
   await put(f.file, [ccUser('构造授权任务', at(-20)), ccCall(at(0))]);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(f.file, 'waiting_permission', at(0))]);
   await detect(f.config, at(1), f.components);
   await appendFile(f.file, JSON.stringify(ccCall(at(2), 'next', '授权后继续执行')) + '\n');
   await detect(f.config, at(6), f.components);
-  assert.equal(f.local.length, 0); assert.deepEqual(await readOutbox(f.config.dataDir), []);
+  assert.equal(f.local.length, 1); assert.equal((await readOutbox(f.config.dataDir)).length, 1);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(f.file, 'waiting_permission', at(7))]);
-  await detect(f.config, at(11), f.components); assert.equal(f.local.length, 0);
-  await detect(f.config, at(12), f.components); assert.equal(f.local.length, 1); assert.equal(f.calls.length, 0);
+  await detect(f.config, at(7), f.components); assert.equal(f.local.length, 2);
+  await detect(f.config, at(12), f.components); assert.equal(f.local.length, 2); assert.equal(f.calls.length, 0);
 });
 
 const items: TaskActionItem[] = [
@@ -234,7 +234,7 @@ test('提醒等候更新：已答完但有真实越界执行步骤，立即判�
 });
 
 for (const format of ['legacy', 'event-item', 'top-item'] as const) for (const parentField of ['source', 'parent_session_id'] as const)
-  test(`返修1-1：Codex 子任务 ${format}/${parentField} 不冒充真人，明确真人回复也不压住其他会话的出口`, async t => {
+  test(`返修1-1：Codex 子任务 ${format}/${parentField} 不冒充真人，明确真人回复只压住其他普通等待的飞书出口`, async t => {
     const f = await fixture(t);
     f.config.sources.codex = join(f.root, 'codex');
     await put(join(f.config.sources.codex, 'parent.jsonl'), [codexMeta(), codexEvent({ type: 'user_message', message: '父任务' }, 'event_msg', at(-20))]);
@@ -263,7 +263,7 @@ for (const format of ['legacy', 'event-item', 'top-item'] as const) for (const p
     await appendFile(f.file, JSON.stringify(answer) + '\n');
     await appendFile(childFile, JSON.stringify(input('实际真人的回复', 10, true)) + '\n');
     const second = await detect(f.config, at(11), f.components);
-    assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 2, '明确真人回复不能压住另一会话的飞书提醒');
+    assert.equal(f.local.length, 2); assert.equal(f.feishu.length, 1, '明确真人回复说明去了其他会话，只发本机');
     assert.equal(f.local[1]!.delivery!.lastHumanAt, at(10));
     const updated = second.records.find(r => r.tool === 'codex')!.members!.find(m => m.sessionId === 'child')!;
     assert.equal(humanRequests(updated).length, 1); assert.equal(humanRequests(updated)[0]!.at, at(10));

@@ -25,7 +25,7 @@ function emptyProjection(): Projection {
   return { sessions: new Map(), seenSessions: new Set(), pushes: [], rawPushes: new Map(), validatedPushIds: new Set(),
     emptyPushIds: new Set(), deferredPushes: new Map(), pushCursors: new Map(), pushMismatches: new Map(), legacyChecks: new Map(),
     health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(),
-    telemetrySuppressions: new Set(), waitingWindows: new Map(), ruleDecisions: new Map(),
+    telemetrySuppressions: new Set(), waitingWindows: new Map(), waitingActivity: new Map(), ruleDecisions: new Map(),
     modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), noticeReplies: new Map(), feedbackSuppressions: new Set(),
     modelCalls: new Map(), channelDeliveries: new Map(), channelDeliveryStates: new Map(), deliveryAlerted: new Set() };
 }
@@ -45,7 +45,7 @@ export function unpackProjection(state: ProjectionState): Projection {
   for (const [key, initial] of Object.entries(result)) {
     const value = (state as any)[key];
     // 丙段前的检查点缺计数/告警索引；允许读取，但下方把缺历史的待发渠道显式标为未知。
-    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted', 'telemetrySuppressions', 'waitingWindows', 'ruleDecisions'].includes(key)) continue;
+    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted', 'telemetrySuppressions', 'waitingWindows', 'waitingActivity', 'ruleDecisions'].includes(key)) continue;
     if (initial instanceof Map || initial instanceof Set || Array.isArray(initial)) {
       if (!Array.isArray(value)) throw new Error(`封存状态 ${key} 结构损坏`);
       (result as any)[key] = initial instanceof Map ? new Map(value) : initial instanceof Set ? new Set(value) : [...value];
@@ -135,6 +135,11 @@ export function project(events: AgentEvent[]): Projection {
         }
         if (entry.decisionKey) result.telemetrySuppressions.add(entry.decisionKey);
         indexWaitingWindow(result.waitingWindows, entry);
+        if (entry.sessionKey && entry.memberSessionId && entry.waitingDecision?.otherHumanAt) {
+          result.waitingActivity.set(JSON.stringify([entry.sessionKey, entry.memberSessionId]), {
+            evidenceAt: entry.evidenceAt, otherHumanAt: entry.waitingDecision.otherHumanAt,
+          });
+        }
         break;
       case 'notice_planned':
         if (!notices.has(entry.notice.id)) { result.notices.push(entry.notice); notices.add(entry.notice.id); }

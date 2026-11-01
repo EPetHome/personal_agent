@@ -6,11 +6,14 @@ import type { Config } from '../src/core/types.ts';
 
 export const start = '2026-10-20T10:00:00.000Z';
 export const later = '2026-10-20T10:31:00.000Z';
-export async function sandbox() {
+// 旧回归主要检查版式、存储、渠道等，显式固定原来的5分钟测试时钟；产品默认值由
+// waiting-presence.test.ts 用 sandbox(null) 单独验，不把真实20/25分钟默认值改成测试值。
+export async function sandbox(waiting: Config['waiting'] | null = { awayMinutes: 5, otherSessionMinutes: 5 }) {
   const root = await mkdtemp(join(tmpdir(), 'personal-agent-test-'));
   const config: Config = {
     dataDir: join(root, 'data'), sources: { cc: join(root, 'cc'), codex: null, pi: null, loop: null },
     inboxDir: join(root, 'inbox'), commands: { cc: 'claude', codex: '/sample tools/codex', pi: 'pi' },
+    ...(waiting ? { waiting } : {}),
   };
   await mkdir(config.sources.cc!);
   await mkdir(config.inboxDir!);

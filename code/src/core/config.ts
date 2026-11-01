@@ -1,7 +1,7 @@
 import { readFile, realpath, lstat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { object, requiredString } from './utils.ts';
-import { tools } from './types.ts';
+import { DEFAULT_WAITING, tools } from './types.ts';
 import { OperationFailure } from './failures.ts';
 import type { Config } from './types.ts';
 
@@ -52,6 +52,11 @@ export async function validateConfig(value: unknown): Promise<Config> {
       pi: requiredString(commands.pi, 'commands.pi'),
     },
   };
+  if (data.waiting != null) {
+    const waiting = object(data.waiting, 'waiting');
+    config.waiting = Object.fromEntries(Object.entries(DEFAULT_WAITING).map(([key, fallback]) =>
+      [key, integer(waiting[key], fallback, `waiting.${key}`, 1)]));
+  }
   if (data.judge != null) {
     const judge = object(data.judge, 'judge');
     config.judge = {

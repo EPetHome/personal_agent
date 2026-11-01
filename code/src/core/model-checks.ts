@@ -1,6 +1,6 @@
-import { membersOf, mismatchedMemberIds, pushMatchesMember, sourceUnavailable } from './sessions.ts';
+import { membersOf, mismatchedMemberIds, sourceUnavailable } from './sessions.ts';
 import { indexModelEvidence, modelEvidenceFor, modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
-import { driftTrigger, humanRequests, waitingReady } from './interaction.ts';
+import { decideWaiting, driftTrigger, humanRequests, latestMemberPush, waitingEvidenceAt, waitingReady } from './interaction.ts';
 import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, judgmentReplay, piJudge, validateJudgment } from './model.ts';
@@ -42,18 +42,14 @@ function candidates(record: JudgedRecord, projection: Projection, config: Config
   const members = membersOf(source).filter(member => !mismatches.has(member.sessionId));
   if (!members.length || members.some(member => member.unavailable)) return [];
   const result: Candidate[] = [];
-  const activities = members.map(member => ({ member,
-    push: projection.pushes.filter(p => p.recordKey === record.key && pushMatchesMember(p, member) && p.at <= now
-      && member.lastActivityAt !== null && p.at >= member.lastActivityAt)
-      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1),
-  }));
+  const activities = members.map(member => ({ member, push: latestMemberPush(source, member, projection, now) }));
   if (!record.waiting) for (const { member, push } of activities) {
     if (member.sessionEnded || push?.event === 'session_end' || push?.event === 'waiting_permission' || member.pendingTools.length
       || !(member.assistantFinished || push?.event === 'turn_end')) continue;
     const reply = push?.event === 'turn_end' ? push.detail : member.assistantReply?.text ?? '';
-    const at = push?.at ?? member.lastActivityAt!;
+    const at = waitingEvidenceAt(source, member, push);
     const known = modelEvidenceFor(projection, { recordKey: record.key, sessionId: member.sessionId, task: 'waiting', evidenceAt: at });
-    if (reply.trim() && (waitingReady(member, at, now) || (!!known?.result && !known.error))) {
+    if (reply.trim() && (decideWaiting(source, member, at, projection, config, now, reply).ready || (!!known?.result && !known.error))) {
       result.push(candidate(record, member, 'waiting', reply, at, projection, config));
     }
   }
@@ -70,7 +66,18 @@ function candidates(record: JudgedRecord, projection: Projection, config: Config
         // 旧步骤没有 kind 时按文本识别最终回复，不把同时间的工具一起压住。
         const replyStep = step.kind !== 'tool' && step.kind !== 'tool_result'
           && step.text === compact(member.assistantReply?.text ?? '');
-        return !finished || !replyStep || waitingReady(member, push?.at ?? member.assistantReply?.at ?? step.at, now);
+        if (!finished || !replyStep) return true;
+        const at = push?.at ?? member.assistantReply?.at ?? step.at;
+        const reply = push?.event === 'turn_end' ? push.detail : member.assistantReply?.text ?? '';
+        const question = requestedAction(reply, member.project, '');
+        const normalize = (text: string) => text.replace(/\s+/g, ' ').trim();
+        const rawReply = normalize(reply), normalizedQuestion = normalize(question);
+        // 比较原始完整输出，只折叠空白；展示清理会丢掉表格/代码，不能据此排除跑偏。
+        // 仅允许整句问句的行内包装，不删除任何其他输出块或正文。
+        const onlyQuestion = /[？?]|(?:请|需要你|等你).*(?:确认|选择|授权|回复|提供|核销)|是否/.test(question)
+          && (rawReply === normalizedQuestion || ['**', '__', '*', '_', '`'].some(marker => rawReply === `${marker}${normalizedQuestion}${marker}`));
+        // 只有独立收尾问句沿用普通等待窗口；实质性最终文本仍按原跑偏五分钟窗口。
+        return onlyQuestion ? decideWaiting(source, member, at, projection, config, now, reply).ready : waitingReady(member, at, now);
       });
     });
     if (mismatches.size) {

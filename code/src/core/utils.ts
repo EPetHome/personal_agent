@@ -105,6 +105,8 @@ export function isHuman(text: string, ...metadata: JsonObject[]): boolean {
   // 文字可被 contentText/注入清理清空，但结构化图片仍是新输入；元数据拒绝规则优先。
   const humanText = withoutInjectedContext(text).trim();
   const hasContent = !!humanText || metadata.some(data => hasInputImage(data.content) || hasInputImage(data.message));
+  // loop 的返修也可能带 user/human 元数据；已知自动前缀优先，不把它当真人回话。
+  if (/^【(?:自动评审|门禁|自动验收)\s*·\s*第\s*\d+\s*次返修】/.test(humanText)) return false;
   if (metadata.some(data => data.origin?.kind === 'human')) return hasContent;
   return hasContent && !/^\s*(?:<task-notification[\s>]|<\/?autoreview[\s>]|\[loop\]|\[自动评审返修\])/.test(humanText);
 }

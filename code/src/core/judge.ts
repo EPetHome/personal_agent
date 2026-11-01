@@ -3,7 +3,7 @@ import { channelName, undeliveredNotices } from './delivery.ts';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
 import { pushIdentity } from './events.ts';
 import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
-import { driftTrigger, humanRequests, routeNotice, waitingReady, WAITING_INTERVAL_MS } from './interaction.ts';
+import { batchWaitingNotices, decideWaiting, driftTrigger, humanRequests, routeNotice, waitingReady, WAITING_INTERVAL_MS } from './interaction.ts';
 import { traceSuppression, traceWaitingWindows } from './telemetry.ts';
 import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
@@ -173,11 +173,18 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const memberId = waitingId ?? record.drift?.sessionId ?? record.sessionId;
     const suppress = (reason: Parameters<typeof traceSuppression>[3]) => traceSuppression(projection, suppressed,
       { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key, memberSessionId: memberId }, reason);
-    // 三类需用户处理的事实先等五分钟；只看目标成员，其他会话的真人输入不解除。
-    if (kind === 'waiting' && waitingMember && !waitingReady(waitingMember,
-      record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting!.evidenceAt, now)) {
-      const factAt = record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting!.evidenceAt;
-      suppress(humanRequests(waitingMember).some(ref => Date.parse(ref.at) > Date.parse(factAt) && ref.at <= now) ? 'user_replied' : 'waiting_interval');
+    const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.modelWaiting || record.ruleWaiting || record.drift)
+      && (!record.drift || sameModelEvidenceScope(n, record.drift))
+      && n.kind === kind && n.sessionKey === record.key && (n.memberSessionId ?? record.sessionId) === memberId
+      && Date.parse(n.evidenceAt ?? '') === Date.parse(evidenceAt)));
+    const already = !!existing;
+    const waitingDecision = kind === 'waiting' && waitingMember
+      ? decideWaiting(record, waitingMember, evidenceAt, projection, config, now,
+        modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? '', !!record.waiting) : undefined;
+    if (waitingDecision && !waitingDecision.ready && !already) {
+      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key,
+        memberSessionId: memberId, intervalMs: waitingDecision.intervalMs, waitingDecision },
+      waitingDecision.state === 'replied' ? 'user_replied' : 'waiting_interval');
       continue;
     }
     if (kind === 'drift' && record.drift) {
@@ -197,11 +204,6 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       suppress('feedback_false_positive');
       continue;
     }
-    const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.modelWaiting || record.ruleWaiting || record.drift)
-      && (!record.drift || sameModelEvidenceScope(n, record.drift))
-      && n.kind === kind && n.sessionKey === record.key && (n.memberSessionId ?? record.sessionId) === memberId
-      && Date.parse(n.evidenceAt ?? '') === Date.parse(evidenceAt)));
-    const already = !!existing;
     const recovered = kind === 'waiting' && projection.pushes.some(push => push.recovered && push.recordKey === record.key
       && (record.waiting ? pushIdentity(push) === pushIdentity(record.waiting)
         : push.event === 'turn_end' && push.sessionId === waitingId && push.at === evidenceAt));
@@ -240,6 +242,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       kind === 'waiting' && !record.waiting ? 'reply' : 'step');
     attachSnapshot(notice, finding?.snapshot?.factualStatus === factualStatus ? finding.snapshot : ruleSnapshot(input, record.project, now), projection);
     notice.memberSessionId = memberId;
+    if (waitingDecision) notice.waitingDecision = waitingDecision;
     record.notice = '待写发件记录';
     candidates.push(notice);
   }
@@ -334,7 +337,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       : { goal: intent ?? null, currentTask: null, lastOutput: compact(lastOutput, 1200), factualStatus: '看不见了' };
     candidates.push(attachSnapshot(notice, ruleSnapshot(input, affected?.project ?? '', now), projection));
   }
-  return candidates.map(notice => routeNotice(notice, projection, now));
+  return batchWaitingNotices(candidates.map(notice => routeNotice(notice, projection, now)));
 }
 export function renderOverview(records: JudgedRecord[], projection: Projection): string {
   const lines = ['工具 | 项目 | 意图 | 状态 | 最后活动时间 | 提醒'];

@@ -1,5 +1,5 @@
 import { hash } from './utils.ts';
-import { driftTrigger, humanRequests, WAITING_INTERVAL_MS } from './interaction.ts';
+import { decideWaiting, driftTrigger, humanRequests, latestMemberPush, waitingEvidenceAt, WAITING_INTERVAL_MS } from './interaction.ts';
 import { membersOf } from './sessions.ts';
 import type { Config, EventPayload, Projection, SessionRecord, SuppressionReason, WaitingWindow } from './types.ts';
 
@@ -30,7 +30,8 @@ export function advanceWaitingWindows(windows: Map<string, WaitingWindow>, recor
 export function traceSuppression(projection: Projection, output: EventPayload[] | undefined,
   target: Omit<Suppression, 'kind' | 'reason' | 'decisionKey'>, reason: SuppressionReason): void {
   if (!output) return;
-  const decisionKey = hash(JSON.stringify([target.dedupeKey, target.evidenceAt, target.scope, reason]));
+  const decisionKey = hash(JSON.stringify([target.dedupeKey, target.evidenceAt, target.scope, reason,
+    ...(target.waitingDecision ? [target.waitingDecision.state, target.waitingDecision.intervalMs, target.waitingDecision.otherHumanAt] : [])]));
   if (projection.telemetrySuppressions.has(decisionKey)) return;
   projection.telemetrySuppressions.add(decisionKey);
   output.push({ kind: 'notice_suppressed', ...target, reason, decisionKey });
@@ -55,8 +56,7 @@ export function traceWaitingWindows(record: SessionRecord, projection: Projectio
       memberSessionId: trigger.sessionId, scope: 'notice', intervalMs: WAITING_INTERVAL_MS, reply }, 'user_replied');
   }
   for (const member of members) {
-    const push = projection.pushes.filter(p => p.recordKey === record.key && p.sessionId === member.sessionId && p.at <= now)
-      .sort((a, b) => a.at.localeCompare(b.at) || ['waiting_permission', 'turn_end', 'session_end'].indexOf(a.event) - ['waiting_permission', 'turn_end', 'session_end'].indexOf(b.event)).at(-1);
+    const push = latestMemberPush(record, member, projection, now);
     const facts = new Map<string, WaitingWindow>();
     const include = (window: WaitingWindow) => {
       const key = JSON.stringify([waitingWindowKey(window), window.evidenceAt]);
@@ -66,14 +66,17 @@ export function traceWaitingWindows(record: SessionRecord, projection: Projectio
     const current = (evidenceAt: string, scope: WaitingWindow['scope']) => include({ evidenceAt, scope,
       dedupeKey: `waiting:${record.key}:${member.sessionId}`, sessionKey: record.key, memberSessionId: member.sessionId, intervalMs: WAITING_INTERVAL_MS });
     if (push?.event === 'waiting_permission') current(push.at, 'notice');
-    if (config.judge && member.assistantReply) current(member.assistantReply.at, 'model_check');
+    if (config.judge && (member.assistantReply || push?.event === 'turn_end')) current(waitingEvidenceAt(record, member, push), 'model_check');
     for (const fact of facts.values()) {
       if (projection.notices.some(n => n.kind === 'waiting' && n.sessionKey === record.key
         && (n.memberSessionId ?? record.sessionId) === member.sessionId && n.evidenceAt === fact.evidenceAt)) continue;
       const reply = humanRequests(member).find(ref => Date.parse(ref.at) > Date.parse(fact.evidenceAt) && Date.parse(ref.at) <= Date.parse(now));
-      const target = { ...fact, ...(reply ? { reply: { ...reply, sessionId: member.sessionId } } : {}) };
+      const waitingDecision = decideWaiting(record, member, fact.evidenceAt, projection, config, now,
+        push?.at === fact.evidenceAt ? push.detail : member.assistantReply?.text ?? '', push?.at === fact.evidenceAt && push.event === 'waiting_permission');
+      const target = { ...fact, intervalMs: waitingDecision.intervalMs, waitingDecision,
+        ...(reply ? { reply: { ...reply, sessionId: member.sessionId } } : {}) };
       if (reply) traceSuppression(projection, output, target, 'user_replied');
-      else if ((push?.at === fact.evidenceAt || member.assistantFinished) && Date.parse(now) - Date.parse(fact.evidenceAt) < fact.intervalMs) {
+      else if ((push?.at === fact.evidenceAt || member.assistantFinished) && !waitingDecision.ready) {
         traceSuppression(projection, output, target, 'waiting_interval');
       }
     }

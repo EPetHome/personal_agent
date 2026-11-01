@@ -10,7 +10,7 @@ export function localChannel(dataDir: string, config: NonNullable<Config['localC
     name: 'local',
     async send(notice) {
       if (notice.level !== '现在就要你') return;
-      await runCommand(config.executable, ['-e', script, '--', notice.content.title, localNoticeText(notice)], config.timeoutMs);
+      await runCommand(config.executable, ['-e', script, '--', notice.localBatch?.title ?? notice.content.title, localNoticeText(notice)], config.timeoutMs);
     },
     receive: reply => receiveFeedback(dataDir, 'local', reply),
   };

@@ -96,9 +96,11 @@ function parseRows(rows: Iterable<JsonObject>, original: Original): SessionRecor
     const at = iso(row.timestamp);
     record.lastActivityAt = at > record.lastActivityAt ? at : record.lastActivityAt;
     if (message.role === 'user') {
-      if (message.human) addIntent(record, message.content, at);
-      record.assistantFinished = false;
-      record.sessionEnded = false;
+      if (message.human) {
+        addIntent(record, message.content, at);
+        record.assistantFinished = false;
+        record.sessionEnded = false;
+      }
     } else if (message.role === 'assistant') {
       record.sessionEnded = false;
       for (const b of message.content) {

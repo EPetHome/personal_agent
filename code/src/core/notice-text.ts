@@ -53,6 +53,8 @@ export function noticeTimeAndReturn(notice: Notice): string {
 export function localNoticeText(notice: Notice): string {
   // 紧急告警已由固定模板生成；不能再截短卡片标题/原因，或把类别中的下划线去掉。
   if (notice.kind === 'delivery_failed' || notice.kind === 'storage_full') return notice.content.summary;
+  if (notice.localBatch) return `${notice.localBatch.title}\n${notice.localBatch.entries.map(entry =>
+    `${entry.project.split('/').at(-1) || entry.project} · ${entry.sessionId}\n${entry.returnCommand}`).join('\n\n')}`;
   const raw = noticeSections(notice.content), sections = noticeSections(presentNotice(notice.content, raw.situation, raw.action, notice.at));
   const items = notice.content.actionItems ?? notice.snapshot?.actionItems;
   const action = items?.length ? `【${items[0]!.label}】${items[0]!.text}（共 ${items.length} 件）` : sections.action;

@@ -19,6 +19,24 @@ export interface Config {
   relay?: { enabled: boolean; ccSessionsDir?: string; timeoutMs?: number };
   service?: { intervalMs: number; restartWindowMs: number; restartThreshold: number };
   learning?: boolean;
+  /** 「在等你」专用；分钟，启动时读取，缺省使用起步值。 */
+  waiting?: Partial<WaitingConfig>;
+}
+export interface WaitingConfig {
+  awayMinutes: number;
+  otherSessionMinutes: number;
+  inactiveMinutes: number;
+  activeConversationMinutes: number;
+}
+export const DEFAULT_WAITING: Readonly<WaitingConfig> = { awayMinutes: 20, otherSessionMinutes: 25, inactiveMinutes: 5, activeConversationMinutes: 10 };
+export interface WaitingDecision {
+  evidenceAt: string;
+  activeConversation: boolean;
+  state: 'same_session' | 'other_session' | 'away' | 'replied';
+  intervalMs: number;
+  ready: boolean;
+  redline: boolean;
+  otherHumanAt?: string;
 }
 export interface FeishuConfig {
   mode: 'fake' | 'real';
@@ -343,7 +361,11 @@ export interface Notice {
   /** 健康提醒能定位会话时的反馈作用域；未知会话不得压住整个来源。 */
   feedbackScope?: string;
   snapshot?: TaskSnapshot;
-  /** 新卡按级别选出口，在场仅留痕；旧决定/重试不改出口，缺字段的旧卡仍按级别。 */
+  /** 等候规则只适用于新等待事实；旧卡/重试不重新分流。 */
+  waitingDecision?: WaitingDecision;
+  /** 同轮到点的本机等候提醒共用批次；逐会话事实/飞书卡片不合并。 */
+  localBatch?: { id: string; title: string; entries: { noticeId: string; sessionId: string; project: string; returnCommand: string }[] };
+  /** 新等待卡按会话活动选出口；其他类别仍按级别，旧决定/重试不改出口。 */
   delivery?: { presence: '在场' | '不在场'; channels: ('local' | 'feishu')[]; decidedAt: string; lastHumanAt?: string };
   content: NoticeContent;
   text: string;
@@ -394,7 +416,7 @@ export type EventPayload =
   | { kind: 'notice_planned'; notice: Notice }
   | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string; reason?: SuppressionReason;
       scope?: 'notice' | 'model_check'; decisionKey?: string; sessionKey?: string; memberSessionId?: string;
-      reply?: RequestRef; intervalMs?: number }
+      reply?: RequestRef; intervalMs?: number; waitingDecision?: WaitingDecision }
   | { kind: 'notices_delivered'; ids: string[] }
   | { kind: 'model_call_started'; task: JudgmentTask | 'snapshot' | 'attribution' | 'same_problem'; key: string }
   | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot; replay?: ModelReplay }
@@ -430,6 +452,8 @@ export interface Projection {
   telemetrySuppressions: Set<string>;
   /** 已观察、尚未结算的等待事实；只供埋点，不参与推送或模型候选决策。 */
   waitingWindows: Map<string, WaitingWindow>;
+  /** 每个成员当前等待的跨会话活动锁存；来自新增事件字段，兼容旧检查点。 */
+  waitingActivity: Map<string, { evidenceAt: string; otherHumanAt: string }>;
   ruleDecisions: Map<string, RuleObservation>;
   modelChecks: Map<string, ModelCheck>;
   /** 所有历史证据的判断索引；由旧/新事件重建，不改写日志。 */
