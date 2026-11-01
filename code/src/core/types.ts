@@ -1,3 +1,5 @@
+import type { IntelligenceConfig, IntelligenceEvent, IntelligenceState } from './intelligence-types.ts';
+
 export const tools = ['cc', 'codex', 'pi', 'loop'] as const;
 export type Tool = typeof tools[number];
 export type HealthSource = Tool | 'inbox';
@@ -21,6 +23,8 @@ export interface Config {
   learning?: boolean;
   /** 「在等你」专用；分钟，启动时读取，缺省使用起步值。 */
   waiting?: Partial<WaitingConfig>;
+  /** 带只读工具的后台分析；沿用 judge 的模型，不占其每日额度。 */
+  intelligence?: IntelligenceConfig;
 }
 export interface WaitingConfig {
   awayMinutes: number;
@@ -305,13 +309,28 @@ export interface SourceComponent {
   parse(text: string, original: Original, context?: SourceReadContext): SessionRecord | null;
 }
 export type Status = '进行中' | '在等我' | '已完成' | '停滞' | '已搁置' | '看不见了' | '疑似跑偏';
+export interface WaitingReply { sessionId: string; evidenceAt: string; reply: string }
+export interface AnalysisWaiting extends WaitingReply { analysisId: string }
+export type MemberWaitingFact =
+  | { kind: 'permission'; waiting: PushRecord }
+  | { kind: 'model'; modelWaiting: ModelFinding }
+  | { kind: 'rule'; ruleWaiting: WaitingReply }
+  | { kind: 'analysis'; analysisWaiting: AnalysisWaiting }
+  | { kind: 'redline'; programWaiting: WaitingReply };
 export interface JudgedRecord extends SessionRecord {
   status: Status;
   reason: string;
   rule?: RuleDecision;
   waiting?: PushRecord;
   modelWaiting?: ModelFinding;
-  ruleWaiting?: { sessionId: string; evidenceAt: string; reply: string };
+  ruleWaiting?: WaitingReply;
+  /** 新分析的等候事实；不复用 ruleWaiting（明确问句兜底）或旧模型字段。 */
+  analysisWaiting?: AnalysisWaiting;
+  /** 程序原始红线，不能被其他成员或模型否答案吞掉。 */
+  programWaiting?: WaitingReply;
+  /** 全部当前成员等待事实；上面的单值只作聚合展示，不决定其他成员是否提醒。 */
+  memberWaitings?: MemberWaitingFact[];
+  intelligenceNote?: string;
   drift?: ModelFinding;
   modelNotes?: string[];
   notice?: '待写发件记录' | '已提醒，本轮去重' | '首次接入历史记录，不补发' | '因你的误报没提醒';
@@ -352,7 +371,7 @@ export interface Notice {
   dedupeKey: string;
   at: string;
   tool: HealthSource | 'agent';
-  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed' | 'weekly' | 'recurrence' | 'service_restart' | 'delivery_failed' | 'storage_full';
+  kind: 'waiting' | 'drift' | 'stalled' | 'blind' | 'unreadable' | 'loop_paused' | 'loop_completed' | 'weekly' | 'recurrence' | 'service_restart' | 'delivery_failed' | 'storage_full' | 'daily';
   level: '现在就要你' | '有空看';
   sessionKey?: string;
   memberSessionId?: string;
@@ -370,6 +389,7 @@ export interface Notice {
   content: NoticeContent;
   text: string;
   reviews?: ReviewItem[];
+  intelligencePeriod?: { from: string; to: string };
 }
 export interface ReviewItem {
   experienceId: string;
@@ -399,7 +419,7 @@ export interface ChannelDeliveryState {
 }
 export type ProjectionState = { [K in keyof Omit<Projection, 'snapshotSessions'>]:
   Projection[K] extends Map<infer A, infer B> ? [A, B][] : Projection[K] extends Set<infer V> ? V[] : Projection[K] };
-export type EventPayload =
+export type EventPayload = IntelligenceEvent
   | { kind: 'store_format'; format: 2; backup?: string }
   | { kind: 'store_checkpoint'; format: 2; sequence: number; archive: string; archives: string[]; state: ProjectionState }
   | { kind: 'session_delta'; delta: import('./session-delta.ts').SessionDelta }
@@ -427,7 +447,7 @@ export type EventPayload =
   | { kind: 'channel_delivery_history_restored'; checkpointId: string; states: [string, ChannelDeliveryState][]; backup: string }
   | { kind: 'feishu_connection'; connection: FeishuConnection };
 export type AgentEvent = EventPayload & { version: 1; id: string; at: string; codeVersion?: CodeVersion };
-export interface Projection {
+export interface Projection extends IntelligenceState {
   sessions: Map<string, SessionRecord>;
   /** 内存中的最后可见事实，供读取故障卡片使用，不复活成当前正常会话。 */
   snapshotSessions?: ReadonlyMap<string, SessionRecord>;

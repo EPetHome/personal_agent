@@ -1,11 +1,14 @@
 import { readFeedback } from './feedback.ts';
-import { readOutbox } from './store.ts';
+import { readEvents, readOutbox, withStoreLock } from './store.ts';
+import { project } from './events.ts';
+import { intelligenceStatistics, renderIntelligenceStatistics } from './intelligence-statistics.ts';
+import type { ShadowStatisticCell } from './intelligence-statistics.ts';
 import { iso } from './utils.ts';
 import { toolNames } from './types.ts';
 import { localTime } from './notice-text.ts';
 import type { Feedback, Notice } from './types.ts';
 
-export const kindNames: Record<Notice['kind'], string> = { waiting: '在等你', drift: '疑似跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成', weekly: '每周小结', recurrence: '同类问题', service_restart: '常驻重启', delivery_failed: '提醒未送达', storage_full: '磁盘已满' };
+export const kindNames: Record<Notice['kind'], string> = { waiting: '在等你', drift: '疑似跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成', weekly: '每周小结', recurrence: '同类问题', service_restart: '常驻重启', delivery_failed: '提醒未送达', storage_full: '磁盘已满', daily: '每日汇总' };
 export function localDate(value: Date | string): string {
   const date = typeof value === 'string' ? new Date(value) : value;
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
@@ -15,7 +18,7 @@ export interface StatisticCell {
   tool: string; kind: string; sent: number; correct: number; falsePositive: number; missed: number; unreadable: number; responded: number;
   accuracy: number | null; responseRate: number | null; perDay: number; daily: Record<string, number>; sufficient: boolean;
 }
-export interface Statistics { from: string; to: string; cells: StatisticCell[] }
+export interface Statistics { from: string; to: string; cells: StatisticCell[]; shadow?: ShadowStatisticCell[] }
 export function feedbackCategory(feedback: Feedback, linked?: Notice): { tool: string; kind: string } {
   if (linked) return { tool: linked.tool, kind: linked.kind };
   const text = feedback.comment;
@@ -26,7 +29,7 @@ export function feedbackCategory(feedback: Feedback, linked?: Notice): { tool: s
 /** 每个提醒只取截至统计时刻的最后一次正确/误报；漏报逐条计数；无回应绝不算正确。 */
 export function calculateStatistics(notices: Notice[], feedback: Feedback[], nowInput: string, fromInput?: string): Statistics {
   const now = iso(nowInput), from = iso(fromInput ?? weekStart(now));
-  const included = notices.filter(n => !['weekly', 'recurrence', 'service_restart'].includes(n.kind));
+  const included = notices.filter(n => !['weekly', 'recurrence', 'service_restart', 'daily'].includes(n.kind));
   const lookup = new Map(included.map(n => [n.id, n]));
   const cells = new Map<string, StatisticCell>();
   const startDate = new Date(from), endDate = new Date(now);
@@ -66,9 +69,10 @@ export function calculateStatistics(notices: Notice[], feedback: Feedback[], now
   return { from, to: now, cells: [...cells.values()].sort((a, b) => a.tool.localeCompare(b.tool) || a.kind.localeCompare(b.kind)) };
 }
 export async function statistics(dataDir: string, now = new Date().toISOString()): Promise<Statistics> {
-  return calculateStatistics(await readOutbox(dataDir), await readFeedback(dataDir), now);
+  const stats = calculateStatistics(await readOutbox(dataDir), await readFeedback(dataDir), now);
+  return { ...stats, shadow: intelligenceStatistics(project(await withStoreLock(dataDir, () => readEvents(dataDir), 30000)), stats.from, stats.to) };
 }
 export function renderStatistics(stats: Statistics): string {
   const percent = (n: number | null) => n === null ? '—' : `${(n * 100).toFixed(1)}%`;
-  return [`反馈统计（${localTime(stats.from, stats.to)} ～ ${localTime(stats.to, stats.to)}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 看不懂 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${c.unreadable} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈'])].join('\n');
+  return [`反馈统计（${localTime(stats.from, stats.to)} ～ ${localTime(stats.to, stats.to)}）`, '工具 × 提醒类型 | 发出 | 正确 / 误报 | 准确率 | 漏了 | 看不懂 | 回应率 | 每天叫几次', ...stats.cells.map(c => `${toolNames[c.tool as keyof typeof toolNames] ?? c.tool} × ${kindNames[c.kind as Notice['kind']] ?? c.kind} | ${c.sent} | ${c.correct} / ${c.falsePositive} | ${percent(c.accuracy)} | ${c.missed} | ${c.unreadable} | ${percent(c.responseRate)}（${c.responded}/${c.sent}） | ${c.perDay.toFixed(2)}${c.sufficient ? '' : '（不足 20 条，只列数字）'}\n  每日：${Object.entries(c.daily).map(([date, n]) => `${date} ${n}`).join('；') || '0'}`), ...(stats.cells.length ? [] : ['暂无发件或反馈']), ...(stats.shadow?.length ? [renderIntelligenceStatistics(stats.shadow)] : [])].join('\n');
 }

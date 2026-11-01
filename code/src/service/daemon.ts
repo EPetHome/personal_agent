@@ -55,7 +55,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
   try {
-    for (const name of ['.detect.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock']) await recoverDeadLock(dir, name);
+    for (const name of ['.detect.lock', '.analysis.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock']) await recoverDeadLock(dir, name);
     const history = await readJsonl<RunEvent>(runsPath);
     const at = new Date().toISOString();
     await appendJsonl(runsPath, [{ kind: 'start', at, runId, pid: process.pid, codeVersion } satisfies RunEvent]);

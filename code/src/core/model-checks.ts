@@ -5,6 +5,8 @@ import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { boundedContext, judgmentReplay, piJudge, validateJudgment } from './model.ts';
 import { traceSuppression } from './telemetry.ts';
+import { analysisId, intelligenceEnabled } from './intelligence.ts';
+import { addMemberWaiting } from './waiting-facts.ts';
 import { protectReplay } from './replay.ts';
 import { compact, hash } from './utils.ts';
 import { ComponentFailure, safeFailure } from './process.ts';
@@ -43,12 +45,14 @@ function candidates(record: JudgedRecord, projection: Projection, config: Config
   if (!members.length || members.some(member => member.unavailable)) return [];
   const result: Candidate[] = [];
   const activities = members.map(member => ({ member, push: latestMemberPush(source, member, projection, now) }));
-  if (!record.waiting) for (const { member, push } of activities) {
+  for (const { member, push } of activities) {
     if (member.sessionEnded || push?.event === 'session_end' || push?.event === 'waiting_permission' || member.pendingTools.length
       || !(member.assistantFinished || push?.event === 'turn_end')) continue;
     const reply = push?.event === 'turn_end' ? push.detail : member.assistantReply?.text ?? '';
     const at = waitingEvidenceAt(source, member, push);
     const known = modelEvidenceFor(projection, { recordKey: record.key, sessionId: member.sessionId, task: 'waiting', evidenceAt: at });
+    const analysis = projection.analysisResults.get(analysisId(record.key, member.sessionId, at, reply));
+    if (intelligenceEnabled(config) && analysis?.output && !analysis.failure) continue;
     if (reply.trim() && (decideWaiting(source, member, at, projection, config, now, reply).ready || (!!known?.result && !known.error))) {
       result.push(candidate(record, member, 'waiting', reply, at, projection, config));
     }
@@ -203,6 +207,7 @@ function ruleWaiting(record: JudgedRecord, item: Candidate, now: string): void {
   const question = requestedAction(item.context.assistantReply, record.project, '');
   if (!question || !/[？?]|(?:请|需要你|等你).*(?:确认|选择|授权|回复|提供|核销)|是否/.test(question)) return;
   record.ruleWaiting = { sessionId: item.sessionId, evidenceAt: item.evidenceAt, reply: item.context.assistantReply };
+  addMemberWaiting(record, { kind: 'rule', ruleWaiting: record.ruleWaiting });
   record.status = '在等我';
   if (record.rule) record.rule = { ...record.rule, id: 'fallback_explicit_question' };
   record.reason = '判断模型不可用，仅按助手最后一个明确问题兜底；尚需你回复或确认';
@@ -241,6 +246,7 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
       const finding = { ...check, result: check.result };
       if (item.task === 'waiting') {
         record.modelWaiting = finding;
+        addMemberWaiting(record, { kind: 'model', modelWaiting: finding });
         record.status = '在等我';
         record.reason = `模型判断可能在等你回复：${check.result.reason}`;
       } else if (!record.modelWaiting && !record.ruleWaiting && !record.waiting) applyDrift(record, finding);
