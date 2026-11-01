@@ -8,6 +8,9 @@ import { maintain } from './maintenance.ts';
 import type { ExperienceModel } from './learning.ts';
 import { applyModelChecks, checkModels } from './model-checks.ts';
 import { checkSnapshotModels } from './snapshot-model.ts';
+import { analysisCandidates, applyAnalyses, intelligenceEnabled, intelligenceWorkPending, observeShadowDecisions, observeShadowOutcomes, requestAnalyses, shadowGuardChanges } from './intelligence.ts';
+import { launchIntelligenceWorker, startInjectedWorker } from './intelligence-worker.ts';
+import type { IntelligenceModel } from './intelligence-types.ts';
 import { noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
 import { nextNoticeReplies, routeNotice } from './interaction.ts';
 import { isIgnoredProject, validateConfig } from './config.ts';
@@ -27,6 +30,10 @@ import { codeVersion } from './runtime-version.ts';
 import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Notice, Projection } from './types.ts';
 
 export interface Snapshot { at: string; eventId: string | null; records: JudgedRecord[]; projection: Projection }
+// 只等后台的短暂落盘锁，不等模型；纯规则/旧替身仍保留原有立即报锁忙的行为。
+function detectionLock<T>(config: Config, operation: () => Promise<T>): Promise<T> {
+  return withStoreLock(config.dataDir, operation, intelligenceEnabled(config) ? 1000 : 0);
+}
 function activeProjection(projection: Projection, config: Config): Projection {
   const pushMismatches = new Map([...projection.pushMismatches].filter(([, mismatch]) => config.inboxDir !== null
     && config.sources[mismatch.push.tool] !== null && !isIgnoredProject(mismatch.push.project, config)
@@ -89,6 +96,7 @@ async function snapshot(events: AgentEvent[], config: Config, now?: string): Pro
   const projection = activeProjection(await feedbackProjection(raw, config, at), config);
   const records = judgeRecords(projection, at);
   applyModelChecks(records, projection, config, at);
+  applyAnalyses(records, projection, config, at);
   planNotices(records, projection, config, at);
   // 查询不投递；只有交付确认事件才算已发，其余候选明确标为待写发件。
   return { at, eventId: events.at(-1)?.id ?? null, records, projection };
@@ -116,6 +124,14 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
     if (changed.length) entry.ruleDecisions = changed;
   }
   applyModelChecks(records, projection, config, at);
+  const analyses = analysisCandidates(projection, config, at);
+  applyAnalyses(records, projection, config, at, analyses);
+  for (const payload of requestAnalyses(projection, config, at, analyses)) add(payload);
+  for (const payload of observeShadowOutcomes(projection, at)) add(payload);
+  for (const payload of shadowGuardChanges(projection, at)) {
+    add(payload);
+    if (payload.kind === 'shadow_guard') projection.shadowGuards.set(payload.guard.category, payload.guard);
+  }
   const suppressed: EventPayload[] = [];
   const planned = planNotices(records, projection, config, at, suppressed).filter(n =>
     (!deferSnapshots || !standaloneSnapshot(n) || projection.noticeSnapshots.has(noticeSnapshotKey(n)))
@@ -123,6 +139,7 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   for (const decision of suppressed) add(decision);
   for (const notice of planned) add({ kind: 'notice_planned', notice });
   const queued = activeProjection(project([...events, ...added]), config);
+  for (const payload of observeShadowDecisions(queued, at)) add(payload);
   for (const channel of channels) for (const notice of queued.notices) {
     if (!accepts(channel, notice) || isFeedbackSuppressed(notice, projection.feedbackSuppressions)) continue;
     const key = `${channel.name}:${notice.id}`;
@@ -203,19 +220,21 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   return { ...view, noticesAdded };
 }
 export async function publishNotices(config: Config, notices: Notice[], now: string, channels = configuredChannels(config), attempted = new Set<string>()) {
-  return withStorageAlerts(config, channels, () => withStoreLock(config.dataDir, async () => {
+  return withStorageAlerts(config, channels, () => detectionLock(config, async () => {
     const events = await prepareEventLog(config.dataDir, now), known = new Set(project(events).notices.map(n => n.id));
     const added = notices.filter(n => !known.has(n.id)).map(notice => event({ kind: 'notice_planned', notice }, now));
     return settle(config, events, added, now, channels, attempted);
   }), false);
 }
-export async function detect(configInput: Config, currentTime = new Date().toISOString(), components: { judge?: Judge; channels?: Channel[]; experienceModel?: ExperienceModel } = {}) {
+export async function detect(configInput: Config, currentTime = new Date().toISOString(), components: { judge?: Judge; channels?: Channel[]; experienceModel?: ExperienceModel; intelligenceModel?: IntelligenceModel } = {}) {
   const config = await validateConfig(configInput);
   const now = iso(currentTime, '当前时间');
   const channels = components.channels ?? configuredChannels(config);
-  return withStorageAlerts(config, channels, () => detectOnce(config, now, channels, components));
+  // 注入旧判断替身但未提供智能替身时不偷偷调用真实账号；旧回归仍只测原链路。
+  const effective = components.judge && !components.intelligenceModel ? { ...config, intelligence: { ...config.intelligence, enabled: false } } : config;
+  return withStorageAlerts(effective, channels, () => detectOnce(effective, now, channels, components));
 }
-async function detectOnce(config: Config, now: string, channels: Channel[], components: { judge?: Judge; experienceModel?: ExperienceModel }) {
+async function detectOnce(config: Config, now: string, channels: Channel[], components: { judge?: Judge; experienceModel?: ExperienceModel; intelligenceModel?: IntelligenceModel }) {
   const attempted = new Set<string>();
   let modelDeadline = Infinity;
   const deferSnapshots = !!config.judge && (!components.judge || !!components.judge.writeSnapshot);
@@ -228,7 +247,7 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
     const settled = await publishNotices(config, supplemental, now, channels, attempted);
     return { ...settled, noticesAdded: view.noticesAdded + settled.noticesAdded };
   };
-  const ruleView = await withStoreLock(config.dataDir, async () => {
+  const ruleView = await detectionLock(config, async () => {
     const events = await prepareEventLog(config.dataDir, now);
     const previous = project(events);
     const input = normalize(await perceive(config), previous.sessions.values(), config);
@@ -316,15 +335,20 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
     // 普通等待留到本轮模型队列结算后一起发；故障仍走原来的即时通道。
     return settle(config, events, added, now, channels, attempted, deferSnapshots, !!config.judge);
   });
+  if (intelligenceEnabled(config) && intelligenceWorkPending(ruleView.projection, now)) {
+    if (components.intelligenceModel) startInjectedWorker(config, now, components.intelligenceModel);
+    else launchIntelligenceWorker(config, now);
+  }
   if (!config.judge) return finish(ruleView);
   modelDeadline = Date.now() + (config.judge.cycleTimeoutMs ?? 60000);
   const modelView = await withModelLock(config.dataDir, async () => {
-    const load = () => withStoreLock(config.dataDir, async () => activeProjection(await feedbackProjection(project(await readEvents(config.dataDir)), config, now), config));
+    const load = () => detectionLock(config, async () => activeProjection(await feedbackProjection(project(await readEvents(config.dataDir)), config, now), config));
     let projection = await load();
     let records = judgeRecords(projection, now);
     applyModelChecks(records, projection, config, now);
+    applyAnalyses(records, projection, config, now);
     const pending = planNotices(records, projection, config, now);
-    const persist = (payload: EventPayload) => withStoreLock(config.dataDir, async () => {
+    const persist = (payload: EventPayload) => detectionLock(config, async () => {
       if (payload.kind === 'model_call_started') {
         // 短锁内按最新日志原子预留；不能拿模型阶段开始时的旧额度覆盖并发用量。
         const used = project(await readEvents(config.dataDir)).modelCalls.get(now.slice(0, 10)) ?? 0;
@@ -334,24 +358,25 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
       return true;
     });
     const snapshots = await checkSnapshotModels(pending, projection, config, now, persist, components.judge, modelDeadline);
-    const early = snapshots ? await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted, true, true)) : null;
+    const early = snapshots ? await detectionLock(config, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted, true, true)) : null;
     projection = await load();
     records = judgeRecords(projection, now);
     const remainingConfig = { ...config, judge: { ...config.judge!, cycleTimeoutMs: Math.max(0, modelDeadline - Date.now()) } };
     const changed = await checkModels(records, projection, remainingConfig, now, persist, components.judge);
     if (!changed && !pending.some(n => n.kind === 'waiting' && !n.waitingDecision?.redline)) return early;
-    const final = await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
+    const final = await detectionLock(config, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
     return { ...final, noticesAdded: (early?.noticesAdded ?? 0) + final.noticesAdded };
   });
   return finish(modelView ? { ...modelView, noticesAdded: ruleView.noticesAdded + modelView.noticesAdded } : ruleView);
 }
 export async function overview(configInput: Config, now?: string): Promise<Snapshot> {
   const config = await validateConfig(configInput);
-  return snapshot(await readEvents(config.dataDir), config, now);
+  return intelligenceEnabled(config) ? detectionLock(config, async () => snapshot(await readEvents(config.dataDir), config, now))
+    : snapshot(await readEvents(config.dataDir), config, now);
 }
 export async function rebuild(configInput: Config, now?: string): Promise<Snapshot> {
   const config = await validateConfig(configInput);
-  return withStoreLock(config.dataDir, async () => {
+  return detectionLock(config, async () => {
     const at = now ?? project(await readEvents(config.dataDir)).lastScanAt ?? new Date().toISOString();
     const view = await snapshot(await prepareEventLog(config.dataDir, at), config, now);
     await writeState(config.dataDir, serializedState(view));

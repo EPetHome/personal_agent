@@ -9,6 +9,8 @@ import { isSafeFailure, OperationFailure } from './failures.ts';
 import { isChannelDeliveryState, unpackProjection } from './events.ts';
 import { validateSessionDelta } from './session-delta.ts';
 import type { AgentEvent, Notice } from './types.ts';
+import { INTELLIGENCE_KINDS, validateIntelligenceEvent } from './intelligence-types.ts';
+import type { IntelligenceEvent } from './intelligence-types.ts';
 
 async function exists(path: string): Promise<boolean> {
   try { await lstat(path); return true; }
@@ -49,11 +51,12 @@ export function parseEventLog(text: string): AgentEvent[] {
   return validateEvents(parseJsonl<AgentEvent>(text, '封存事件'));
 }
 function validateEvents(rows: AgentEvent[]): AgentEvent[] {
-  const kinds = ['store_format', 'store_checkpoint', 'session_delta', 'push_mismatches', 'session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'notice_reply_observed', 'channel_delivery', 'notice_delivery_alerted', 'channel_delivery_history_restored'];
+  const kinds: string[] = [...INTELLIGENCE_KINDS, 'store_format', 'store_checkpoint', 'session_delta', 'push_mismatches', 'session_observed', 'session_seen', 'push_observed', 'push_validated', 'push_empty', 'feishu_connection', 'push_deferred', 'push_cursor', 'source_health', 'scan_completed', 'notice_planned', 'notice_suppressed', 'notices_delivered', 'model_call_started', 'model_checked', 'notice_snapshot_written', 'notice_reply_observed', 'channel_delivery', 'notice_delivery_alerted', 'channel_delivery_history_restored'];
   for (const row of rows) {
     if (!row || row.version !== 1 || typeof row.id !== 'string' || typeof row.at !== 'string' || !kinds.includes(row.kind)) {
       throw new Error('events.jsonl 事件版本/结构不受支持；未改写，请先备份再恢复');
     }
+    if ((INTELLIGENCE_KINDS as readonly string[]).includes(row.kind)) validateIntelligenceEvent(row as IntelligenceEvent);
     if (row.kind === 'store_format' && row.format !== 2) throw new Error('不支持的数据格式');
     if (row.kind === 'store_checkpoint') {
       if (row !== rows[0] || row.format !== 2 || !Number.isSafeInteger(row.sequence) || row.sequence < 1

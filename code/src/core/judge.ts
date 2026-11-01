@@ -5,6 +5,8 @@ import { pushIdentity } from './events.ts';
 import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
 import { batchWaitingNotices, decideWaiting, driftTrigger, humanRequests, routeNotice, waitingReady, WAITING_INTERVAL_MS } from './interaction.ts';
 import { traceSuppression, traceWaitingWindows } from './telemetry.ts';
+import { analysisSnapshot, shouldBlockWaiting, waitingAnalysis } from './intelligence.ts';
+import { addMemberWaiting, mergeWaitingViews, permissionReason, waitingFactViews } from './waiting-facts.ts';
 import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
 import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
@@ -62,9 +64,7 @@ export function judgeRecords(projection: Projection, now: string): JudgedRecord[
     } else if (waiting?.waiting) {
       ruleId = 'permission_waiting';
       judged.status = '在等我';
-      judged.reason = waiting.member.unavailable
-        ? `子会话本轮读不了，保留最后一次已对账的等授权事实，尚无解除证据：${waiting.waiting.detail}`
-        : `${waiting.member.sessionId === record.sessionId ? '会话' : '子会话'}收到等授权事件，该会话之后没有新动静：${waiting.waiting.detail}`;
+      judged.reason = permissionReason(record, waiting.member, waiting.waiting);
       judged.waiting = waiting.waiting;
     } else if (activities.some(a => a.member.unavailable)) {
       ruleId = 'member_unavailable';
@@ -86,6 +86,9 @@ export function judgeRecords(projection: Projection, now: string): JudgedRecord[
         sessionEnded: member.sessionEnded, assistantFinished: member.assistantFinished, pendingTools: member.pendingTools.length,
         unavailable: !!member.unavailable, completed, ...(push ? { pushEvent: push.event, pushAt: push.at } : {}) })),
     } };
+    if (judged.status !== '已搁置' && !sourceUnavailable(projection, record.tool)) {
+      for (const activity of activities) if (activity.waiting) addMemberWaiting(judged, { kind: 'permission', waiting: activity.waiting });
+    }
     return judged;
   }).sort((a, b) => a.tool.localeCompare(b.tool) || a.project.localeCompare(b.project) || a.key.localeCompare(b.key));
 }
@@ -127,20 +130,24 @@ function attachSnapshot(notice: Notice, value: TaskSnapshot, projection: Project
   return notice;
 }
 export function planNotices(records: JudgedRecord[], projection: Projection, config: Config, now: string, suppressed?: EventPayload[]): Notice[] {
-  const candidates: Notice[] = [];
+  const candidates: Notice[] = [], memberViews = new Map<JudgedRecord, JudgedRecord[]>();
   for (const record of records) {
     traceWaitingWindows(record, projection, config, now, suppressed);
+    const views = waitingFactViews(record, projection, config, now);
+    if (views.length) memberViews.set(record, views);
+  }
+  for (const record of records.flatMap(record => memberViews.get(record) ?? [record])) {
     if (record.status === '已搁置') continue;
     let kind: Notice['kind'] | undefined;
     let key = '';
     let title = '';
     const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
-    const waitingId = record.waiting?.sessionId ?? record.modelWaiting?.sessionId ?? record.ruleWaiting?.sessionId;
+    const waitingId = record.waiting?.sessionId ?? record.programWaiting?.sessionId ?? record.analysisWaiting?.sessionId ?? record.modelWaiting?.sessionId ?? record.ruleWaiting?.sessionId;
     const targetId = waitingId ?? (record.drift && mismatchedMemberIds(record, projection).size ? record.drift.sessionId : undefined);
     const waitingMember = targetId ? membersOf(record).find(member => member.sessionId === targetId) : undefined;
     const modelReply = record.modelWaiting ? projection.pushes.findLast(p => p.recordKey === record.key && p.sessionId === record.modelWaiting!.sessionId
       && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
-    const last = record.loop?.phase ?? modelReply ?? record.ruleWaiting?.reply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
+    const last = record.loop?.phase ?? record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
     const batch = record.loop ? humanText(record.loop.batch ?? '批次名暂未记录', record.project, now) : '';
     if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
       kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
@@ -153,9 +160,11 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
       const child = record.waiting.sessionId !== record.sessionId;
       title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-    } else if (record.status === '在等我' && (record.modelWaiting || record.ruleWaiting)) {
+    } else if (record.status === '在等我' && (record.programWaiting || record.analysisWaiting || record.modelWaiting || record.ruleWaiting)) {
       kind = 'waiting';
-      const fact = record.modelWaiting ?? { ...record.ruleWaiting!, recordKey: record.key, task: 'waiting' as const };
+      const fact = record.programWaiting ? { ...record.programWaiting, recordKey: record.key, task: 'waiting' as const }
+        : record.analysisWaiting ? { ...record.analysisWaiting, recordKey: record.key, task: 'waiting' as const }
+        : record.modelWaiting ?? { ...record.ruleWaiting!, recordKey: record.key, task: 'waiting' as const };
       key = `model_waiting:${record.key}:${modelEvidenceKey(fact)}`;
       title = `${ai} 可能在等你回复`;
     } else if (record.status === '疑似跑偏' && record.drift) {
@@ -169,18 +178,19 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     }
     if (!kind) continue;
     const evidenceAt = kind === 'loop_paused' ? record.loopPausedAt ?? now
-      : record.waiting?.at ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
+      : record.waiting?.at ?? record.programWaiting?.evidenceAt ?? record.analysisWaiting?.evidenceAt ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
     const memberId = waitingId ?? record.drift?.sessionId ?? record.sessionId;
     const suppress = (reason: Parameters<typeof traceSuppression>[3]) => traceSuppression(projection, suppressed,
       { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key, memberSessionId: memberId }, reason);
-    const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.modelWaiting || record.ruleWaiting || record.drift)
+    const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.programWaiting || record.analysisWaiting || record.modelWaiting || record.ruleWaiting || record.drift)
       && (!record.drift || sameModelEvidenceScope(n, record.drift))
       && n.kind === kind && n.sessionKey === record.key && (n.memberSessionId ?? record.sessionId) === memberId
       && Date.parse(n.evidenceAt ?? '') === Date.parse(evidenceAt)));
     const already = !!existing;
+    const analysis = kind === 'waiting' && waitingMember ? waitingAnalysis(record, waitingMember, evidenceAt, projection, config, now)?.result : undefined;
     const waitingDecision = kind === 'waiting' && waitingMember
       ? decideWaiting(record, waitingMember, evidenceAt, projection, config, now,
-        modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? '', !!record.waiting) : undefined;
+        record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? '', !!record.waiting || !!record.programWaiting || !!analysis?.output?.redline) : undefined;
     if (waitingDecision && !waitingDecision.ready && !already) {
       traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key,
         memberSessionId: memberId, intervalMs: waitingDecision.intervalMs, waitingDecision },
@@ -216,6 +226,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
       record.notice = projection.deliveredNoticeIds.has(existing.id) ? '已提醒，本轮去重' : '待写发件记录';
       suppress('duplicate_notice'); continue;
     }
+    if (kind === 'waiting' && waitingMember && shouldBlockWaiting(record, waitingMember, evidenceAt, projection, config, now, suppressed)) continue;
     const content: NoticeContent = {
       title, summary: '', returnCommand: returnCommand(record, config, memberId),
       evidence: {
@@ -223,7 +234,7 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
         additionalRequirements: record.intent.additions, recentSteps: waitingMember?.recentSteps ?? record.recentSteps,
         reason: record.loop ? `${record.reason}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次` : record.reason,
         originals: record.originals,
-        assistantReply: modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text,
+        assistantReply: record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text,
         ...(record.loop ? { needs: record.loop.needs, needsProvided: record.loop.needsProvided } : {}),
       },
     };
@@ -235,17 +246,19 @@ export function planNotices(records: JudgedRecord[], projection: Projection, con
     const lastOutput = record.loop && kind !== 'stalled'
       ? `${basename(record.project)} · ${batch}：${record.loop.conclusion}${record.loop.summary ? `；${record.loop.summary}` : ''}；还欠 ${record.loop.needs.length} 项${record.loop.needsProvided === false ? '；总结没写还欠什么' : ''}`
       : kind === 'stalled' ? `${record.loop ? `${basename(record.project)} · ${batch}，` : ''}最后在做 ${record.loop?.phase ?? record.recentSteps.at(-1)?.text ?? last}；已 ${Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000)} 分钟没动静`
-        : kind === 'drift' ? record.drift!.result.stepQuote ?? last : modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text ?? last;
+        : kind === 'drift' ? record.drift!.result.stepQuote ?? last : record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text ?? last;
     const quotedStep = kind === 'drift' ? record.recentSteps.findLast(step => step.text.includes(record.drift!.result.stepQuote!)) : undefined;
     const input = quotedStep ? stepSnapshotInput(record, quotedStep) : snapshotInput(record, lastOutput, factualStatus,
       record.assistantReply && kind === 'waiting' && !record.waiting ? record.assistantReply.at : evidenceAt,
       kind === 'waiting' && !record.waiting ? 'reply' : 'step');
-    attachSnapshot(notice, finding?.snapshot?.factualStatus === factualStatus ? finding.snapshot : ruleSnapshot(input, record.project, now), projection);
+    const baseSnapshot = finding?.snapshot?.factualStatus === factualStatus ? finding.snapshot : ruleSnapshot(input, record.project, now);
+    attachSnapshot(notice, analysisSnapshot(notice, baseSnapshot, analysis), projection);
     notice.memberSessionId = memberId;
     if (waitingDecision) notice.waitingDecision = waitingDecision;
     record.notice = '待写发件记录';
     candidates.push(notice);
   }
+  for (const [record, views] of memberViews) mergeWaitingViews(record, views);
   const unmatchedSessions = new Set<string>();
   for (const mismatch of projection.pushMismatches.values()) {
     const push = mismatch.push, scope = `${push.tool}:${push.sessionId}`;
@@ -343,7 +356,7 @@ export function renderOverview(records: JudgedRecord[], projection: Projection):
   const lines = ['工具 | 项目 | 意图 | 状态 | 最后活动时间 | 提醒'];
   for (const record of records) {
     const intent = [record.intent.initial ?? '总结未提供开工指令', ...record.intent.additions].join('；');
-    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, [record.notice ?? '—', ...new Set(record.modelNotes ?? [])].join('；')].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
+    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, [record.intelligenceNote ?? record.notice ?? '—', ...new Set(record.modelNotes ?? [])].join('；')].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
   }
   if (!records.length) lines.push('暂无会话');
   for (const health of projection.health.values()) {

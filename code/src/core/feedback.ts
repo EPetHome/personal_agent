@@ -6,7 +6,7 @@ import { iso } from './utils.ts';
 import { codeVersion } from './runtime-version.ts';
 import type { ChannelReply, Feedback, JudgedRecord, Notice } from './types.ts';
 
-const nonJudgment = ['weekly', 'recurrence', 'service_restart'];
+const nonJudgment = ['weekly', 'recurrence', 'service_restart', 'daily'];
 /** 成员会话隔离；会话无法定位时绝不退化为整种工具/项目的屏蔽。 */
 export function feedbackSuppressionKey(notice: Pick<Notice, 'tool' | 'kind' | 'sessionKey' | 'memberSessionId' | 'feedbackScope'>): string | undefined {
   const scope = notice.feedbackScope ?? (notice.memberSessionId ? `${notice.tool}:${notice.memberSessionId}` : notice.sessionKey);

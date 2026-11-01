@@ -43,7 +43,7 @@ export function noticeCard(notice: Notice, relay?: RelayView) {
   const elements: unknown[] = [markdown(`**这件事**：${content.situation}`), markdown(`**要你做**：${items?.length ? `\n${renderActionItems(items)}` : content.action}`),
     markdown(`**时间 / 回去看**：${noticeTimeAndReturn(notice)}`)];
   if (relay) elements.push(...relayElements(notice, relay));
-  const verdicts = ['weekly', 'recurrence', 'service_restart'].includes(notice.kind) ? ['看不懂'] : ['正确', '误报', '看不懂'];
+  const verdicts = ['weekly', 'recurrence', 'service_restart', 'daily'].includes(notice.kind) ? ['看不懂'] : ['正确', '误报', '看不懂'];
   elements.push({ tag: 'collapsible_panel', expanded: false,
     header: { title: { tag: 'plain_text', content: '给 personal agent 的反馈' } },
     elements: [buttons(verdicts.map(verdict => button(verdict, { action: 'feedback', verdict, noticeId: notice.id })))] });

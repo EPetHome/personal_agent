@@ -19,9 +19,11 @@ export function safeFailure(error: unknown): { category: FailureCategory; detail
 }
 
 /** 不经 shell；调用者决定如何降级，外部 stderr（可能带敏感数据）不进入记录。 */
-export function runCommand(executable: string, args: string[], timeoutMs: number, input?: string, signal?: AbortSignal, cwd?: string): Promise<string> {
+export function runCommand(executable: string, args: string[], timeoutMs: number, input?: string, signal?: AbortSignal, cwd?: string, environment?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, PATH: componentPath(process.env.PATH) };
+    // 显式环境是完整替换，不再混入宿主变量；现有调用缺省仍沿用原行为。
+    const base = environment ?? process.env;
+    const env: NodeJS.ProcessEnv = { ...base, PATH: componentPath(base.PATH) };
     delete env.FEISHU_APP_ID; delete env.FEISHU_APP_SECRET;
     const child = execFile(executable, args, { env, cwd, encoding: 'utf8', timeout: timeoutMs, signal, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
       if (!error) { resolve(stdout); return; }

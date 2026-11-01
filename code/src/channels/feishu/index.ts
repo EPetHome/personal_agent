@@ -196,7 +196,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       const notice = (await readOutbox(dir)).find(n => n.id === mapped.noticeId);
       if (!notice) throw new IncomingFailure('notice_not_found', '这条提醒已无法找到，请打开最新卡片再试。');
       if (value.action?.startsWith('relay_')) return relay.handle(input, notice);
-      if (value.action === 'feedback' && value.noticeId === notice.id && ['正确', '误报', '看不懂'].includes(value.verdict ?? '') && (value.verdict === '看不懂' || !['weekly', 'recurrence', 'service_restart'].includes(notice.kind))) {
+      if (value.action === 'feedback' && value.noticeId === notice.id && ['正确', '误报', '看不懂'].includes(value.verdict ?? '') && (value.verdict === '看不懂' || !['weekly', 'recurrence', 'service_restart', 'daily'].includes(notice.kind))) {
         response = await receiveFeedback(dir, 'feishu', { noticeId: notice.id, content: value.verdict!, at: input.at, replyId: input.id });
       } else if (['agree', 'revise'].includes(value.action ?? '')) {
         const review = notice.reviews?.find(item => item.experienceId === value.experienceId);
@@ -213,7 +213,7 @@ export function feishuChannel(config: Config, injected?: FeishuTransport): Feish
       if (!/^(正确|误报|漏了|看不懂)(?:\s|$)/.test(input.text ?? '')) response = '请引用卡片回复「正确 / 误报 / 看不懂 + 一句话」，或直接发「漏了 + 一句话」。';
       else if (input.text!.startsWith('漏了') && !input.ref) response = await receiveFeedback(dir, 'feishu', { noticeId: null, content: input.text!, at: input.at, replyId: input.id });
       else if (!mapped?.noticeId) response = '没有找到被引用的提醒，请引用机器人发出的提醒再回复。';
-      else if (!input.text!.startsWith('看不懂') && ['weekly', 'recurrence', 'service_restart'].includes((await readOutbox(dir)).find(n => n.id === mapped.noticeId)?.kind ?? '')) response = '这条不是盯防提醒，请使用「看不懂」按钮或本机 experience 命令。';
+      else if (!input.text!.startsWith('看不懂') && ['weekly', 'recurrence', 'service_restart', 'daily'].includes((await readOutbox(dir)).find(n => n.id === mapped.noticeId)?.kind ?? '')) response = '这条不是盯防提醒，请使用「看不懂」按钮或本机 experience 命令。';
       else response = await receiveFeedback(dir, 'feishu', { noticeId: mapped.noticeId, content: input.text!, at: input.at, replyId: input.id });
     }
     return response;

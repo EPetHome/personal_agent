@@ -6,6 +6,7 @@ import { appendJsonl, readEvents, readJsonl, readOutbox, withStoreLock } from '.
 import { readFeedback } from './feedback.ts';
 import { event, project } from './events.ts';
 import { piReadOnly } from './model.ts';
+import { intelligenceEnabled } from './intelligence.ts';
 import { feedbackCategory, kindNames } from './statistics.ts';
 import { compact, hash, iso, shellQuote, truncateText } from './utils.ts';
 import { firstScreen, humanText, localTime, noticeSections, presentNotice } from './notice-text.ts';
@@ -116,7 +117,7 @@ export function piExperienceModel(config: NonNullable<Config['judge']>): Experie
     },
   };
 }
-export function agentNotice(kind: 'weekly' | 'recurrence' | 'service_restart', key: string, at: string, title: string, summary: string, command: string, reviews?: ReviewItem[]): Notice {
+export function agentNotice(kind: 'weekly' | 'recurrence' | 'service_restart' | 'daily', key: string, at: string, title: string, summary: string, command: string, reviews?: ReviewItem[]): Notice {
   const raw = { title, summary, returnCommand: command, evidence: { project: null, intentOriginal: null, additionalRequirements: [], recentSteps: [], reason: summary, originals: [] } };
   const sections = noticeSections(raw), content = presentNotice(raw, sections.situation, sections.action, at);
   return { version: 1, id: hash(key), dedupeKey: key, at, tool: 'agent', kind, level: '有空看', content,
@@ -148,14 +149,14 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
     const existingBaseline = await learningBaseline(config.dataDir);
     const baselineAt = existingBaseline ?? now;
     if (!existingBaseline) await appendJsonl(join(config.dataDir, 'learning-baseline.jsonl'), [{ version: 1, at: baselineAt }]);
-    const input = await withStoreLock(config.dataDir, async () => ({ events: await readEvents(config.dataDir), outbox: await readOutbox(config.dataDir), feedback: await readFeedback(config.dataDir) }));
+    const input = await withStoreLock(config.dataDir, async () => ({ events: await readEvents(config.dataDir), outbox: await readOutbox(config.dataDir), feedback: await readFeedback(config.dataDir) }), intelligenceEnabled(config) ? 1000 : 0);
     const projection = project(input.events);
     const lookup = new Map(input.outbox.map(n => [n.id, n]));
     const candidates: Omit<Problem, 'layer' | 'reason' | 'countermeasure' | 'experienceId'>[] = [];
     for (const [index, feedback] of input.feedback.entries()) {
       if (feedback.at > now || feedback.verdict === '正确') continue;
       const notice = feedback.noticeId ? lookup.get(feedback.noticeId) : undefined;
-      if (notice && ['weekly', 'recurrence', 'service_restart'].includes(notice.kind) && feedback.verdict !== '看不懂') continue;
+      if (notice && ['weekly', 'recurrence', 'service_restart', 'daily'].includes(notice.kind) && feedback.verdict !== '看不懂') continue;
       const category = feedbackCategory(feedback, notice);
       const source = `feedback:${index}:${hash(JSON.stringify(feedback))}`;
       // 同一条提醒的重复评价仍留原始反馈，但不冒充第二次问题出现。
@@ -186,7 +187,7 @@ export async function collectProblems(config: Config, now: string, injected?: Ex
         const used = project(await readEvents(config.dataDir)).modelCalls.get(now.slice(0, 10)) ?? 0;
         if (used >= (config.judge!.dailyLimit ?? Infinity)) return false;
         await appendJsonl(join(config.dataDir, 'events.jsonl'), [event({ kind: 'model_call_started', task, key }, now)]); return true;
-      });
+      }, intelligenceEnabled(config) ? 1000 : 0);
       if (!reserved) return;
       const controller = new AbortController();
       let timer: NodeJS.Timeout | undefined;

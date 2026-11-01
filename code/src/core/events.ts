@@ -27,7 +27,9 @@ function emptyProjection(): Projection {
     health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(),
     telemetrySuppressions: new Set(), waitingWindows: new Map(), waitingActivity: new Map(), ruleDecisions: new Map(),
     modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), noticeReplies: new Map(), feedbackSuppressions: new Set(),
-    modelCalls: new Map(), channelDeliveries: new Map(), channelDeliveryStates: new Map(), deliveryAlerted: new Set() };
+    modelCalls: new Map(), channelDeliveries: new Map(), channelDeliveryStates: new Map(), deliveryAlerted: new Set(),
+    analysisRequests: new Map(), analysisResults: new Map(), shadowDecisions: new Map(), shadowReplies: new Map(),
+    shadowComparisons: new Map(), shadowLabels: new Map(), shadowGuards: new Map() };
 }
 export function packProjection(projection: Projection): ProjectionState {
   return Object.fromEntries(Object.entries(projection).filter(([key]) => key !== 'snapshotSessions').map(([key, value]) =>
@@ -45,7 +47,7 @@ export function unpackProjection(state: ProjectionState): Projection {
   for (const [key, initial] of Object.entries(result)) {
     const value = (state as any)[key];
     // 丙段前的检查点缺计数/告警索引；允许读取，但下方把缺历史的待发渠道显式标为未知。
-    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted', 'telemetrySuppressions', 'waitingWindows', 'waitingActivity', 'ruleDecisions'].includes(key)) continue;
+    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted', 'telemetrySuppressions', 'waitingWindows', 'waitingActivity', 'ruleDecisions', 'analysisRequests', 'analysisResults', 'shadowDecisions', 'shadowReplies', 'shadowComparisons', 'shadowLabels', 'shadowGuards'].includes(key)) continue;
     if (initial instanceof Map || initial instanceof Set || Array.isArray(initial)) {
       if (!Array.isArray(value)) throw new Error(`封存状态 ${key} 结构损坏`);
       (result as any)[key] = initial instanceof Map ? new Map(value) : initial instanceof Set ? new Set(value) : [...value];
@@ -194,6 +196,13 @@ export function project(events: AgentEvent[]): Projection {
         }
         break;
       case 'notice_delivery_alerted': result.deliveryAlerted.add(entry.noticeId); break;
+      case 'analysis_requested': if (!result.analysisRequests.has(entry.request.id)) result.analysisRequests.set(entry.request.id, entry.request); break;
+      case 'analysis_finished': result.analysisResults.set(entry.result.id, entry.result); break;
+      case 'shadow_decided': if (!result.shadowDecisions.has(entry.decision.analysisId)) result.shadowDecisions.set(entry.decision.analysisId, entry.decision); break;
+      case 'shadow_reply_observed': if (!result.shadowReplies.has(entry.reply.analysisId)) result.shadowReplies.set(entry.reply.analysisId, entry.reply); break;
+      case 'shadow_compared': if (!result.shadowComparisons.has(entry.comparison.analysisId)) result.shadowComparisons.set(entry.comparison.analysisId, entry.comparison); break;
+      case 'shadow_labeled': if (!result.shadowLabels.has(entry.label.analysisId)) result.shadowLabels.set(entry.label.analysisId, entry.label); break;
+      case 'shadow_guard': result.shadowGuards.set(entry.guard.category, entry.guard); break;
       case 'feishu_connection': result.feishuConnection = { ...entry.connection, at: entry.at }; break;
       case 'push_empty': result.emptyPushIds.add(entry.pushId); break;
       case 'push_cursor': result.pushCursors.set(entry.path, entry); break;

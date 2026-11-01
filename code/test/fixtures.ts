@@ -1,5 +1,5 @@
 // 全部内容为测试编造。实际来源文件只写到系统临时目录，不访问真实工具目录。
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Config } from '../src/core/types.ts';
@@ -14,10 +14,17 @@ export async function sandbox(waiting: Config['waiting'] | null = { awayMinutes:
     dataDir: join(root, 'data'), sources: { cc: join(root, 'cc'), codex: null, pi: null, loop: null },
     inboxDir: join(root, 'inbox'), commands: { cc: 'claude', codex: '/sample tools/codex', pi: 'pi' },
     ...(waiting ? { waiting } : {}),
+    // 旧回归只测原判断/版式/渠道；工具分析由 intelligence.test.ts 显式开启并注入替身。
+    intelligence: { enabled: false },
   };
   await mkdir(config.sources.cc!);
   await mkdir(config.inboxDir!);
   return { root, config };
+}
+// 普通样例项目与门禁证据目录分开：Loop的TMPDIR可能位于.pi-autoreview，
+// 那里作为会话cwd应被产品正确过滤。此处只建新的POSIX系统临时项目，调用方负责清理。
+export async function ordinaryProject(): Promise<string> {
+  return realpath(await mkdtemp('/tmp/personal-agent-sample-project-'));
 }
 export async function put(path: string, content: string | unknown[]) {
   await mkdir(dirname(path), { recursive: true });

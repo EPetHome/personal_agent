@@ -4,6 +4,7 @@ import { object, requiredString } from './utils.ts';
 import { DEFAULT_WAITING, tools } from './types.ts';
 import { OperationFailure } from './failures.ts';
 import type { Config } from './types.ts';
+import { DEFAULT_INTELLIGENCE } from './intelligence-types.ts';
 
 function absolute(value: unknown, label: string): string {
   const path = requiredString(value, label);
@@ -56,6 +57,13 @@ export async function validateConfig(value: unknown): Promise<Config> {
     const waiting = object(data.waiting, 'waiting');
     config.waiting = Object.fromEntries(Object.entries(DEFAULT_WAITING).map(([key, fallback]) =>
       [key, integer(waiting[key], fallback, `waiting.${key}`, 1)]));
+  }
+  if (data.intelligence != null) {
+    const settings = object(data.intelligence, 'intelligence');
+    if (settings.enabled !== undefined && typeof settings.enabled !== 'boolean') throw new Error('intelligence.enabled 必须是布尔值');
+    config.intelligence = { enabled: settings.enabled ?? true,
+      timeoutMs: integer(settings.timeoutMs, DEFAULT_INTELLIGENCE.timeoutMs, 'intelligence.timeoutMs', 1),
+      maxToolCalls: integer(settings.maxToolCalls, DEFAULT_INTELLIGENCE.maxToolCalls, 'intelligence.maxToolCalls', 1) };
   }
   if (data.judge != null) {
     const judge = object(data.judge, 'judge');
