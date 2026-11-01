@@ -113,7 +113,12 @@ for (const waiting of [false, true]) {
         assert.deepEqual((await rebuild(f.config)).records, second.records);
         const eventCount = (await readEvents(f.config.dataDir)).length;
         assert.equal((await detect(f.config, '2026-10-20T10:35:00Z')).noticesAdded, 0);
-        assert.equal((await readEvents(f.config.dataDir)).length - eventCount, 1, '同样的局部故障空跑只追加检测时间');
+        const appended = (await readEvents(f.config.dataDir)).slice(eventCount);
+        assert.deepEqual(appended.map(e => e.kind), ['scan_completed', 'notice_suppressed']);
+        assert.ok(appended[1]?.kind === 'notice_suppressed' && appended[1].reason === 'duplicate_notice');
+        const after = (await readEvents(f.config.dataDir)).length;
+        await detect(f.config, '2026-10-20T10:35:01Z');
+        assert.equal((await readEvents(f.config.dataDir)).length - after, 1, '抑制原因只记一次，稳定局部故障不重复快照');
         assert.ok((await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8')).startsWith(before));
       } finally {
         if (failure === 'directory-permission') await chmod(dirname(f.child), 0o700);

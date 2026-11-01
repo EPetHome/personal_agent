@@ -11,9 +11,10 @@ import { agentNotice } from '../core/learning.ts';
 import { appendJsonl, measureStoreLocks, readJsonl } from '../core/store.ts';
 import { firstScreen } from '../core/notice-text.ts';
 import { renderNotice } from '../core/judge.ts';
-import type { Channel, Config } from '../core/types.ts';
+import { codeVersion } from '../core/runtime-version.ts';
+import type { Channel, CodeVersion, Config } from '../core/types.ts';
 
-interface RunEvent { kind: 'start' | 'stop' | 'alerted' | 'failed'; at: string; runId: string; pid?: number; failure?: SafeFailure }
+interface RunEvent { kind: 'start' | 'stop' | 'alerted' | 'failed'; at: string; runId: string; pid?: number; failure?: SafeFailure; codeVersion?: CodeVersion }
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise(resolve => {
@@ -37,13 +38,13 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
   async function log(kind: string, extra: Record<string, unknown> = {}) {
     try {
       await readJsonl(logPath);
-      await appendJsonl(logPath, [...(pendingStorageLog ? [pendingStorageLog] : []), { at: new Date().toISOString(), kind, ...extra }]);
+      await appendJsonl(logPath, [...(pendingStorageLog ? [pendingStorageLog] : []), { at: new Date().toISOString(), kind, ...extra, codeVersion }]);
       pendingStorageLog = undefined;
     } catch (error) {
       const failure = safeProcessingFailure(error);
       if (failure.category !== 'storage_full') throw error;
       // 日志也写不进时先告警，不反复崩溃；空间恢复后补记一条安全类别。
-      pendingStorageLog ??= { at: new Date().toISOString(), kind: 'storage_full', ...failure };
+      pendingStorageLog ??= { at: new Date().toISOString(), kind: 'storage_full', ...failure, codeVersion };
       await reportStorageFailure(config, error, channels);
     }
   }
@@ -57,7 +58,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
     for (const name of ['.detect.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock']) await recoverDeadLock(dir, name);
     const history = await readJsonl<RunEvent>(runsPath);
     const at = new Date().toISOString();
-    await appendJsonl(runsPath, [{ kind: 'start', at, runId, pid: process.pid } satisfies RunEvent]);
+    await appendJsonl(runsPath, [{ kind: 'start', at, runId, pid: process.pid, codeVersion } satisfies RunEvent]);
     const windowStart = Date.parse(at) - (config.service?.restartWindowMs ?? 300000);
     const stopped = new Set(history.filter(e => e.kind === 'stop').map(e => e.runId));
     const lastRun = history.filter(e => e.kind === 'start').at(-1);
@@ -75,7 +76,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
       notice.content.evidence.reason = `异常重启记录：${runsPath}；运行日志：${logPath}`;
       notice.text = renderNotice(notice.content, at);
       await publishNotices(config, [notice], at, channels);
-      await appendJsonl(runsPath, [{ kind: 'alerted', at, runId } satisfies RunEvent]);
+      await appendJsonl(runsPath, [{ kind: 'alerted', at, runId, codeVersion } satisfies RunEvent]);
     }
     for (const channel of channels) if ('start' in channel && typeof channel.start === 'function') await channel.start();
     await log('started', { intervalMs: interval });
@@ -115,7 +116,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
     const failure = safeProcessingFailure(error);
     await reportStorageFailure(config, error, channels);
     await log('service_failed', { ...failure }).catch(() => {});
-    await appendJsonl(runsPath, [{ kind: 'failed', at: new Date().toISOString(), runId, failure } satisfies RunEvent]).catch(() => {});
+    await appendJsonl(runsPath, [{ kind: 'failed', at: new Date().toISOString(), runId, failure, codeVersion } satisfies RunEvent]).catch(() => {});
     throw error;
   } finally {
     shutdown.abort(); signal.removeEventListener('abort', abort);
@@ -124,7 +125,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[]): 
       for (const channel of channels) if ('stop' in channel && typeof channel.stop === 'function') await channel.stop();
       if (normalExit) {
         await log('stopped');
-        await appendJsonl(runsPath, [{ kind: 'stop', at: new Date().toISOString(), runId } satisfies RunEvent]);
+        await appendJsonl(runsPath, [{ kind: 'stop', at: new Date().toISOString(), runId, codeVersion } satisfies RunEvent]);
       }
     } finally { await release(); }
   }

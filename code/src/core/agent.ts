@@ -23,9 +23,10 @@ import { perceive } from './perception.ts';
 import { findPushTarget, isFailedOriginal, isIgnoredMember, isInternalSession, membersOf, mismatchedMemberIds } from './sessions.ts';
 import { appendJsonl, readEvents, readOutbox, withModelLock, withStoreLock, writeState } from './store.ts';
 import { iso } from './utils.ts';
+import { codeVersion } from './runtime-version.ts';
 import type { AgentEvent, Channel, Config, EventPayload, Judge, JudgedRecord, Notice, Projection } from './types.ts';
 
-export interface Snapshot { at: string; records: JudgedRecord[]; projection: Projection }
+export interface Snapshot { at: string; eventId: string | null; records: JudgedRecord[]; projection: Projection }
 function activeProjection(projection: Projection, config: Config): Projection {
   const pushMismatches = new Map([...projection.pushMismatches].filter(([, mismatch]) => config.inboxDir !== null
     && config.sources[mismatch.push.tool] !== null && !isIgnoredProject(mismatch.push.project, config)
@@ -90,10 +91,10 @@ async function snapshot(events: AgentEvent[], config: Config, now?: string): Pro
   applyModelChecks(records, projection, config, at);
   planNotices(records, projection, config, at);
   // 查询不投递；只有交付确认事件才算已发，其余候选明确标为待写发件。
-  return { at, records, projection };
+  return { at, eventId: events.at(-1)?.id ?? null, records, projection };
 }
 function serializedState(view: Snapshot) {
-  return { version: 1, at: view.at, records: view.records, health: [...view.projection.health.values()],
+  return { version: 1, at: view.at, eventId: view.eventId, codeVersion, records: view.records, health: [...view.projection.health.values()],
     ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}),
     undeliveredNotices: undeliveredNotices(view.projection) };
 }
@@ -109,6 +110,11 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   // supplemental 通知也按级别选择出口；历史卡片绝不重新计划或改变出口。
   for (const entry of added) if (entry.kind === 'notice_planned') entry.notice = routeNotice(entry.notice, projection, at);
   const records = judgeRecords(projection, at);
+  for (const entry of added) if (entry.kind === 'scan_completed') {
+    const observations = records.filter(record => record.rule).map(record => ({ recordKey: record.key, status: record.status, rule: record.rule! }));
+    const changed = observations.filter(observation => JSON.stringify(raw.ruleDecisions.get(observation.recordKey)) !== JSON.stringify(observation));
+    if (changed.length) entry.ruleDecisions = changed;
+  }
   applyModelChecks(records, projection, config, at);
   const suppressed: EventPayload[] = [];
   const planned = planNotices(records, projection, config, at, suppressed).filter(n => !deferSnapshots || !standaloneSnapshot(n)
@@ -129,6 +135,8 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   await flush();
   const completeRaw = project([...events, ...added]);
   const complete = activeProjection(await feedbackProjection(completeRaw, config, at), config);
+  // 复用已经判好的记录发布已提交视图，不为埋点额外重放/重读反馈；收件不等模型或外部渠道。
+  await writeState(config.dataDir, serializedState({ at, eventId: added.at(-1)?.id ?? events.at(-1)?.id ?? null, records, projection: complete }));
   const deliverable = complete.notices.filter(n => !isFeedbackSuppressed(n, complete.feedbackSuppressions));
   const outbox = await readOutbox(config.dataDir), lookup = new Map(outbox.map(n => [n.id, n]));
   for (const notice of completeRaw.notices) lookup.set(notice.id, notice);

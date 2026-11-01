@@ -3,7 +3,8 @@ import { appendJsonl, readJsonl, readOutbox } from './store.ts';
 import { acquireLock } from './locks.ts';
 import { OperationFailure } from './failures.ts';
 import { iso } from './utils.ts';
-import type { ChannelReply, Feedback, Notice } from './types.ts';
+import { codeVersion } from './runtime-version.ts';
+import type { ChannelReply, Feedback, JudgedRecord, Notice } from './types.ts';
 
 const nonJudgment = ['weekly', 'recurrence', 'service_restart'];
 /** 成员会话隔离；会话无法定位时绝不退化为整种工具/项目的屏蔽。 */
@@ -47,6 +48,20 @@ async function readFeedbackUnlocked(dataDir: string): Promise<Feedback[]> {
 export async function readFeedback(dataDir: string): Promise<Feedback[]> {
   return withFeedbackLock(dataDir, () => readFeedbackUnlocked(dataDir));
 }
+/** state.json 以 rename 发布；只取引用，不读会话原件，也不拿检测锁或重放增长中的事件日志。 */
+async function missedContext(dataDir: string): Promise<NonNullable<Feedback['context']>> {
+  const capturedAt = new Date().toISOString();
+  try {
+    const [state] = await readJsonl<{ at: string; eventId?: string | null; records: JudgedRecord[] }>(join(dataDir, 'state.json'));
+    if (!state) return { asOf: null, eventId: null, capturedAt, sessions: [], unavailable: 'no_completed_scan' };
+    if (!Number.isFinite(Date.parse(state.at)) || !Array.isArray(state.records)) throw new Error('无可用状态');
+    return { asOf: state.at, eventId: state.eventId ?? null, capturedAt, sessions: state.records.map(record => ({
+      key: record.key, tool: record.tool, sessionId: record.sessionId, status: record.status, lastActivityAt: record.lastActivityAt,
+      originals: record.originals, ...(record.rule ? { ruleId: record.rule.id } : {}),
+      ...((record.modelWaiting ?? record.drift) ? { modelCheckKey: (record.modelWaiting ?? record.drift)!.key } : {}),
+    })) };
+  } catch { return { asOf: null, eventId: null, capturedAt, sessions: [], unavailable: 'state_unavailable' }; }
+}
 /** 所有渠道共用的收件落盘入口。短锁内保存原卡片和原话；行为从该事实现算，绝不转发给 AI。 */
 export async function receiveFeedback(dataDir: string, channel: string, reply: ChannelReply, waitMs = 30000): Promise<string> {
   const at = iso(reply.at);
@@ -64,7 +79,8 @@ export async function receiveFeedback(dataDir: string, channel: string, reply: C
     if (reply.noticeId && !notice) throw new OperationFailure('notice_not_found', '未找到指定提醒，未记录反馈');
     if (!notice && verdict !== '漏了') throw new OperationFailure('notice_not_found', '还没有提醒；漏报可直接回「漏了」');
     const feedback: Feedback = { version: 1, at, date: at.slice(0, 10), channel,
-      noticeId: notice?.id ?? null, verdict, comment: match[2]?.trim() ?? '', originalText: reply.content,
+      noticeId: notice?.id ?? null, verdict, comment: match[2]?.trim() ?? '', originalText: reply.content, codeVersion,
+      ...(verdict === '漏了' ? { context: await missedContext(dataDir) } : {}),
       ...(notice ? { card: { title: notice.content.title, firstScreen: notice.content.summary, returnCommand: notice.content.returnCommand, at: notice.at } } : {}),
       ...(reply.replyId ? { replyId: reply.replyId } : {}) };
     await appendJsonl(join(dataDir, 'feedback.jsonl'), [feedback]);

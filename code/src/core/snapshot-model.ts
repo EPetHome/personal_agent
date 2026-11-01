@@ -1,7 +1,8 @@
 import { timedModel } from './model-checks.ts';
-import { piJudge } from './model.ts';
+import { piJudge, snapshotReplay } from './model.ts';
+import { protectReplay } from './replay.ts';
 import { modelSnapshot, noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
-import type { Config, EventPayload, Judge, Notice, Projection, TaskSnapshotInput } from './types.ts';
+import type { Config, EventPayload, Judge, ModelReplay, Notice, Projection, TaskSnapshotInput } from './types.ts';
 
 /** 仅处理尚未计划过的新卡片。调用者持模型锁，persist 短持数据锁；模型等待绝不持数据锁。 */
 export async function checkSnapshotModels(notices: Notice[], projection: Projection, config: Config, now: string,
@@ -17,16 +18,18 @@ export async function checkSnapshotModels(notices: Notice[], projection: Project
     const { goal, currentTask, lastOutput, factualStatus } = notice.snapshot;
     const input: TaskSnapshotInput = { goal, currentTask, lastOutput, factualStatus };
     let snapshot = notice.snapshot;
+    let replay: ModelReplay | undefined;
     const used = projection.modelCalls.get(day) ?? 0;
     if (used < (config.judge.dailyLimit ?? Infinity) && Date.now() < deadline
       && await persist({ kind: 'model_call_started', task: 'snapshot', key }) !== false) {
       projection.modelCalls.set(day, used + 1);
+      replay = protectReplay(snapshotReplay(config.judge, input), [{ kind: 'notice_snapshot', key, data: input }]);
       try {
         const result = await timedModel(signal => judge.writeSnapshot!(input, { signal }), Math.min(config.judge.timeoutMs, deadline - Date.now()));
         snapshot = modelSnapshot(input, result, notice.content.evidence.project ?? '', now) ?? snapshot;
       } catch { /* 不可用/超时/坏答案都照发规则卡片；同一事实不重花调用。 */ }
     }
-    await persist({ kind: 'notice_snapshot_written', key, snapshot });
+    await persist({ kind: 'notice_snapshot_written', key, snapshot, ...(replay ? { replay } : {}) });
     projection.noticeSnapshots.set(key, snapshot);
     written++;
   }

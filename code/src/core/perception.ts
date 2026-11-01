@@ -80,6 +80,9 @@ async function readComponent(path: string, component: SourceComponent) {
     } catch (cause) { error = cause; }
     try { reader.finish(); } catch (cause) { error ??= cause; }
     original.fingerprint = reader.fingerprint;
+    if (reader.fingerprint && reader.lineCount) original.span = {
+      startLine: 1, endLine: reader.lineCount, byteLength: reader.byteLength,
+    };
     return { record, original, identity: reader.identity, sessionIds: reader.sessionIds, hasCoreRows: reader.hasCoreRows,
       lastRecordAt: reader.lastRecordAt, modifiedAt: stat.mtime.toISOString(), error: reader.error ?? error };
   } finally { await handle.close(); }

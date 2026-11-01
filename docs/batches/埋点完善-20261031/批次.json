@@ -1,0 +1,12 @@
+{
+  "name": "埋点完善-20261031",
+  "branch": "feat/埋点完善",
+  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "stages": {
+    "埋点完善": {
+      "prompt": "../../prompt/提示词-埋点完善.md",
+      "scope": { "allow": ["code/", "docs/batches/埋点完善-20261031/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples", "eval/"] }
+    }
+  },
+  "steps": [["埋点完善"]]
+}

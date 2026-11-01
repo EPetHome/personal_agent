@@ -98,6 +98,48 @@ export interface Judge {
   /** 替身省略此方法即只做规则兜底，不偷偷调用真实模型。 */
   writeSnapshot?(input: TaskSnapshotInput, options?: { signal?: AbortSignal }): Promise<TaskSnapshotDraft>;
 }
+export interface CodeVersion {
+  /** 启动本进程时从代码所在仓库取得；打包副本没有 Git 时明确为 null。 */
+  commit: string | null;
+  dirty: boolean | null;
+}
+export interface ModelReplay {
+  model: string;
+  promptVersion: string;
+  templateSha256: string;
+  /** SHA-256(JSON.stringify(input))，UTF-8；包含系统指令和完整 stdin。 */
+  inputSha256: string;
+  input: { systemPrompt: string; prompt: string };
+  /** 外部材料全部引用已有记录，offset 按 JSON 字符串编码后的 UTF-16 索引；兼容旧的局部引用。 */
+  references?: { placeholder: string; source: { kind: 'session' | 'model_check' | 'notice_snapshot' | 'push'; key: string;
+    path: (string | number)[]; valueSha256: string }; start: number; end: number }[];
+  unavailable?: 'credential_reference_unavailable' | 'input_reference_unavailable';
+}
+export type SuppressionReason = 'duplicate_notice' | 'waiting_interval' | 'user_replied' | 'model_daily_limit'
+  | 'first_connection_history' | 'recovered_push' | 'feedback_false_positive' | 'model_cycle_timeout'
+  | 'drift_cooldown' | 'missing_trigger_member' | 'loop_resumed' | 'model_evidence_24h';
+export interface WaitingWindow {
+  dedupeKey: string;
+  evidenceAt: string;
+  sessionKey: string;
+  memberSessionId: string;
+  scope: 'notice' | 'model_check';
+  intervalMs: number;
+}
+export interface RuleDecision {
+  id: 'active_unfinished' | 'source_unavailable' | 'push_mismatch' | 'inactive_24h' | 'loop_paused'
+    | 'loop_completed' | 'permission_waiting' | 'member_unavailable' | 'all_members_completed' | 'unfinished_30m'
+    | 'fallback_explicit_question' | 'model_fact_inactive_24h';
+  facts: {
+    lastActivityAt: string;
+    thresholdMs?: number;
+    loopStatus?: LoopFacts['status'];
+    loopPausedAt?: string;
+    members: { sessionId: string; lastActivityAt: string | null; sessionEnded: boolean; assistantFinished: boolean;
+      pendingTools: number; unavailable: boolean; completed: boolean; pushEvent?: PushRecord['event']; pushAt?: string }[];
+  };
+}
+export interface RuleObservation { recordKey: string; status: Status; rule: RuleDecision }
 export interface ModelCheck {
   key: string;
   recordKey: string;
@@ -108,6 +150,9 @@ export interface ModelCheck {
   fingerprint: string;
   stepIds: string[];
   summary: string;
+  /** 仅实际调用才有；额度/时限阻止调用的记录不伪造输入。 */
+  replay?: ModelReplay;
+  originals?: Original[];
   result?: JudgmentResult;
   snapshot?: TaskSnapshot;
   /** 区分旧版判断，升级不重试已交代的旧事实。 */
@@ -118,7 +163,12 @@ export interface ModelCheck {
   failure?: { category: import('./process.ts').FailureCategory; detail: string };
 }
 export interface ModelFinding extends ModelCheck { result: JudgmentResult }
-export interface Original { path: string; fingerprint: string }
+export interface Original {
+  path: string;
+  fingerprint: string;
+  /** 本次解析完整读取的范围；原始字节含换行，SHA-256 复用已有 fingerprint，不重复存哈希。 */
+  span?: { startLine: number; endLine: number; byteLength: number };
+}
 export interface Step {
   at: string;
   text: string;
@@ -240,6 +290,7 @@ export type Status = '进行中' | '在等我' | '已完成' | '停滞' | '已�
 export interface JudgedRecord extends SessionRecord {
   status: Status;
   reason: string;
+  rule?: RuleDecision;
   waiting?: PushRecord;
   modelWaiting?: ModelFinding;
   ruleWaiting?: { sessionId: string; evidenceAt: string; reply: string };
@@ -276,6 +327,9 @@ export interface NoticeContent {
 }
 export interface Notice {
   version: 1;
+  codeVersion?: CodeVersion;
+  /** 仅当判断原件不同于最新所见、或读取故障只剩历史原件时补充，旧 evidence.originals 不改义。 */
+  sourceEvidence?: Original[];
   id: string;
   dedupeKey: string;
   at: string;
@@ -336,19 +390,21 @@ export type EventPayload =
   | { kind: 'push_deferred'; pushId: string; rounds: number }
   | { kind: 'push_cursor'; path: string; lines: number; fingerprint: string }
   | { kind: 'source_health'; report: HealthReport }
-  | { kind: 'scan_completed' }
+  | { kind: 'scan_completed'; ruleDecisions?: RuleObservation[] }
   | { kind: 'notice_planned'; notice: Notice }
-  | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string }
+  | { kind: 'notice_suppressed'; dedupeKey: string; evidenceAt: string; reason?: SuppressionReason;
+      scope?: 'notice' | 'model_check'; decisionKey?: string; sessionKey?: string; memberSessionId?: string;
+      reply?: RequestRef; intervalMs?: number }
   | { kind: 'notices_delivered'; ids: string[] }
   | { kind: 'model_call_started'; task: JudgmentTask | 'snapshot' | 'attribution' | 'same_problem'; key: string }
-  | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot }
+  | { kind: 'notice_snapshot_written'; key: string; snapshot: TaskSnapshot; replay?: ModelReplay }
   | { kind: 'notice_reply_observed'; noticeId: string; reply: RequestRef }
   | { kind: 'model_checked'; check: ModelCheck }
   | { kind: 'channel_delivery'; channel: string; noticeId: string; ok: boolean; phase?: 'queued' | 'attempted'; failure?: import('./failures.ts').SafeFailure }
   | { kind: 'notice_delivery_alerted'; noticeId: string; ok?: boolean; failure?: import('./failures.ts').SafeFailure }
   | { kind: 'channel_delivery_history_restored'; checkpointId: string; states: [string, ChannelDeliveryState][]; backup: string }
   | { kind: 'feishu_connection'; connection: FeishuConnection };
-export type AgentEvent = EventPayload & { version: 1; id: string; at: string };
+export type AgentEvent = EventPayload & { version: 1; id: string; at: string; codeVersion?: CodeVersion };
 export interface Projection {
   sessions: Map<string, SessionRecord>;
   /** 内存中的最后可见事实，供读取故障卡片使用，不复活成当前正常会话。 */
@@ -370,6 +426,11 @@ export interface Projection {
   lastScanAt: string | null;
   startedAt: string | null;
   suppressedNotices: Map<string, string>;
+  /** 新埋点去重与旧「首次接入不补发」索引隔离。 */
+  telemetrySuppressions: Set<string>;
+  /** 已观察、尚未结算的等待事实；只供埋点，不参与推送或模型候选决策。 */
+  waitingWindows: Map<string, WaitingWindow>;
+  ruleDecisions: Map<string, RuleObservation>;
   modelChecks: Map<string, ModelCheck>;
   /** 所有历史证据的判断索引；由旧/新事件重建，不改写日志。 */
   modelEvidence: Map<string, ModelCheck>;
@@ -403,6 +464,11 @@ export interface Feedback {
   replyId?: string;
   originalText?: string;
   card?: { title: string; firstScreen: string; returnCommand: string; at?: string };
+  codeVersion?: CodeVersion;
+  /** 漏报当时最近一次已提交的检测视图，不猜测用户指的是哪一个会话。 */
+  context?: { asOf: string | null; eventId: string | null; capturedAt?: string; unavailable?: 'no_completed_scan' | 'state_unavailable';
+    sessions: { key: string; tool: Tool; sessionId: string; status: Status; lastActivityAt: string;
+      originals: Original[]; ruleId?: RuleDecision['id']; modelCheckKey?: string }[] };
 }
 /** 渠道只发给用户本人，不替用户回复来源工具。编号只在结构化参数内。 */
 export interface Channel {
