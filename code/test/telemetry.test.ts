@@ -343,7 +343,7 @@ test('返修1-1：找不到材料引用不回退明文，旧原文记录仍可�
 });
 
 for (const scenario of ['cc', 'codex', 'pi', 'checkpoint', 'permission_push'] as const)
-  test(`返修1-2 ${scenario}：两次扫描间接话并有新回复，仍结算原等待；新回合独立计时`, async t => {
+  test(`返修1-2 ${scenario}：${scenario === 'permission_push' ? '红线已即时提醒，后续接话不重发' : '两次扫描间接话并有新回复，仍结算原等待；新回合独立计时'}`, async t => {
     const f = await fixture(t), tool = scenario === 'codex' || scenario === 'pi' ? scenario : 'cc';
     const newAt = at(3 + 1 / 6);
     const answer = (time: string, text: string) => { const row = ccAnswer(time); row.message.content[0]!.text = text; return row; };
@@ -365,7 +365,8 @@ for (const scenario of ['cc', 'codex', 'pi', 'checkpoint', 'permission_push'] as
     }
     await detect(f.config, at(1));
     const scope = scenario === 'permission_push' ? 'notice' : 'model_check';
-    assert.ok((await readEvents(f.config.dataDir)).some(e => e.kind === 'notice_suppressed' && e.reason === 'waiting_interval' && e.evidenceAt === at(0) && e.scope === scope));
+    if (scenario === 'permission_push') assert.equal((await readOutbox(f.config.dataDir)).length, 1);
+    else assert.ok((await readEvents(f.config.dataDir)).some(e => e.kind === 'notice_suppressed' && e.reason === 'waiting_interval' && e.evidenceAt === at(0) && e.scope === scope));
     if (scenario === 'checkpoint') {
       const state = packProjection(project(await readEvents(f.config.dataDir)));
       const archive = `events-000000000001-${hash('constructed-checkpoint')}.jsonl.gz`;
@@ -378,10 +379,12 @@ for (const scenario of ['cc', 'codex', 'pi', 'checkpoint', 'permission_push'] as
     await detect(f.config, at(4));
     const events = await readEvents(f.config.dataDir);
     const cancelled = events.filter(e => e.kind === 'notice_suppressed' && e.reason === 'user_replied' && e.evidenceAt === at(0) && e.scope === scope);
-    assert.equal(cancelled.length, 1);
-    const decision = cancelled[0]!; assert.ok(decision.kind === 'notice_suppressed');
-    assert.equal(decision.reply?.at, at(3));
-    assert.deepEqual(await readJsonl(f.capture), []); assert.deepEqual(await readOutbox(f.config.dataDir), []);
+    assert.equal(cancelled.length, scenario === 'permission_push' ? 0 : 1);
+    if (scenario !== 'permission_push') {
+      const decision = cancelled[0]!; assert.ok(decision.kind === 'notice_suppressed');
+      assert.equal(decision.reply?.at, at(3)); assert.deepEqual(await readOutbox(f.config.dataDir), []);
+    } else assert.equal((await readOutbox(f.config.dataDir)).length, 1);
+    assert.deepEqual(await readJsonl(f.capture), []);
     if (scenario !== 'permission_push') {
       assert.ok(events.some(e => e.kind === 'notice_suppressed' && e.reason === 'waiting_interval' && e.evidenceAt === newAt));
       await detect(f.config, at(8 + 1 / 6));
@@ -390,7 +393,7 @@ for (const scenario of ['cc', 'codex', 'pi', 'checkpoint', 'permission_push'] as
       assert.ok(checks(await readEvents(f.config.dataDir)).every(e => e.check.evidenceAt === newAt));
     }
     await detect(f.config, at(9));
-    assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'notice_suppressed' && e.reason === 'user_replied' && e.evidenceAt === at(0) && e.scope === scope).length, 1);
+    assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'notice_suppressed' && e.reason === 'user_replied' && e.evidenceAt === at(0) && e.scope === scope).length, scenario === 'permission_push' ? 0 : 1);
   });
 
 test('返修1-2：没有接话的新输出结清旧窗口，后续接话不串到更早一轮', async t => {

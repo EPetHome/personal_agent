@@ -99,7 +99,7 @@ function serializedState(view: Snapshot) {
     undeliveredNotices: undeliveredNotices(view.projection) };
 }
 /** 必须在数据锁内调用：决策先落盘，文件幂等交付，再分别确认外部渠道。 */
-async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>, deferSnapshots = false) {
+async function settle(config: Config, events: AgentEvent[], added: AgentEvent[], now: string, channels: Channel[], attempted: Set<string>, deferSnapshots = false, deferWaiting = false) {
   const previous = project(events);
   const raw = project([...events, ...added]);
   // 模型等待期间可能已有另一轮感知/反馈，不能用旧时间/旧会话覆盖新事实。
@@ -117,8 +117,9 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
   }
   applyModelChecks(records, projection, config, at);
   const suppressed: EventPayload[] = [];
-  const planned = planNotices(records, projection, config, at, suppressed).filter(n => !deferSnapshots || !standaloneSnapshot(n)
-    || projection.noticeSnapshots.has(noticeSnapshotKey(n)));
+  const planned = planNotices(records, projection, config, at, suppressed).filter(n =>
+    (!deferSnapshots || !standaloneSnapshot(n) || projection.noticeSnapshots.has(noticeSnapshotKey(n)))
+    && (!deferWaiting || n.kind !== 'waiting' || n.waitingDecision?.redline));
   for (const decision of suppressed) add(decision);
   for (const notice of planned) add({ kind: 'notice_planned', notice });
   const queued = activeProjection(project([...events, ...added]), config);
@@ -160,11 +161,22 @@ async function settle(config: Config, events: AgentEvent[], added: AgentEvent[],
       || !complete.channelDeliveryStates.has(key) || complete.channelDeliveryStates.get(key)?.historyUnknown
       || (complete.channelDeliveryStates.get(key)?.failures ?? 0) >= MAX_CHANNEL_FAILURES) continue;
     if (!await canDeliver(notice)) continue;
-    attempted.add(key);
+    const group: Notice[] = [notice];
+    if (channel.name === 'local' && notice.localBatch) for (const candidate of deliverable) {
+      const candidateKey = `${channel.name}:${candidate.id}`, state = complete.channelDeliveryStates.get(candidateKey);
+      if (candidate.id !== notice.id && candidate.localBatch?.id === notice.localBatch.id && accepts(channel, candidate)
+        && complete.channelDeliveries.get(candidateKey) === false && state && !state.historyUnknown
+        && state.failures < MAX_CHANNEL_FAILURES && !attempted.has(candidateKey) && await canDeliver(candidate)) group.push(candidate);
+    }
+    for (const candidate of group) attempted.add(`${channel.name}:${candidate.id}`);
+    const localBatch = channel.name === 'local' && notice.localBatch ? { ...notice.localBatch,
+      entries: notice.localBatch.entries.filter(entry => group.some(candidate => candidate.id === entry.noticeId)) } : undefined;
+    const outgoing = localBatch ? { ...notice, localBatch, content: { ...notice.content, title: localBatch.title } } : notice;
     let ok = true, failure;
-    try { await channel.send(notice); }
+    try { await channel.send(outgoing); }
     catch (error) { ok = false; failure = safeDeliveryFailure(error); await reportStorageFailure(config, error, channels); }
-    add({ kind: 'channel_delivery', channel: channel.name, noticeId: notice.id, ok, phase: 'attempted', ...(failure ? { failure } : {}) });
+    for (const candidate of group) add({ kind: 'channel_delivery', channel: channel.name, noticeId: candidate.id,
+      ok, phase: 'attempted', ...(failure ? { failure } : {}) });
     await flush();
   }
   const delivery = activeProjection(project([...events, ...added]), config), local = channels.find(channel => channel.name === 'local');
@@ -300,8 +312,9 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
       if (!last || JSON.stringify([last.errors, last.paths, last.fileFailures, last.sessionKeys, last.fileStats, last.fileStatsProfile, last.affectedSessions]) !== JSON.stringify([report.errors, report.paths, report.fileFailures, report.sessionKeys, report.fileStats, report.fileStatsProfile, report.affectedSessions])) add({ kind: 'source_health', report });
     }
     add({ kind: 'scan_completed' });
-    // 已过等候间隔的授权等待等确定提醒先交付，绝不等待其他会话的模型。
-    return settle(config, events, added, now, channels, attempted, deferSnapshots);
+    // 红线授权等确定提醒先交付，绝不等待其他会话的模型。
+    // 普通等待留到本轮模型队列结算后一起发；故障仍走原来的即时通道。
+    return settle(config, events, added, now, channels, attempted, deferSnapshots, !!config.judge);
   });
   if (!config.judge) return finish(ruleView);
   modelDeadline = Date.now() + (config.judge.cycleTimeoutMs ?? 60000);
@@ -321,12 +334,12 @@ async function detectOnce(config: Config, now: string, channels: Channel[], comp
       return true;
     });
     const snapshots = await checkSnapshotModels(pending, projection, config, now, persist, components.judge, modelDeadline);
-    const early = snapshots ? await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted, true)) : null;
+    const early = snapshots ? await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted, true, true)) : null;
     projection = await load();
     records = judgeRecords(projection, now);
     const remainingConfig = { ...config, judge: { ...config.judge!, cycleTimeoutMs: Math.max(0, modelDeadline - Date.now()) } };
     const changed = await checkModels(records, projection, remainingConfig, now, persist, components.judge);
-    if (!changed) return early;
+    if (!changed && !pending.some(n => n.kind === 'waiting' && !n.waitingDecision?.redline)) return early;
     const final = await withStoreLock(config.dataDir, async () => settle(config, await readEvents(config.dataDir), [], now, channels, attempted));
     return { ...final, noticesAdded: (early?.noticesAdded ?? 0) + final.noticesAdded };
   });
