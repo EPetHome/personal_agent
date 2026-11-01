@@ -8,6 +8,8 @@ import type { SessionIdentity, SourceComponent } from './types.ts';
 /** 每次遍历从同一只读 fd 的 0 位开始；内存仅含当前行，不连接整份原件。 */
 export class SourceReader {
   fingerprint = '';
+  lineCount = 0;
+  byteLength = 0;
   error: Error | undefined;
   identity: SessionIdentity | null = null;
   lastRecordAt: string | undefined;
@@ -36,6 +38,7 @@ export class SourceReader {
     const decoder = new StringDecoder('utf8');
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
+    let lineCount = 0;
     const fragments: string[] = [];
     while (true) {
       const bytes = readSync(this.handle.fd, buffer, 0, buffer.length, position);
@@ -51,6 +54,7 @@ export class SourceReader {
         fragments.length = 0;
         start = end + 1;
         this.observeHeader(line);
+        lineCount++;
         yield line;
       }
       if (start < chunk.length) fragments.push(chunk.slice(start));
@@ -60,8 +64,11 @@ export class SourceReader {
     if (fragments.length) {
       const line = fragments.join('');
       this.observeHeader(line);
+      lineCount++;
       yield line;
     }
+    this.lineCount = lineCount;
+    this.byteLength = position;
     this.fingerprint = digest.digest('hex');
     this.complete = true;
   }

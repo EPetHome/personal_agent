@@ -65,7 +65,12 @@ for (const prefix of ['metadata-only', 'pending-call', 'completed-prefix']) {
     const before = await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8');
     const eventCount = (await readEvents(f.config.dataDir)).length;
     assert.equal((await detect(f.config, '2026-10-20T10:40:00Z')).noticesAdded, 0);
-    assert.equal((await readEvents(f.config.dataDir)).length - eventCount, 1);
+    const appended = (await readEvents(f.config.dataDir)).slice(eventCount);
+    assert.deepEqual(appended.map(e => e.kind), ['scan_completed', 'notice_suppressed']);
+    assert.ok(appended[1]?.kind === 'notice_suppressed' && appended[1].reason === 'duplicate_notice');
+    const after = (await readEvents(f.config.dataDir)).length;
+    await detect(f.config, '2026-10-20T10:41:00Z');
+    assert.equal((await readEvents(f.config.dataDir)).length - after, 1, '重复抑制只追加一次，后续仍只记扫描');
     const second = await overview(f.config);
     assert.equal(second.records.find(r => r.sessionId === 'demo-codex')?.status, '进行中');
     await rm(join(f.config.dataDir, 'state.json'));

@@ -3,10 +3,11 @@ import { test } from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
+import childProcess from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { appendFile, chmod, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { detect, overview, rebuild } from '../src/core/agent.ts';
 import { receiveFeedback } from '../src/core/feedback.ts';
 import { event } from '../src/core/events.ts';
@@ -186,18 +187,74 @@ test('模型准备读写已耗尽整轮预算时全部延期，不启动判断�
   assert.ok(checks.every(e => e.check.error === '本轮模型时限用完，仅规则判断'));
 });
 
-test('返修2-2 总时限取消真实子进程替身，30秒单次超时不会突破2秒模型预算', async t => {
+async function assertRealProcessCancellation(t: TestContext, readyDelayMs: number) {
   const { root, config, channel } = await fixture(t, 1);
-  const command = join(root, 'fake-hanging-pi'); const pidFile = join(root, 'fake-pi.pid');
-  await writeFile(command, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},10000);\n`);
+  const command = join(root, 'fake-hanging-pi'), pidFile = join(root, 'fake-pi.pid');
+  const ready = `require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));`;
+  await writeFile(command, `#!${process.execPath}\n${readyDelayMs ? `setTimeout(()=>{${ready}},${readyDelayMs});` : ready}setInterval(()=>{},10000);\n`);
   await chmod(command, 0o700);
   config.judge!.executable = command; config.judge!.timeoutMs = 30000; config.judge!.cycleTimeoutMs = 2000;
+  type Observation = { child: ChildProcess; aliveAtLaunch: boolean; spawned: Promise<boolean>;
+    closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>; signal?: AbortSignal; timeout?: number };
+  const launched = deferred<Observation>(), execFile = childProcess.execFile;
+  let observed: Observation | undefined, calls = 0, cleaning = false;
+  // 仅旁观目标可执行文件，所有参数/回调和真实 execFile 原样转交；不冻结时钟、不改超时。
+  t.mock.method(childProcess, 'execFile', (...args: Parameters<typeof execFile>) => {
+    const child = Reflect.apply(execFile, childProcess, args) as ChildProcess;
+    if (args[0] === command) {
+      calls++;
+      let aliveAtLaunch = false;
+      if (child.pid !== undefined) try { process.kill(child.pid, 0); aliveAtLaunch = true; } catch {}
+      const observation: Observation = { child, aliveAtLaunch, signal: args[2]?.signal, timeout: args[2]?.timeout,
+        spawned: new Promise(resolve => {
+          child.once('spawn', () => resolve(true));
+          child.once('error', () => resolve(false));
+        }),
+        closed: new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal }))),
+      };
+      observed = observation; launched.resolve(observation);
+      if (cleaning) child.kill('SIGKILL');
+    }
+    return child;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
   const running = detect(config, now, { channels: [channel] });
-  let pid: number | undefined;
   try {
-    await within((async () => { while (pid === undefined) { try { const value = Number(await readFile(pidFile, 'utf8')); if (Number.isInteger(value) && value > 1 && value !== process.pid) pid = value; } catch {} if (pid === undefined) await delay(10); } })());
+    const actual = await within(launched.promise.then(async observation => {
+      assert.equal(await observation.spawned, true, '必须真实创建目标子进程，而非只记预留事件');
+      return observation;
+    })); // 捕获与 spawn 合计仍用原来的3秒就绪上限。
+    assert.ok(actual.child.pid !== undefined && actual.child.pid > 1 && actual.child.pid !== process.pid);
+    assert.equal(actual.aliveAtLaunch, true, '原生调用返回时必须确认该进程真实存活');
+    assert.equal(actual.timeout, 30000, '单次命令超时仍为30秒，必须由整轮预算取消');
     const view = await within(running, 5000);
+    const terminal = await within(actual.closed);
+    assert.equal(actual.signal?.aborted, true);
+    assert.equal(actual.child.killed, true);
+    assert.equal(terminal.code, null);
+    assert.ok(terminal.signal === 'SIGTERM' || terminal.signal === 'SIGKILL', '必须被信号取消，不能自然退出冒充取消');
+    assert.equal(actual.child.signalCode, terminal.signal, 'close 必须对应同一个已退出的子进程');
+    assert.equal(calls, 1);
     assert.ok(view.records.some(r => r.modelNotes?.includes('调用失败，仅规则判断')));
-    await within((async () => { while (true) { try { process.kill(pid!, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; } await delay(10); } })());
-  } finally { if (pid !== undefined) { try { process.kill(pid, 'SIGKILL'); } catch {} } await running.catch(() => {}); }
-});
+    const checks = (await readEvents(config.dataDir)).filter(e => e.kind === 'model_checked');
+    assert.ok(checks.some(e => e.check.failure?.category === 'timeout'));
+    const marker = await readFile(pidFile, 'utf8').catch(error => { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; });
+    if (marker !== undefined) assert.equal(Number(marker), actual.child.pid);
+    if (readyDelayMs) assert.equal(marker, undefined, '尚未写就绪标记也必须能观察并核验真实取消');
+  } catch (error) {
+    const events = await readEvents(config.dataDir);
+    t.diagnostic(JSON.stringify({ pidCaptured: observed?.child.pid !== undefined, aliveAtLaunch: observed?.aliveAtLaunch,
+      signalAborted: observed?.signal?.aborted, terminalSignal: observed?.child.signalCode,
+      modelCalls: events.filter(e => e.kind === 'model_call_started').length,
+      checks: events.filter(e => e.kind === 'model_checked').map(e => ({ error: e.check.error, category: e.check.failure?.category })) }));
+    throw error;
+  } finally {
+    cleaning = true;
+    if (observed && observed.child.exitCode === null && observed.child.signalCode === null) observed.child.kill('SIGKILL');
+    await running.catch(() => {});
+    if (observed) await observed.closed;
+  }
+}
+test('返修2-2 总时限取消真实子进程替身，30秒单次超时不会突破2秒模型预算', t => assertRealProcessCancellation(t, 0));
+test('门禁返修2：子进程未写PID标记就被预算取消，仍以真实spawn和close核验，不误判未启动', t => assertRealProcessCancellation(t, 10000));

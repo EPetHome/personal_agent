@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { hash } from './utils.ts';
+import { codeVersion } from './runtime-version.ts';
 import { indexModelEvidence, restoreModelEvidence } from './evidence.ts';
 import { findPushTarget, membersOf } from './sessions.ts';
 import { learnSkipBaseline } from './health.ts';
 import { applySessionDelta } from './session-delta.ts';
+import { advanceWaitingWindows, indexWaitingWindow } from './telemetry.ts';
 import { isSafeFailure, OperationFailure } from './failures.ts';
 import type { AgentEvent, ChannelDeliveryState, EventPayload, Projection, ProjectionState, PushRecord } from './types.ts';
 
@@ -16,12 +18,14 @@ export function event(payload: EventPayload, at: string): AgentEvent {
     // 原始事实身份包含对账字段，修正路径/项目的新事件不能被旧坏事件去重掉。
     id = `push:bound:${hash(JSON.stringify([pushIdentity(payload.push), payload.push.project, payload.push.transcriptPath]))}`;
   } else if (payload.kind === 'push_validated') id = `validated:${payload.pushId}:${payload.recordKey}`;
-  return { ...payload, version: 1, at, id };
+  return { ...payload, ...(payload.kind === 'notice_planned' ? { notice: { ...payload.notice, codeVersion: payload.notice.codeVersion ?? codeVersion } } : {}),
+    version: 1, at, id, codeVersion } as AgentEvent;
 }
 function emptyProjection(): Projection {
   return { sessions: new Map(), seenSessions: new Set(), pushes: [], rawPushes: new Map(), validatedPushIds: new Set(),
     emptyPushIds: new Set(), deferredPushes: new Map(), pushCursors: new Map(), pushMismatches: new Map(), legacyChecks: new Map(),
     health: new Map(), notices: [], deliveredNoticeIds: new Set(), lastScanAt: null, startedAt: null, suppressedNotices: new Map(),
+    telemetrySuppressions: new Set(), waitingWindows: new Map(), ruleDecisions: new Map(),
     modelChecks: new Map(), modelEvidence: new Map(), noticeSnapshots: new Map(), noticeReplies: new Map(), feedbackSuppressions: new Set(),
     modelCalls: new Map(), channelDeliveries: new Map(), channelDeliveryStates: new Map(), deliveryAlerted: new Set() };
 }
@@ -41,7 +45,7 @@ export function unpackProjection(state: ProjectionState): Projection {
   for (const [key, initial] of Object.entries(result)) {
     const value = (state as any)[key];
     // 丙段前的检查点缺计数/告警索引；允许读取，但下方把缺历史的待发渠道显式标为未知。
-    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted'].includes(key)) continue;
+    if (value === undefined && ['channelDeliveryStates', 'deliveryAlerted', 'telemetrySuppressions', 'waitingWindows', 'ruleDecisions'].includes(key)) continue;
     if (initial instanceof Map || initial instanceof Set || Array.isArray(initial)) {
       if (!Array.isArray(value)) throw new Error(`封存状态 ${key} 结构损坏`);
       (result as any)[key] = initial instanceof Map ? new Map(value) : initial instanceof Set ? new Set(value) : [...value];
@@ -74,11 +78,13 @@ export function project(events: AgentEvent[]): Projection {
       case 'session_delta': {
         const record = applySessionDelta(result.sessions.get(entry.delta.key), entry.delta);
         result.sessions.set(record.key, record);
+        advanceWaitingWindows(result.waitingWindows, record);
         for (const member of membersOf(record)) result.seenSessions.add(`${record.tool}:${member.sessionId}`);
         break;
       }
       case 'session_observed':
         result.sessions.set(entry.record.key, entry.record);
+        advanceWaitingWindows(result.waitingWindows, entry.record);
         for (const member of membersOf(entry.record)) result.seenSessions.add(`${entry.record.tool}:${member.sessionId}`);
         break;
       case 'session_seen': result.seenSessions.add(`${entry.tool}:${entry.sessionId}`); break;
@@ -121,12 +127,21 @@ export function project(events: AgentEvent[]): Projection {
       case 'scan_completed':
         result.startedAt ??= entry.at;
         result.lastScanAt = entry.at;
+        for (const observation of entry.ruleDecisions ?? []) result.ruleDecisions.set(observation.recordKey, observation);
         break;
       case 'notice_suppressed':
-        result.suppressedNotices.set(entry.dedupeKey, entry.evidenceAt);
+        if (!entry.reason || entry.reason === 'first_connection_history' || entry.reason === 'recovered_push') {
+          result.suppressedNotices.set(entry.dedupeKey, entry.evidenceAt);
+        }
+        if (entry.decisionKey) result.telemetrySuppressions.add(entry.decisionKey);
+        indexWaitingWindow(result.waitingWindows, entry);
         break;
       case 'notice_planned':
         if (!notices.has(entry.notice.id)) { result.notices.push(entry.notice); notices.add(entry.notice.id); }
+        if (entry.notice.kind === 'waiting') for (const [key, window] of result.waitingWindows) {
+          if (window.sessionKey === entry.notice.sessionKey && window.memberSessionId === (entry.notice.memberSessionId ?? result.sessions.get(window.sessionKey)?.sessionId)
+            && entry.notice.evidenceAt && window.evidenceAt <= entry.notice.evidenceAt) result.waitingWindows.delete(key);
+        }
         break;
       case 'notices_delivered':
         for (const id of entry.ids) result.deliveredNoticeIds.add(id);
@@ -138,6 +153,10 @@ export function project(events: AgentEvent[]): Projection {
       }
       case 'model_checked': {
         const check = entry.check;
+        if (check.task === 'waiting') for (const [key, window] of result.waitingWindows) {
+          if (window.scope === 'model_check' && window.sessionKey === check.recordKey && window.memberSessionId === check.sessionId
+            && window.evidenceAt <= check.evidenceAt) result.waitingWindows.delete(key);
+        }
         result.modelChecks.set(check.key, check);
         indexModelEvidence(result.modelEvidence, check);
         checksByFingerprint.set(`${check.recordKey}:${check.fingerprint}`, check);

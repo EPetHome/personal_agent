@@ -131,7 +131,12 @@ test('隔离：12 份坏文件按来源一条提醒、最多 3 例、正文 <=4K
   assert.ok(Buffer.byteLength(notice!.text) <= 4096);
   const before = await readEvents(f.config.dataDir);
   assert.equal((await detect(f.config, '2026-10-20T10:36:00Z')).noticesAdded, 0);
-  assert.equal((await readEvents(f.config.dataDir)).length - before.length, 1);
+  const appended = (await readEvents(f.config.dataDir)).slice(before.length);
+  assert.deepEqual(appended.map(e => e.kind), ['scan_completed', 'notice_suppressed']);
+  assert.ok(appended[1]?.kind === 'notice_suppressed' && appended[1].reason === 'duplicate_notice');
+  const after = (await readEvents(f.config.dataDir)).length;
+  await detect(f.config, '2026-10-20T10:37:00Z');
+  assert.equal((await readEvents(f.config.dataDir)).length - after, 1, '重复原因只记一次，不重复会话/健康快照');
 });
 
 test('隔离：曾读成功的文件后来损坏，不冒充本轮正常；修复后恢复，下一次故障新提醒', async t => {

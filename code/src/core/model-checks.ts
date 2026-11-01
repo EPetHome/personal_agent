@@ -3,7 +3,9 @@ import { indexModelEvidence, modelEvidenceFor, modelEvidenceKey, sameModelEviden
 import { driftTrigger, humanRequests, waitingReady } from './interaction.ts';
 import { requestedAction } from './notice-text.ts';
 import { modelSnapshot, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
-import { boundedContext, piJudge, validateJudgment } from './model.ts';
+import { boundedContext, judgmentReplay, piJudge, validateJudgment } from './model.ts';
+import { traceSuppression } from './telemetry.ts';
+import { protectReplay } from './replay.ts';
 import { compact, hash } from './utils.ts';
 import { ComponentFailure, safeFailure } from './process.ts';
 import type { Config, EventPayload, Judge, JudgedRecord, JudgmentContext, JudgmentRequest, ModelCheck, ModelFinding, Projection, SessionMember, SessionRecord, TaskSnapshotInput } from './types.ts';
@@ -119,9 +121,20 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
       || (previous?.error === '每日额度用完，仅规则判断' && previous.at.slice(0, 10) !== day);
     if (evidence && !retry) continue;
     // 首次接入的旧完成记录也不是新动静，不能先耗尽额度再轮到当前任务。
-    if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY
-      || (projection.startedAt && Date.parse(item.evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK)) continue;
-    if (item.task === 'drift' && (!item.context.newSteps.length || (previous && !retry && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES))) continue;
+    const suppressed: EventPayload[] = [];
+    const suppress = async (reason: Parameters<typeof traceSuppression>[3]) => {
+      traceSuppression(projection, suppressed, { dedupeKey: item.key, evidenceAt: item.evidenceAt, scope: 'model_check',
+        sessionKey: record.key, memberSessionId: item.sessionId }, reason);
+      for (const payload of suppressed.splice(0)) await persist(payload);
+    };
+    if (Date.parse(now) - Date.parse(item.evidenceAt) > ONE_DAY) { await suppress('model_evidence_24h'); continue; }
+    if (projection.startedAt && Date.parse(item.evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK) {
+      await suppress('first_connection_history'); continue;
+    }
+    if (item.task === 'drift' && (!item.context.newSteps.length || (previous && !retry && Date.parse(now) - Date.parse(previous.at) < TEN_MINUTES))) {
+      if (item.context.newSteps.length) await suppress('drift_cooldown');
+      continue;
+    }
     const check: ModelCheck = { key: item.key, recordKey: record.key, sessionId: item.sessionId, task: item.task,
       at: now, evidenceAt: item.evidenceAt, fingerprint: item.fingerprint, stepIds: item.stepIds, snapshotVersion: 1,
       summary: compact([...([previous?.summary ?? '', ...item.context.newSteps.map(s => s.text)].filter(Boolean).join('；'))].slice(-500).join(''), 500) };
@@ -140,6 +153,13 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
         additionalRequirements: item.snapshotInput.currentTask ? [item.snapshotInput.currentTask] : [], previousSummary: '', newSteps: [] } : item.context;
       const request: JudgmentRequest = { task: item.task, format: 'binary', context,
         ...(item.task === 'drift' ? { snapshotInputsByStep: item.snapshotInputsByStep } : { snapshotInput: item.snapshotInput }), draftSnapshot: !sameKind };
+      check.originals = record.originals;
+      check.replay = protectReplay(judgmentReplay(config.judge, request), [
+        { kind: 'session', key: record.key, data: projection.sessions.get(record.key) ?? record },
+        ...(previous ? [{ kind: 'model_check' as const, key: previous.key, data: previous }] : []),
+        ...[...projection.rawPushes].filter(([, push]) => push.tool === record.tool && push.sessionId === item.sessionId)
+          .map(([key, data]) => ({ kind: 'push' as const, key, data })),
+      ]);
       try {
         const answer = await timedModel(signal => judge.judge(request, { signal }), Math.min(config.judge.timeoutMs, deadline - performance.now()));
         try { check.result = validateJudgment(answer, request); }
@@ -158,6 +178,8 @@ export async function checkModels(records: JudgedRecord[], projection: Projectio
       }
     }
     if (check.error) {
+      if (check.error === '每日额度用完，仅规则判断') await suppress('model_daily_limit');
+      if (check.error === DEFERRED) await suppress('model_cycle_timeout');
       // 失败/超限并未完成判断，不吞步骤；下一轮重试仍提供相同证据。
       check.stepIds = previous?.stepIds ?? [];
       check.summary = previous?.summary ?? '';
@@ -175,6 +197,7 @@ function ruleWaiting(record: JudgedRecord, item: Candidate, now: string): void {
   if (!question || !/[？?]|(?:请|需要你|等你).*(?:确认|选择|授权|回复|提供|核销)|是否/.test(question)) return;
   record.ruleWaiting = { sessionId: item.sessionId, evidenceAt: item.evidenceAt, reply: item.context.assistantReply };
   record.status = '在等我';
+  if (record.rule) record.rule = { ...record.rule, id: 'fallback_explicit_question' };
   record.reason = '判断模型不可用，仅按助手最后一个明确问题兜底；尚需你回复或确认';
 }
 function applyDrift(record: JudgedRecord, finding: ModelFinding): void {
@@ -203,6 +226,7 @@ export function applyModelChecks(records: JudgedRecord[], projection: Projection
       if (Date.parse(now) - Date.parse(check.evidenceAt) > ONE_DAY) {
         if (!locallyBlind && Date.parse(now) - Date.parse(record.lastActivityAt) > ONE_DAY) {
           record.status = '已搁置';
+          if (record.rule) record.rule = { ...record.rule, id: 'model_fact_inactive_24h', facts: { ...record.rule.facts, thresholdMs: ONE_DAY } };
           record.reason = '模型先前判断可能需要你处理，但已超过 24 小时没有新动静；只进总览，不提醒';
         }
         continue;

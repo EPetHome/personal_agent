@@ -100,7 +100,12 @@ for (const tool of ['codex', 'pi'] as const) {
     assert.deepEqual((await rebuild(f.config)).records, view.records);
     const count = (await readEvents(f.config.dataDir)).length;
     assert.equal((await detect(f.config, '2026-10-20T10:03:00Z')).noticesAdded, 0);
-    assert.equal((await readEvents(f.config.dataDir)).length - count, 1);
+    const appended = (await readEvents(f.config.dataDir)).slice(count);
+    assert.deepEqual(appended.map(e => e.kind), ['scan_completed', 'notice_suppressed']);
+    assert.ok(appended[1]?.kind === 'notice_suppressed' && appended[1].reason === 'duplicate_notice');
+    const after = (await readEvents(f.config.dataDir)).length;
+    await detect(f.config, '2026-10-20T10:04:00Z');
+    assert.equal((await readEvents(f.config.dataDir)).length - after, 1, '同一重复抑制只留痕一次，之后仍只记扫描');
     assert.ok((await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8')).startsWith(prefix));
   });
 }
