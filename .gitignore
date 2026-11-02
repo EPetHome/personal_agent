@@ -10,3 +10,8 @@ logs/
 文档/
 # 本机权限设置
 .claude/settings.local.json
+
+# 评测真实材料（含题目索引，避免身份信息进入公开仓库）
+/eval/cases/
+/eval/runs/
+/eval/待标注/

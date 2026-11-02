@@ -4,7 +4,7 @@
   "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
   "stages": {
     "叫与不叫": {
-      "prompt": "../../prompt/提示词-叫与不叫.md",
+      "prompt": "../../prompt/xx/提示词-叫与不叫.md",
       "scope": { "allow": ["code/", "docs/batches/叫与不叫-20261101/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples", "eval/"] }
     }
   },

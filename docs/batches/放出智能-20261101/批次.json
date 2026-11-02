@@ -1,12 +1,29 @@
 {
   "name": "放出智能-20261101",
   "branch": "feat/放出智能",
-  "pi": { "model": "openai-codex/gpt-6.1-sol", "thinking": "max" },
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max"
+  },
   "stages": {
     "放出智能": {
-      "prompt": "../../prompt/提示词-放出智能.md",
-      "scope": { "allow": ["code/", "docs/batches/放出智能-20261101/结果.md"], "deny": ["docs/batches/闭环1-感知与总览-20261025/samples", "docs/batches/真实格式兼容-20261025/samples", "eval/"] }
+      "prompt": "../../prompt/xx/提示词-放出智能.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/放出智能-20261101/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
     }
   },
-  "steps": [["放出智能"]]
+  "steps": [
+    [
+      "放出智能"
+    ]
+  ]
 }
