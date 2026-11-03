@@ -61,11 +61,15 @@ export function refreshTicketProgress(state: LedgerState, add: (change: LedgerCh
       continue;
     }
     // 已交回的补查只是历史派工；失败/完成都不能压住后来的干活派工。
-    const assignments = Object.values(state.tables.assignments).filter(row => row.ticketId === id && !row.endedAt);
+    const active = Object.values(state.tables.assignments).filter(row => row.ticketId === id && !row.endedAt);
+    const lifecycle = active.filter(row => row.state !== 'queue');
+    const assignments = lifecycle.length ? lifecycle : active;
+    const queuePaused = active.some(row => row.state === 'queue' && ['returned', 'returning', 'blocked', 'stopped'].includes(String(state.events[row.lastEventId]?.detail.status)));
     const assessment = (eventId: string) => state.tables.assessments[`assessment:${eventId}`];
     const stops = assignments.filter(row => ['needs_decision', 'paused', 'repair_limit', 'failed'].includes(row.state) && !assessment(row.lastEventId)?.suppressed);
-    const status = stops.length ? stops.some(row => !!assessment(row.lastEventId)) ? 'waiting_user' : 'pending_verification'
-      : assignments.some(row => ['started', 'resumed'].includes(row.state) || assessment(row.lastEventId)?.suppressed) ? 'running'
+    const readOnlyReturned = assignments.length && assignments.every(row => row.state === 'completed' && state.events[row.lastEventId]?.native?.batch.recipe === 'review-only');
+    const status = readOnlyReturned ? 'result_returned' : stops.length ? stops.some(row => !!assessment(row.lastEventId)) ? 'waiting_user' : 'pending_verification'
+      : queuePaused ? 'waiting' : assignments.some(row => ['started', 'resumed'].includes(row.state) || assessment(row.lastEventId)?.suppressed) ? 'running'
         : assignments.some(row => row.state === 'queue') ? 'waiting'
           : assignments.length && assignments.every(row => row.state === 'completed')
             ? assignments.every(row => {

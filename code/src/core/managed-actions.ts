@@ -230,9 +230,9 @@ export async function dispatchWrites(config: Config, at: string, worker?: LoopWo
     let receipt: WorkerReceipt;
     try {
       if (claimed.write.execution) receipt = worker?.execute ? await worker.execute({ ...claimed.write.execution, requestId: claimed.write.id,
-        project: claimed.assignment.project, batch: claimed.assignment.batch, stage: claimed.assignment.stage, source: 'user_via_pa', force: false, checkSecrets: true, protectedBranches: ['main', 'master'] })
+        project: claimed.assignment.project, batch: claimed.assignment.batch, batchFile: claimed.assignment.batchFile, stage: claimed.assignment.stage, source: 'user_via_pa', force: false, checkSecrets: true, protectedBranches: ['main', 'master'] })
         : { requestId: claimed.write.id, status: 'failed', reason: 'worker 未配置执行接口，没有执行' };
-      else receipt = worker ? await worker.send({ requestId: claimed.write.id, batch: claimed.assignment.batch, stage: claimed.assignment.stage, text: claimed.write.text, source: claimed.write.automation ? 'pa_auto' : 'user_via_pa' })
+      else receipt = worker ? await worker.send({ requestId: claimed.write.id, project: claimed.assignment.project, batch: claimed.assignment.batch, batchFile: claimed.assignment.batchFile, stage: claimed.assignment.stage, text: claimed.write.text, source: claimed.write.automation ? 'pa_auto' : 'user_via_pa' })
         : { requestId: claimed.write.id, status: 'failed', reason: '未配置 worker 命令，没有投递' };
     }
     catch { receipt = { requestId: claimed.write.id, status: 'uncertain', reason: '适配器失败/超时，可能已送到，不重发', failure: true }; }

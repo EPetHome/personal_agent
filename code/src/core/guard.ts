@@ -58,9 +58,10 @@ export function guardWrite(state: LedgerState, write: ManagedWrite): WriteDecisi
   const deny = (reason: string) => ({ allowed: false, reason, redline });
   if (!ticket || !assignment || !card || assignment.ticketId !== ticket.id || card.ticketId !== ticket.id || card.assignmentId !== assignment.id)
     return deny('不能指向明确的那条派工');
-  if (!assignment.stage || assignment.worker !== 'loop' || assignment.project !== ticket.project || assignment.batch !== ticket.batch)
+  if (!assignment.stage || assignment.worker !== 'loop' || assignment.project !== ticket.project || assignment.batch !== ticket.batch || assignment.batchFile && assignment.batchFile !== ticket.batchFile)
     return deny('派工身份缺失或不一致');
-  if (Object.values(state.tables.assignments).some(other => other.id !== assignment.id && other.worker === assignment.worker && other.batch === assignment.batch && other.stage === assignment.stage))
+  if (Object.values(state.tables.assignments).some(other => other.id !== assignment.id && other.worker === assignment.worker && other.batch === assignment.batch && other.stage === assignment.stage && (other.state === 'queue') === (assignment.state === 'queue')
+    && (!assignment.batchFile || other.project === assignment.project && other.batchFile === assignment.batchFile)))
     return deny('相同批次名和段对应多条派工，当前loop接口不能唯一定位；请先澄清批次身份');
   if (!intent?.confirmed || intent.version !== write.intentVersion) return deny('没有当前有效的授权；不能跨意图卡借权限');
   if (intent.pausedActions?.includes(write.action)
@@ -78,6 +79,7 @@ export function guardWrite(state: LedgerState, write: ManagedWrite): WriteDecisi
       || JSON.stringify(approval.target) !== JSON.stringify(target) || !intent.boundaries.execute.includes(`loop_${target.action}`)) return deny('缺少这一个执行对象的逐条授权');
     if (!card.executions?.some(allowed => JSON.stringify(allowed) === JSON.stringify(target))) return deny('该动作不属于当前卡片');
     if (target.action === 'push' || target.action === 'merge') {
+      if (Object.values(state.tables.assignments).some(row => row.ticketId === ticket.id && row.state === 'queue' && !row.endedAt && state.events[row.lastEventId]?.detail.status !== 'ready')) return deny('合入队列尚未就绪或已退回，旧完成卡不能放行发布；请先重新核实');
       const assessment = card.assessmentId ? state.tables.assessments[card.assessmentId] : undefined;
       if (assignment.state !== 'completed' || !assessment?.commit || assessment.commit.result === 'missing' || assessment.commit.resolved !== target.commit)
         return deny('完成提交尚未核实，不能推送或合入');

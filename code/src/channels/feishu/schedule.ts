@@ -11,6 +11,9 @@ export interface ScheduleReader {
   minute(token: string): Promise<MinuteMaterial>;
   discoverMinutes?(ownerIds: string[], from: string, to: string): Promise<string[]>;
 }
+export class ScheduleAuthorizationMissing extends Error {
+  constructor() { super('日历/妙记未就绪：缺少本人用户授权令牌；只有应用凭据不能读取，需用户完成授权。'); }
+}
 type Sdk = typeof import('@larksuiteoapi/node-sdk');
 const quiet = { trace() {}, debug() {}, info() {}, warn() {}, error() {} };
 /** 只读官方SDK；凭证/SDK报文不进入账本、卡片或日志。注入http仅供离线验证。 */
@@ -28,8 +31,10 @@ export async function feishuScheduleReader(config: Config, dependencies: {
     credentials = { appId: process.env.FEISHU_APP_ID ?? file.FEISHU_APP_ID ?? '', appSecret: process.env.FEISHU_APP_SECRET ?? file.FEISHU_APP_SECRET ?? '',
       userAccessToken: process.env.FEISHU_USER_ACCESS_TOKEN ?? file.FEISHU_USER_ACCESS_TOKEN ?? '' };
   }
-  if (!/^cli_[0-9a-fA-F]{16}$/.test(credentials.appId) || !credentials.appSecret || !credentials.userAccessToken) throw new Error('日程需要本人授权的用户凭证，请检查环境或.env');
+  if (!credentials.userAccessToken) throw new ScheduleAuthorizationMissing();
+  if (!/^cli_[0-9a-fA-F]{16}$/.test(credentials.appId) || !credentials.appSecret) throw new Error('日程需要有效应用凭据引用，请检查环境或.env');
   const sdk = await (dependencies.loadSdk?.() ?? import('@larksuiteoapi/node-sdk'));
+  // SAFETY: SDK默认HTTP实例实现同一request接口；包装仅补timeout，其他方法由原型保留。
   const upstream: HttpInstance = dependencies.httpInstance ?? sdk.defaultHttpInstance as unknown as HttpInstance;
   const http = Object.create(upstream) as HttpInstance;
   http.request = options => upstream.request({ ...options, timeout: schedule.timeoutMs });

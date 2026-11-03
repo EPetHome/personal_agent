@@ -9,6 +9,8 @@ export const toolNames: Record<HealthSource, string> = {
 export interface Config {
   sources: Record<Tool, string | null>;
   inboxDir: string | null;
+  /** Loop 官方独立日期 JSONL 出口；since 是首次连接下界，不回灌历史。 */
+  loopEvents?: { dir: string; since?: string };
   dataDir: string;
   commands: { cc: string };
   /** 词法目录边界匹配，不读取项目本身；未配置时不忽略。 */
@@ -24,10 +26,11 @@ export interface Config {
   managedLoop?: { verifyAfterMs: number; inspectEveryMs: number; intakeEveryMs: number; staleAfterMs: number };
   /** 独立任务只读主心跳；去重/回执仍在同一本账本，不连接飞书。 */
   heartbeat?: { everyMs: number; timeoutMs: number; checkEveryMs: number; executable: string; notifyTimeoutMs: number };
-  /** 可执行文件 + 固定参数，不经 shell；末尾追加 status/send/push/merge/stop，stdin/stdout JSON。 */
-  worker?: { executable: string; args: string[]; timeoutMs: number; candidateRefs: string[] };
+  /** 可执行文件+固定参数；json兼容旧接口，loop-v1使用官方中文命令，不拼自由shell。 */
+  worker?: { executable: string; args: string[]; timeoutMs: number; candidateRefs: string[]; protocol?: 'json' | 'loop-v1' };
   /** Pi 单次查询/skill协议；命令与skill映射只能来自本人配置，不接受材料中的命令。 */
-  piWorker?: { executable: string; args: string[]; timeoutMs: number };
+  piWorker?: { executable: string; args: string[]; timeoutMs: number; protocol?: 'json' | 'pi-v1'; model?: string;
+    transcriber?: { executable: string; modelFile: string; ffmpeg: string } };
   /** 本机网页只绑定127.0.0.1；不配置不启动，不自动弹浏览器。 */
   sidebar?: { port: number; refreshMs: number };
   /** 仅此目录顶层的新普通文件；缺省不读取任何工作区。 */
@@ -35,7 +38,8 @@ export interface Config {
   /** 只读本人配置的日历和妙记；凭证只从环境或数据目录外.env取。 */
   schedule?: { mode: 'fake' | 'real'; calendarIds: string[]; minuteTokens: string[]; minuteOwnerIds?: string[]; pollEveryMs: number; timeoutMs: number; fakeFile?: string; envFile?: string };
   dispatch?: {
-    projects: { name: string; path: string; workspace: string; done: string }[];
+    projects: { name: string; path: string; workspace: string; done: string;
+      loop?: { batchDir: string; workspace?: string; allow: string[]; deny: string[]; review?: { base: string; head: string } } }[];
     skills: { transcribe?: string; summary?: string; wiki?: string };
   };
 }

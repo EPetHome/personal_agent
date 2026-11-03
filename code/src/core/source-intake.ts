@@ -4,16 +4,17 @@ import { readLedger, updateLedger } from './ledger.ts';
 import { recoverDeadLock, withNamedLock } from './locks.ts';
 import { taskSandbox } from './task-adapter.ts';
 import { hash, object } from './utils.ts';
-import { feishuScheduleReader } from '../channels/feishu/schedule.ts';
+import { decodeJson } from './protocol-json.ts';
+import { feishuScheduleReader, ScheduleAuthorizationMissing } from '../channels/feishu/schedule.ts';
 import type { ScheduleReader, MinuteMaterial } from '../channels/feishu/schedule.ts';
 import type { Config } from './types.ts';
 import type { CalendarMeeting, SourceMaterial } from './managed-types.ts';
 
-async function health(config: Config, id: string, at: string, ok: boolean) {
+async function health(config: Config, id: string, at: string, ok: boolean, detail?: string) {
   await updateLedger(config.dataDir, at, (state, add) => {
-    const old = state.tables.health[id]; if (old?.ok === ok || !old && ok) return;
-    add({ kind: 'put', table: 'health', value: { id, at, ok, kind: 'source', episode: ok ? '' : `${id}:${state.seq + 1}`,
-      reason: ok ? '来源已恢复' : '配置的收件箱/日历/妙记读取失败；保留已读事实，请检查路径、权限、网络或用户授权（不保存上游报文）' } });
+    const reason = ok ? '来源已恢复' : detail ?? '配置的收件箱/日历/妙记读取失败；保留已读事实，请检查路径、权限、网络或用户授权（不保存上游报文）';
+    const old = state.tables.health[id]; if (old?.ok === ok && old.reason === reason || !old && ok) return;
+    add({ kind: 'put', table: 'health', value: { id, at, ok, kind: 'source', episode: ok ? '' : `${id}:${state.seq + 1}`, reason } });
   });
 }
 function media(path: string): SourceMaterial['media'] {
@@ -45,7 +46,7 @@ async function fakeReader(config: Config, at: string): Promise<ScheduleReader> {
   const path = config.schedule!.fakeFile!, box = await taskSandbox(config, dirname(path), at);
   const page = await box.text(path, 1, 1000, 524288);
   if (!page.eof) throw new Error('假日程超过读取上限');
-  const raw = object(JSON.parse(page.text), '假日程快照');
+  const raw = object(decodeJson(page.text), '假日程快照');
   if (!Array.isArray(raw.meetings ?? []) || !Array.isArray(raw.minutes ?? [])) throw new Error('假日程格式不合法');
   return { async calendar(calendarId) {
     return (raw.meetings ?? []).filter((row: any) => row?.calendarId === calendarId && row.cancelled !== true && row.busy !== false).map((row: any) => {
@@ -87,7 +88,7 @@ export async function intakeConfiguredSources(config: Config, at: string, inject
     await polled('poll:schedule');
     let reader: ScheduleReader;
     try { reader = injected ?? (schedule.mode === 'fake' ? await fakeReader(config, at) : await feishuScheduleReader(config)); }
-    catch { await health(config, 'source:schedule', at, false); return; }
+    catch (error) { await health(config, 'source:schedule', at, false, error instanceof ScheduleAuthorizationMissing ? error.message : undefined); return; }
     await health(config, 'source:schedule', at, true);
     const from = new Date(Date.parse(at) - 86400000).toISOString(), to = new Date(Date.parse(at) + 7 * 86400000).toISOString();
     for (const calendarId of schedule.calendarIds) {

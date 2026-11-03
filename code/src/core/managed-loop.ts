@@ -28,7 +28,7 @@ export interface ManagedComponents { channels: ManagedChannel[]; worker?: LoopWo
 /** 闸门只读账本研判，写待发；不访问 worker 或渠道。 */
 export function gateAssessments(state: LedgerState, add: (change: LedgerChange) => void, at: string) {
   for (const assignment of Object.values(state.tables.assignments)) {
-    if (assignment.worker !== 'loop' || !state.events[assignment.lastEventId]) continue;
+    if (assignment.worker !== 'loop' || assignment.endedAt || !state.events[assignment.lastEventId]) continue;
     const assessment = state.tables.assessments[`assessment:${assignment.lastEventId}`];
     if (!assessment || assessment.eventId === assignment.assessedEventId) continue;
     const event = state.events[assignment.lastEventId]!;
@@ -56,8 +56,16 @@ export function gateAssessments(state: LedgerState, add: (change: LedgerChange) 
     const card: ManagedCard = { id: assignment.ticketId, ticketId: assignment.ticketId, assignmentId: assignment.id, eventId: event.id,
       assessmentId: assessment.id, revision: (old?.revision ?? 0) + 1, at, title: `${event.batch} · ${titles[event.state] ?? event.state}`,
       fact: assessment.fact, question: assessment.question, suggestion: assessment.suggestion, basis: assessment.basis,
-      options: assessment.options, redline: assessment.redline, urgency: event.state === 'completed' ? 'completion' : 'decision', actionMode: event.state === 'completed' ? 'none' : event.state === 'repair_limit' ? 'repair' : 'reply' };
-    if (event.state === 'completed' && assessment.commit?.result !== 'missing' && assessment.commit?.resolved && validBatchBranch(assessment.commit.branch)) {
+      options: assessment.options, redline: assessment.redline, urgency: event.state === 'completed' ? 'completion' : 'decision', actionMode: event.state === 'completed' || event.stage === '@batch' && event.detail.next === 'manual' ? 'none' : event.state === 'repair_limit' ? 'repair' : 'reply' };
+    if (event.state === 'queue') {
+      const completed = Object.values(state.tables.assignments).find(row => row.ticketId === assignment.ticketId && row.stage === assignment.stage && row.state === 'completed' && !row.endedAt);
+      const completion = completed ? state.tables.assessments[`assessment:${completed.lastEventId}`] : undefined;
+      if (completion) {
+        card.fact += `\n最近完成报告（不代替本次队列结论）：\n${completion.fact}`;
+        card.basis += `\n完成事实仍保留：${completion.eventId}；${completion.basis}`;
+      }
+    }
+    if (event.state === 'completed' && !assessment.status?.executionBlock && assessment.commit?.result !== 'missing' && assessment.commit?.resolved && validBatchBranch(assessment.commit.branch)) {
       const target = { branch: assessment.commit.branch, commit: assessment.commit.resolved,
         ...(assessment.commit.result === 'candidate' ? { candidateRef: assessment.commit.ref } : {}) };
       card.executions = [{ action: 'merge', ...target }];

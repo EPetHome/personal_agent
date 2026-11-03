@@ -48,7 +48,7 @@ export async function assessLoop(config: Config, state: LedgerState, assignment:
     suggestion: '', basis: '', redline: false, mismatch: false, suppressed: false, reads, queryMs: 0 };
   if (worker) {
     try {
-      result.status = await worker.status(event.batch, event.project);
+      result.status = await worker.status(event.batch, event.project, event.batchFile);
       const stage = result.status.stages.find(stage => stage.name === event.stage);
       if (['needs_decision', 'paused', 'repair_limit', 'failed'].includes(event.state) && stage && ['started', 'resumed', 'running', 'completed'].includes(stage.state)) {
         result.suppressed = true; result.mismatch = true; result.fact = `loop 说停了，核实状态是 ${stage.state}，不叫用户`;
@@ -81,11 +81,12 @@ export async function assessLoop(config: Config, state: LedgerState, assignment:
       : commit.result === 'candidate' ? `已核实合入候选提交 ${commit.resolved}；还没提交到分支 ${commit.branch}`
         : `已核实批次分支 ${commit.branch} 包含提交 ${commit.resolved}`;
     result.mismatch ||= commit.result === 'missing';
-    result.fact += `\n门禁（loop 报告）：${string(event.detail.gate) || '未提供'}；评审（loop 报告）：${string(event.detail.review) || '未提供'}`;
+    const describe = (value: unknown) => typeof value === 'string' ? value : value && typeof value === 'object' ? JSON.stringify(value) : '未提供';
+    result.fact += `\n门禁（loop 报告）：${describe(event.detail.gate)}；评审（loop 报告）：${describe(event.detail.review)}`;
     if (event.detail.acceptance && typeof event.detail.acceptance === 'object') {
       const acceptance = event.detail.acceptance as Record<string, unknown>;
-      result.fact += `\n验收（loop 报告）：${string(acceptance.result) || '未知'}；人工项：${Array.isArray(acceptance.manual) ? acceptance.manual.join('；') || '无' : '未提供'}`;
-      for (const key of ['failed', 'partial']) if (Array.isArray(acceptance[key]) && acceptance[key].length) result.fact += `\n${key === 'failed' ? '失败' : '部分验证'}：${acceptance[key].join('；')}`;
+      result.fact += `\n验收（loop 报告）：${string(acceptance.verdict) || string(acceptance.result) || '未知'}；人工项：${Array.isArray(acceptance.manual) ? acceptance.manual.map(describe).join('；') || '无' : '未提供'}`;
+      for (const key of ['failed', 'partial']) if (Array.isArray(acceptance[key]) && acceptance[key].length) result.fact += `\n${key === 'failed' ? '失败' : '部分验证'}：${acceptance[key].map(describe).join('；')}`;
     } else result.fact += '\n验收：未提供；业务验收未核销';
   }
   if (event.state === 'needs_decision') {
@@ -100,6 +101,16 @@ export async function assessLoop(config: Config, state: LedgerState, assignment:
     result.basis = '依据本机 Git 只读核实与 loop 报告；开发、门禁、评审、合入和业务验收分开，不互相代替。';
   } else {
     result.suggestion = actual === '测试失败' ? '继续，先排查并修复刚才的测试失败，保持原任务范围，再运行原门禁。' : actual === '磁盘不足' ? '先只读检查可用空间与占用，列出处理选项等我决定。' : '继续'; result.basis = actual ? `依据只读日志核实：${actual}。只建议在原任务范围内继续，是否送出由你决定。` : '没把握：没有足够证据给出具体修复方案；可回电脑核实，或仅在原任务范围内继续。';
+  }
+  if (event.stage === '@batch' && event.detail.next === 'manual') {
+    result.suggestion = '请在电脑上处理Loop指出的问题；不能自动续跑'; result.redline = true;
+  }
+  if (event.stage === '@batch' && event.detail.next === 'grant') {
+    result.suggestion = '请按当前标准逐项输入「同意授权：编号」或「不授权：编号」；普通继续不是授权'; result.redline = true;
+  }
+  if (event.state === 'completed' && event.native?.batch.recipe === 'review-only') {
+    result.commit = undefined; result.fact = `只评审报告已产出（不表示无必修或业务通过）：${string(event.detail.report) || '报告路径未提供'}`;
+    result.suggestion = '查看只读评审报告；不返修、不提交、不进合入队列';
   }
   const memories = confirmedMemories(state).filter(row => row.kind === 'rule'
     ? row.rule?.key === ruleKey(event.project, event.reason.category, result.question, result.options)
@@ -134,6 +145,7 @@ export async function assessLoop(config: Config, state: LedgerState, assignment:
   for (const memory of memories.filter(row => row.kind !== 'rule')) result.basis += `\n已确认${memory.kind}记忆 ${memory.id} v${memory.version}：${memory.subject}：${memory.content}（仅作参照，不扩大权限）`;
   result.redline ||= majorConsequences([event.reason.text, result.question, result.suggestion, ...result.options].join('\n'));
   if (result.statusFailure) result.fact += `\n${result.statusFailure}`;
+  if (event.state === 'completed' && result.status?.executionBlock) result.fact += `\n未就绪：${result.status.executionBlock}`;
   result.queryMs = Math.round(performance.now() - began);
   // 只保存原件范围/指纹，不把读到的全文复制进新库。
   result.basis += `\n来源事件：${event.id}；证据：${material.map(item => `${item.path}（${hash(item.text).slice(0, 12)}）`).join('；') || '无可读证据'}`;
