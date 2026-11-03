@@ -28,9 +28,9 @@ function confirmation(feedback: Feedback, notice?: Notice): string {
   if (feedback.verdict === '正确') return '已记下：这次提醒对你有用，不会记成问题。';
   if (feedback.verdict === '误报' && notice && feedbackSuppressionKey(notice)) {
     const reasons: Partial<Record<Notice['kind'], string>> = { waiting: '等你回复或授权', drift: '可能跑偏', stalled: '停滞', blind: '看不见了', unreadable: '会话读不了', loop_paused: 'loop 暂停', loop_completed: 'loop 完成' };
-    return `已记下：这个会话之后不会再因为${reasons[notice.kind] ?? '同一种原因'}叫你；这条进了本周的问题汇总。`;
+    return `已记下：这个会话之后不会再因为${reasons[notice.kind] ?? '同一种原因'}叫你；反馈已保存。`;
   }
-  return `已记下：这条进了本周的问题汇总。${feedback.verdict === '误报' ? '这张提醒未定位到具体会话，不会压住其他会话。' : ''}`;
+  return `已记下：反馈已保存。${feedback.verdict === '误报' ? '这张提醒未定位到具体会话，不会压住其他会话。' : ''}`;
 }
 
 /** 只锁反馈的短读写，不和整轮检测共用数据锁。所有读取也须经此锁，不能读到追加中的半行。 */

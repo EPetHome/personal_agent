@@ -132,7 +132,6 @@ main();
 `); await chmod(executable, 0o700);
   f.config.commands.cc = executable;
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 };
-  f.config.learning = false;
   if (options.enabled !== false) f.config.relay = { enabled: true, ccSessionsDir: registry, timeoutMs: 5000 };
   await validateConfig(f.config);
   const id = randomUUID();
@@ -303,7 +302,7 @@ test('长转达不持检测/收件/反馈锁：CC等闸门时继续检测、接�
   await f.click('按建议回'); const began = performance.now(); await f.click('确认发送', undefined, false);
   await waitFor(async () => (await f.calls()).length === 1);
   try {
-    const detection = await detect(f.config, new Date().toISOString(), { channels: [f.channel] }); assert.ok(detection.records.length);
+    const detection = await detect(f.config, new Date().toISOString(), { channels: [f.channel] }); assert.deepEqual(detection.records, []);
     const detectRelease = await acquireLock(f.config.dataDir, '.detect.lock');
     try { await f.push(f.envelope({ action: 'feedback', verdict: '正确', noticeId: f.notice.id }), false); }
     finally { await detectRelease(); }
@@ -385,7 +384,7 @@ test('预览更新失败不能拿隐藏值确认发送，只留失败与一次�
   } finally { await channel.stop(); }
 });
 
-test('完整检测链：构造会话→判断等待→飞书新卡→建议预览→同会话续话→原回复回卡', async t => {
+test('减法后兼容旧卡：不生成聊天卡，旧卡建议预览→同会话续话→原回复回卡', async t => {
   const f = await fixture(t);
   const config = { ...f.config, dataDir: join(f.root, 'detected-data'), judge: { executable: '/not-called', model: 'synthetic', timeoutMs: 1000 } };
   const channel = feishuChannel(config);
@@ -395,6 +394,8 @@ test('完整检测链：构造会话→判断等待→飞书新卡→建议预�
         actionItems: [{ label: '回复会话', text: '第二种方案继续吗？', suggestion: '是' }] };
     } } });
     const sent = () => readJsonl<SentMessage>(join(config.dataDir, 'feishu-sent.jsonl'));
+    assert.deepEqual(await sent(), [], '检测不能生成聊天卡片');
+    await appendOutbox(config.dataDir, f.notice); await channel.send(f.notice);
     const message = (await sent()).find(row => row.type === 'interactive')!; assert.ok(message);
     const latest = async () => (await sent()).filter(row => row.messageId === message.messageId).at(-1)!.content;
     for (const label of ['按建议回', '确认发送']) {
@@ -402,7 +403,7 @@ test('完整检测链：构造会话→判断等待→飞书新卡→建议预�
       const raw: any = f.envelope(button.value); raw.event.context.open_message_id = message.messageId;
       await channel.capture(raw); await channel.drain(); await channel.settled();
     }
-    assert.equal((await f.calls()).length, 1); assert.equal((await f.calls())[0]!.text, '是');
+    assert.equal((await f.calls()).length, 1); assert.equal((await f.calls())[0]!.text, advice);
     assert.match(JSON.stringify(await latest()), /已送到/);
   } finally { await channel.stop(); }
 });
@@ -414,7 +415,7 @@ test('转达日志损坏只关闭转达，不拖垮盯防检测/后续反馈，�
   await f.push(f.envelope({ action: 'feedback', verdict: '正确', noticeId: f.notice.id }), false);
   await f.channel.settled();
   assert.equal((await readFeedback(f.config.dataDir)).length, 1); assert.equal((await f.calls()).length, 0);
-  const detection = await detect(f.config, new Date().toISOString(), { channels: [f.channel] }); assert.ok(detection.records.length);
+  const detection = await detect(f.config, new Date().toISOString(), { channels: [f.channel] }); assert.deepEqual(detection.records, []);
   assert.equal(await readFile(path, 'utf8'), original + '{BROKEN_RELAY_ONLY');
 });
 

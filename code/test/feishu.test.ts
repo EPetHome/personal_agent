@@ -10,7 +10,7 @@ import { feishuChannel } from '../src/channels/feishu/index.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { readFeedback } from '../src/core/feedback.ts';
 import { readJsonl, readOutbox } from '../src/core/store.ts';
-import { ccCall, ccUser, put, pushed as samplePush, sandbox } from './fixtures.ts';
+import { ccCall, ccUser, put, pushed as samplePush, sandbox, putLoop } from './fixtures.ts';
 // 本文件测渠道而非等待窗口：使用已等足五分钟的授权事实。
 const pushed = (path: string) => samplePush(path, 'waiting_permission', '2026-10-20T09:55:01Z');
 
@@ -19,6 +19,7 @@ async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
   f.config.feishu = { mode: 'fake', receiverId: 'ou_test', timeoutMs: 2000 };
   const transcript = join(f.config.sources.cc!, 'session.jsonl');
   await put(transcript, [ccUser(undefined, '2026-10-20T09:40:00Z'), ccCall('2026-10-20T09:55:00Z')]);
+  await putLoop(f.config, f.root);
   return { ...f, transcript, sent: () => readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl')) };
 }
 function text(id: string, content: string, parent?: string, actor = 'ou_test', chat = 'p2p') {
@@ -41,6 +42,7 @@ test('段2 A1/A2：两级飞书卡片；本机只收紧急级；同证据与重�
     await writeFile(executable, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(calls)},'called\\n');\n`); await chmod(executable, 0o700);
     config.localChannel = { executable, timeoutMs: 5000 };
     if (urgent) await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]);
+    else await putLoop(config, root, '完成');
     await detect(config, urgent ? '2026-10-20T10:01:00Z' : '2026-10-20T10:31:00Z');
     const notice = (await readOutbox(config.dataDir))[0]!;
     const messages = await sent(); assert.equal(messages.length, 1);
@@ -70,8 +72,8 @@ test('段2 A3/A4：按钮和引用准确关联，直接漏了不关联；重投�
   await channel.drain(); await channel.drain();
   feedback = await readFeedback(config.dataDir); assert.equal(feedback.length, 3); assert.equal(feedback[2]!.noticeId, notice.id);
   const replies = (await sent()).filter(m => m.type === 'text'); assert.equal(replies.length, 3);
-  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:click-1')!.content), /这个会话之后不会再因为等你回复或授权叫你/);
-  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:miss-1')!.content), /这条进了本周的问题汇总/);
+  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:click-1')!.content), /这个会话之后不会再因为loop 暂停叫你/);
+  assert.match(JSON.stringify(replies.find(m => m.key === 'reply:miss-1')!.content), /反馈已保存/);
   assert.match(JSON.stringify(replies.find(m => m.key === 'reply:quote-1')!.content), /提醒对你有用，不会记成问题/);
 });
 
@@ -98,7 +100,7 @@ test('官方 SDK 适配替身：两个长连接处理器3秒内只确认持久�
 });
 
 test('低优先级飞书失败保留文件发件、总览明示、下一轮重试且成功后去重', async t => {
-  const { config } = await fixture(t); config.learning = false;
+  const { root, config } = await fixture(t); await putLoop(config, root, '完成');
   let fails = true, calls = 0;
   const channel = feishuChannel(config, { async send() { calls++; if (fails) throw new Error('private upstream error'); return 'om_ok'; } });
   const first = await detect(config, '2026-10-20T10:31:00Z', { channels: [channel] });
@@ -125,19 +127,20 @@ test('段2 A10：.env 构造凭证只留原文件，假飞书检测后的数据�
   }
 });
 
-test('整链：构造推送→本机与假飞书→按钮误报→周五统计，始终不连接真实平台', async t => {
+test('旧卡兼容整链：升级后新点误报仍处理，周五不再发统计报告', async t => {
   const { root, config, transcript, sent } = await fixture(t);
   const log = join(root, 'local-calls'), executable = join(root, 'local-stub');
   await writeFile(executable, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(log)},'called\\n');\n`); await chmod(executable, 0o700); config.localChannel = { executable, timeoutMs: 5000 };
   await put(join(config.inboxDir!, 'cc.jsonl'), [pushed(transcript)]); await detect(config, '2026-10-20T10:01:00Z');
   const reminder = (await readOutbox(config.dataDir))[0]!, message = (await sent())[0]!;
+  // 先完成managed切换，再模拟用户的新点击；切换前的旧收件不得作为新点击重放。
+  const upgraded = feishuChannel(config, undefined, { managed: true }); await upgraded.start(); await upgraded.stop();
   await put(join(config.dataDir, 'feishu-inbox.jsonl'), [action('e2e-feedback', message.messageId, reminder.id)]);
   const path = join(root, 'config.json'); await put(path, JSON.stringify(config));
   const result = spawnSync(process.execPath, [resolve(import.meta.dirname, '../src/cli/main.ts'), 'detect', '--config', path, '--now', '2026-10-23T18:00:00Z'], { encoding: 'utf8', env: { ...process.env, TZ: 'UTC' } });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(log, 'utf8'), 'called\n');
-  const summary = (await readOutbox(config.dataDir)).find(n => n.kind === 'weekly')!; assert.ok(summary);
-  assert.match(summary.text, /Claude Code × 在等你 \| 1 \| 0 \/ 1 \| 0\.0%/);
+  assert.equal((await readOutbox(config.dataDir)).filter(n => ['weekly', 'daily', 'recurrence'].includes(n.kind)).length, 0);
   assert.equal((await readFeedback(config.dataDir))[0]!.noticeId, reminder.id);
-  assert.equal((await sent()).filter(m => m.noticeId === summary.id).length, 1);
+  assert.equal((await sent()).filter(m => m.type === 'interactive').length, 1);
 });

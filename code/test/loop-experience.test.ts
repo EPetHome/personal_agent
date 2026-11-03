@@ -1,108 +1,83 @@
 import { test } from 'node:test';
-import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { rm, utimes } from 'node:fs/promises';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { readFile, rm, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 import { detect, overview, rebuild } from '../src/core/agent.ts';
-import { event } from '../src/core/events.ts';
-import { readEvents, readOutbox } from '../src/core/store.ts';
-import { pi } from '../src/sources/pi/index.ts';
-import { loopSummary, piHeader, piMessage, put, sandbox } from './fixtures.ts';
-import { hash } from '../src/core/utils.ts';
-
-const now = '2026-10-20T10:40:00.000Z', old = '2026-10-20T10:00:00.000Z', recent = '2026-10-20T10:35:00.000Z';
-const id = '00000000-0000-4000-8000-000000000123';
-async function fixture(t: TestContext) {
+import { appendJsonl, readEvents, readJsonl, readOutbox } from '../src/core/store.ts';
+import { event, project } from '../src/core/events.ts';
+import { feishuChannel } from '../src/channels/feishu/index.ts';
+import type { SentMessage } from '../src/channels/feishu/index.ts';
+import type { Channel, Notice } from '../src/core/types.ts';
+import { loopSummary, put, putLoop, sandbox, piHeader, piMessage, start } from './fixtures.ts';
+for (const status of ['暂停', '完成', '进行中']) test(`loop ${status}只读取自身总结，不再借Pi聊天目录取任务与阶段`, async t => {
+  const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true })); await putLoop(f.config, f.root, status, start);
+  f.config.sources.pi = join(f.root, 'pi'); await put(join(f.config.sources.pi, 'standalone.jsonl'), [piHeader(), piMessage('u', null, 'user', '不得混入loop的聊天内容')]);
+  const view = await detect(f.config, start); assert.equal(view.records.length, 1); assert.equal(view.records[0]!.tool, 'loop'); assert.equal(view.records[0]!.loop!.status, status);
+  assert.doesNotMatch(JSON.stringify(view.records), /不得混入loop/); assert.deepEqual((await rebuild(f.config)).records, view.records);
+});
+for (const role of ['development', 'review', 'acceptance'] as const) test(`飞书 A7 负向回归：总结10:00开始，${role}10:35仍输出，10:40不报停滞且不恢复扫描`, async t => {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  f.config.sources.cc = null; f.config.sources.pi = join(f.root, 'pi'); f.config.sources.loop = join(f.root, '.pi-autoreview');
-  f.config.learning = false;
-  const summary = join(f.config.sources.loop, 'shop', `${id}.md`);
-  await put(summary, loopSummary('进行中', '/demo/shop', '- A10. [人工] 操作：不要拿这条当成当前步骤', old)
-    .replace('loop-demo', id).replace('- 状态：', '- 批次：商品缓存\n- 状态：'));
-  await utimes(summary, new Date(old), new Date(old));
-  return { ...f, summary };
-}
-function rows(sessionId: string, at: string, cwd = '/demo/shop') {
-  return [{ ...piHeader(), id: sessionId, cwd, timestamp: old },
-    piMessage('u', null, 'user', '提示词：商品缓存（闭环 1）', old),
-    piMessage('a', 'u', 'assistant', [{ type: 'toolCall', id: 'call', name: 'bash', arguments: { command: '构造验证' } }], at, { stopReason: 'toolUse' })];
-}
-
-for (const role of ['development', 'review', 'acceptance'] as const) test(`飞书 A7：loop 总结40分钟前，${role} 5分钟前写记录，不报停滞`, async t => {
-  const f = await fixture(t);
+  const id = '11111111-1111-4111-8111-111111111111', recent = '2026-10-20T10:35:00.000Z';
+  const summary = await putLoop(f.config, f.root, '进行中', start, id);
+  await utimes(summary, new Date(start), new Date(start));
+  f.config.sources.pi = join(f.root, 'pi');
   const sessionId = role === 'development' ? id : `autoreview-${role === 'review' ? 'rev' : 'acc'}-${id}`;
-  await put(join(f.config.sources.pi!, 'session.jsonl'), rows(sessionId, recent));
-  const view = await detect(f.config, now), run = view.records.find(r => r.tool === 'loop')!;
-  assert.equal(run.status, '进行中'); assert.equal(run.lastActivityAt, recent);
-  assert.equal(run.loop?.phase, role === 'development' ? '开发' : role === 'review' ? '评审第 4 轮' : '验收');
-  assert.ok(!(await readOutbox(f.config.dataDir)).some(n => n.kind === 'stalled' && n.tool === 'loop'));
-  if (role !== 'development') assert.ok(!view.records.some(r => r.tool === 'pi'));
-  assert.equal((await rebuild(f.config, now)).records.find(r => r.tool === 'loop')?.lastActivityAt, recent);
-});
-
-test('飞书 A8：loop 所有关联会话40分钟前没动静，提醒当前评审步骤，不拿验收条款当进度', async t => {
-  const f = await fixture(t);
-  // 一轮开始以后评审写了一次，此后40分钟没有更新；总结中的完成轮数仍是3。
-  await put(f.summary, (loopSummary('进行中', '/demo/shop', '- A10. [人工] 操作：不要拿这条当成当前步骤', '2026-10-20T09:59:00Z')).replace('loop-demo', id).replace('- 状态：', '- 批次：商品缓存\n- 状态：'));
-  await utimes(f.summary, new Date('2026-10-20T09:59:30Z'), new Date('2026-10-20T09:59:30Z'));
-  await put(join(f.config.sources.pi!, 'review.jsonl'), rows(`autoreview-rev-${id}`, old));
-  const view = await detect(f.config, now);
-  assert.equal(view.records.find(r => r.tool === 'loop')?.status, '停滞');
-  const notice = (await readOutbox(f.config.dataDir)).find(n => n.tool === 'loop' && n.kind === 'stalled')!;
-  assert.ok(notice); assert.match(notice.content.summary, /最后在做.*评审第 4 轮/);
-  assert.doesNotMatch(notice.content.summary, /A10|不要拿这条/);
-});
-
-test('评审结束写成总结后的旧记录不误当下一轮，返修中显示开发，已通过显示验收', async t => {
-  for (const conclusion of ['需返修', '通过']) {
-    const f = await fixture(t);
-    await put(f.summary, loopSummary('进行中', '/demo/shop', '- 无', '2026-10-20T09:59:00Z').replace('loop-demo', id).replace(/\n- 无\n$/, `\n结论：${conclusion}\n- 无\n`));
-    await utimes(f.summary, new Date('2026-10-20T10:00:30Z'), new Date('2026-10-20T10:00:30Z'));
-    await put(join(f.config.sources.pi!, 'review.jsonl'), rows(`autoreview-rev-${id}`, old));
-    const view = await detect(f.config, now), record = view.records.find(r => r.tool === 'loop')!;
-    assert.equal(record.lastActivityAt, old);
-    assert.equal(record.loop?.phase, conclusion === '需返修' ? '开发' : '验收');
-    assert.doesNotMatch((await readOutbox(f.config.dataDir)).find(n => n.tool === 'loop')!.content.summary, /评审第 4 轮/);
+  const transcript = join(f.config.sources.pi, `${role}.jsonl`);
+  await put(transcript, [{ ...piHeader(), id: sessionId, cwd: '/sample/project' }, piMessage('u', null, 'user', '构造loop任务'),
+    piMessage('a', 'u', 'assistant', [{ type: 'toolCall', id: 'live', name: 'bash', arguments: { command: '构造验证仍在进行' } }], recent, { stopReason: 'toolUse' })]);
+  const before = await readFile(transcript);
+  // 真实检测路径不得靠重新读取Pi目录/原件来通过此回归。
+  const accesses: string[] = [];
+  for (const method of ['open', 'readFile', 'readdir'] as const) {
+    const original = fs.promises[method];
+    t.mock.method(fs.promises, method, (...args: any[]) => {
+      const path = String(args[0]);
+      if (path === f.config.sources.pi || path.startsWith(f.config.sources.pi! + '/')) accesses.push(path);
+      return (original as Function)(...args);
+    });
   }
-});
-
-test('飞书 A9：流水线普通UUID会话及其报信/旧缓存都不入总览、不判断、不提醒', async t => {
-  const f = await fixture(t); f.config.sources.loop = null;
-  const sessionId = 'ordinary-uuid-not-autoreview', project = join(f.root, '.pi-autoreview/pipelines/某批/e2e/r1');
-  const transcript = join(f.config.sources.pi!, 'pipeline.jsonl');
-  const content = rows(sessionId, old, project); await put(transcript, content);
-  const cached = pi.parse(content.map(row => JSON.stringify(row)).join('\n'), { path: transcript, fingerprint: 'old' })!;
-  await put(join(f.config.dataDir, 'events.jsonl'), [event({ kind: 'session_observed', record: cached }, old)]);
-  await put(join(f.config.inboxDir!, 'pi.jsonl'), [{ tool: 'pi', event: 'waiting_permission', session_id: sessionId, cwd: project, transcript_path: transcript, at: recent, detail: '构造内部授权' }]);
-  f.config.judge = { executable: '/test-only/no-model', model: 'fake', timeoutMs: 100, dailyLimit: 10 };
+  syncBuiltinESMExports(); t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  f.config.feishu = { mode: 'fake', receiverId: 'ou_test', timeoutMs: 1000 };
+  f.config.judge = { executable: '/constructed/must-not-run', model: 'fake', timeoutMs: 100 };
+  const local: Notice[] = [], channel = feishuChannel(f.config);
+  const localChannel: Channel = { name: 'local', levels: ['现在就要你', '有空看'], async send(notice) { local.push(notice); }, async receive() { return ''; } };
   let calls = 0;
-  const view = await detect(f.config, now, { judge: { async judge() { calls++; return { answer: '是', reason: '不应调用' }; } } });
-  assert.equal(calls, 0); assert.deepEqual(view.records, []); assert.deepEqual((await overview(f.config, now)).records, []);
+  const components = { channels: [localChannel, channel], judge: { async writeSnapshot() { calls++; throw new Error('不应为推测的停滞起草'); } } };
+  const view = await detect(f.config, '2026-10-20T10:40:00Z', components), run = view.records[0]!;
+  assert.equal(run.status, '进行中'); assert.equal(run.lastActivityAt, start, '保留总结所见时间，不编造已采集到活动时间');
+  assert.notEqual(run.rule!.id, 'unfinished_30m'); assert.match(run.reason, /总结时间不代表最后活动/);
+  assert.deepEqual((await overview(f.config, '2026-10-20T10:41:00Z')).records, (await rebuild(f.config, '2026-10-20T10:41:00Z')).records);
+  await detect(f.config, '2026-10-20T10:42:00Z', components);
+  assert.deepEqual(await readOutbox(f.config.dataDir), []); assert.deepEqual(local, []);
+  assert.deepEqual(await readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl')), []);
+  assert.equal(calls, 0); assert.equal((await readEvents(f.config.dataDir)).some(e => e.kind === 'model_call_started'), false);
+  assert.deepEqual(accesses, []); t.mock.restoreAll(); syncBuiltinESMExports();
+  assert.deepEqual(await readFile(transcript), before);
+});
+for (const timing of ['old-round', 'old-mtime'] as const) test(`没有活动证据：${timing}超过30分钟或24小时均不推断loop停滞/搁置`, async t => {
+  const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const summary = await putLoop(f.config, f.root, '进行中', start);
+  if (timing === 'old-mtime') await put(summary, (await readFile(summary, 'utf8')).replace(/### 第 1 轮[^\n]*\n/, ''));
+  await utimes(summary, new Date(start), new Date(start));
+  for (const now of ['2026-10-20T10:40:00Z', '2026-10-21T12:00:00Z']) {
+    const view = await detect(f.config, now); assert.equal(view.records[0]!.status, '进行中'); assert.equal(view.noticesAdded, 0);
+  }
   assert.deepEqual(await readOutbox(f.config.dataDir), []);
-  assert.equal(view.projection.health.get('pi')?.fileStats?.total, 0);
-  assert.ok(!(await readEvents(f.config.dataDir)).some(e => e.kind === 'model_call_started' || e.kind === 'push_observed'));
 });
-
-test('loop 新增批名/步骤/关联会话不改变旧版去重键，不重复交代完成总结', async t => {
-  const f = await fixture(t);
-  const text = loopSummary('完成', '/demo/shop', '- 无', old).replace('loop-demo', id);
-  await put(f.summary, text);
-  const first = await detect(f.config, now), record = first.records[0]!;
-  const legacyFacts = { status: '完成', conclusion: '完成', reviews: 3, repairs: 2, needs: [], needsProvided: true };
-  const notice = (await readOutbox(f.config.dataDir))[0]!;
-  assert.equal(notice.dedupeKey, `loop_completed:${record.key}:${hash(JSON.stringify(legacyFacts))}`);
-  await put(f.summary, text.replace('- 状态：', '- 批次：补齐批名\n- 当前步骤：验收\n- 状态：'));
-  assert.equal((await detect(f.config, '2026-10-20T10:41:00Z')).noticesAdded, 0);
-});
-
-test('排除流水线后的跳过统计换v2口径，不拿旧v1健康比例误报失明', async t => {
-  const f = await fixture(t); f.config.sources.loop = null;
-  await put(join(f.config.dataDir, 'events.jsonl'), [event({ kind: 'source_health', report: { source: 'pi', errors: [], paths: [f.config.sources.pi!], fileStats: { total: 30, skipped: 0 }, fileStatsProfile: 'exclude_internal_v1' } }, old)]);
-  for (let i = 0; i < 5; i++) await put(join(f.config.sources.pi!, `normal-${i}.jsonl`), rows(`normal-${i}`, recent));
-  for (let i = 0; i < 5; i++) await put(join(f.config.sources.pi!, `noise-${i}.jsonl`), [{ type: 'metadata' }]);
-  for (let i = 0; i < 20; i++) await put(join(f.config.sources.pi!, `pipeline-${i}.jsonl`), rows(`pipeline-${i}`, recent, join(f.root, '.pi-autoreview/pipelines/batch/e2e/r1')));
-  const view = await detect(f.config, now), health = view.projection.health.get('pi')!;
-  assert.equal(health.fileStatsProfile, 'exclude_internal_v2'); assert.deepEqual(health.fileStats, { total: 10, skipped: 5 });
-  assert.equal(health.skipBaseline, .5); assert.equal(health.since, null);
-  assert.ok(!(await readOutbox(f.config.dataDir)).some(n => n.kind === 'blind'));
+test('旧总结年龄产生的待发停滞卡不恢复投递，原事件不改写', async t => {
+  const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  await putLoop(f.config, f.root, '进行中', start); const view = await detect(f.config, start), record = view.records[0]!;
+  const at = '2026-10-20T10:40:00.000Z', dedupeKey = `stalled:${record.key}`;
+  const notice: Notice = { version: 1, id: 'legacy-summary-stalled', dedupeKey, at, tool: 'loop', kind: 'stalled', level: '有空看', sessionKey: record.key, evidenceAt: start,
+    content: { title: '旧的loop停滞卡', summary: '40分钟没动静', returnCommand: '查看构造总结', evidence: { project: record.project, intentOriginal: null, additionalRequirements: [], recentSteps: [], originals: record.originals, reason: '只按轮次时间推断' } }, text: '旧正文' };
+  await appendJsonl(join(f.config.dataDir, 'events.jsonl'), [event({ kind: 'notice_planned', notice }, at), event({ kind: 'channel_delivery', channel: 'feishu', noticeId: notice.id, ok: false, phase: 'queued' }, at)]);
+  const prefix = await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8'), sent: Notice[] = [];
+  const channel: Channel = { name: 'feishu', levels: ['现在就要你', '有空看'], async send(value) { sent.push(value); }, async receive() { return ''; } };
+  await detect(f.config, at, { channels: [channel] }); await rebuild(f.config, at);
+  assert.deepEqual(sent, []); assert.deepEqual(await readOutbox(f.config.dataDir), []);
+  assert.equal((await overview(f.config, at)).projection.notices.some(n => n.id === notice.id), false);
+  const events = await readEvents(f.config.dataDir); assert.ok(project(events).notices.some(n => n.id === notice.id));
+  assert.ok((await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8')).startsWith(prefix));
 });

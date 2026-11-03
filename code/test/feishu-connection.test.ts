@@ -5,13 +5,15 @@ import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile, readdir, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { LoggerLevel, LoggerProxy } from '@larksuiteoapi/node-sdk';
 import { feishuChannel } from '../src/channels/feishu/index.ts';
 import { realTransport, safeFeishuFailure } from '../src/channels/feishu/transport.ts';
 import { overview, rebuild } from '../src/core/agent.ts';
 import { renderOverview } from '../src/core/judge.ts';
+import { readLedger } from '../src/core/ledger.ts';
 import { readEvents, readJsonl, readOutbox } from '../src/core/store.ts';
 import { runService } from '../src/service/daemon.ts';
 import { put, sandbox } from './fixtures.ts';
@@ -35,7 +37,7 @@ function sdkStub(start: (options: WsOptions) => void | Promise<void>) {
 }
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  f.config.sources.cc = null; f.config.learning = false;
+  f.config.sources.cc = null;
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 };
   f.config.service = { intervalMs: 10000, restartWindowMs: 60000, restartThreshold: 3 };
   return f;
@@ -67,7 +69,7 @@ for (const mode of ['reject', 'callback', 'logger', 'logger-dns', 'logger-http-t
     }
   });
   const transport = await realTransport(f.config.feishu!, { credentials, loadSdk: sdk.loadSdk });
-  const channel = feishuChannel(f.config, transport), controller = new AbortController();
+  const channel = feishuChannel(f.config, transport, { managed: true }), controller = new AbortController();
   const running = runService(f.config, controller.signal, { channels: [channel] });
   // 先安装拒绝处理器，失败仍由后面的 await 报告。
   void running.catch(() => {});
@@ -77,17 +79,18 @@ for (const mode of ['reject', 'callback', 'logger', 'logger-dns', 'logger-http-t
     const log = await readJsonl<{ kind: string; category?: string; message?: string }>(logPath);
     const failures = log.filter(e => e.kind === 'feishu_connection_failed');
     assert.equal(failures.length, 1); assert.equal(failures[0]?.category, category); assert.match(failures[0]!.message!, category === 'network' ? /网络/ : /凭证/);
-    const view = await overview(f.config);
-    assert.equal(view.projection.feishuConnection?.state, 'failed');
-    assert.match(renderOverview(view.records, view.projection), new RegExp(`飞书长连接：未连接.*${category}`));
-    const rebuilt = await rebuild(f.config);
-    assert.deepEqual(rebuilt.projection.feishuConnection, view.projection.feishuConnection);
+    const view = await readLedger(f.config.dataDir);
+    assert.equal(view.tables.connections.feishu?.state, 'failed');
+    assert.equal(view.tables.connections.feishu?.failure?.category, category);
+    assert.deepEqual((await readLedger(f.config.dataDir)).tables.connections, view.tables.connections);
     const configPath = join(f.root, 'config.json'); await put(configPath, JSON.stringify(f.config));
-    const cli = spawnSync(process.execPath, [resolve(import.meta.dirname, '../src/cli/main.ts'), 'overview', '--config', configPath, '--json'], { encoding: 'utf8' });
-    assert.equal(cli.status, 0, cli.stderr); assert.equal(JSON.parse(cli.stdout).feishuConnection.state, 'failed');
+    // 服务就在本测试进程里；不能同步阻塞事件循环，否则它无法释放已经取得的账本短锁。
+    // 异步子进程仍走真实CLI；非零退出直接拒绝，不放宽状态/脱敏检查。
+    const cli = await promisify(execFile)(process.execPath, [resolve(import.meta.dirname, '../src/cli/main.ts'), 'overview', '--config', configPath, '--json'], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(cli.stderr, ''); assert.equal(JSON.parse(cli.stdout).connections.feishu.state, 'failed');
     assert.equal((await readOutbox(f.config.dataDir)).length, 0);
     controller.abort(); await running; assert.equal(sdk.stopped(), true);
-    assert.equal((await overview(f.config)).projection.feishuConnection?.state, 'stopped');
+    assert.equal((await readLedger(f.config.dataDir)).tables.connections.feishu?.state, 'stopped');
     await assertNoSecrets(f.config.dataDir);
   } finally {
     // 必须先停常驻再执行 fixture 的临时目录清理，断言失败时也不能留下写入者。

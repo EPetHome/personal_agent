@@ -12,14 +12,14 @@ import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { readFeedback } from '../src/core/feedback.ts';
 import { appendJsonl, readEvents, readJsonl, readOutbox, withStoreLock } from '../src/core/store.ts';
 import { runService } from '../src/service/daemon.ts';
+import { readLedger } from '../src/core/ledger.ts';
 import type { FeishuConnection } from '../src/core/types.ts';
-import { ccCall, ccUser, put, pushed, sandbox } from './fixtures.ts';
+import { ccCall, ccUser, put, pushed, sandbox, putLoop, putManagedLoop } from './fixtures.ts';
 
 async function fixture(t: TestContext) {
   const f = await sandbox();
   t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 40000 };
-  f.config.learning = false;
   return { ...f, sent: () => readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl')) };
 }
 function text(id: string, content = '漏了 测试') {
@@ -46,6 +46,7 @@ test('飞书 A1：16位微秒按钮记今天的误报并回话；秒/毫秒同�
   const stopped = new Date(Date.parse(now) - 12 * 60000).toISOString();
   await put(transcript, [ccUser('构造任务', stopped), ccCall(stopped)]);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', stopped)]);
+  await putLoop(f.config, f.root, '暂停', stopped);
   await detect(f.config, now);
   const notice = (await readOutbox(f.config.dataDir))[0]!, message = (await f.sent())[0]!;
   const microseconds = String(Date.parse(now) * 1000);
@@ -133,40 +134,65 @@ test('门禁返修1：固定重试钟未到时，检测释放锁后的 drain 独
   } finally { await channel.stop(); t.mock.timers.reset(); }
 });
 
-test('飞书 A3：检测持锁超过30秒时连接状态独立重试，收件/后续检测继续且总览已连上', { timeout: 50000 }, async t => {
+test('飞书 A3：新卡API阻塞31秒时，连接状态独立入新账本、收件与后续处理仍继续', { timeout: 50000 }, async t => {
   const f = await fixture(t), now = new Date().toISOString();
   f.config.service = { intervalMs: 100, restartWindowMs: 1000, restartThreshold: 3 };
   const transcript = join(f.config.sources.cc!, 'sample.jsonl');
   const stopped = new Date(Date.parse(now) - 12 * 60000).toISOString();
   await put(transcript, [ccUser('构造长检测', stopped), ccCall(stopped)]);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', stopped)]);
-  let connected: ((state: FeishuConnection) => void) | undefined, holding = false;
-  let release!: () => void;
+  await putManagedLoop(f.config, f.root, 'paused', stopped);
+  f.config.managedLoop = { intakeEveryMs: 25, verifyAfterMs: 0, inspectEveryMs: 600000, staleAfterMs: 1800000 };
+  let connected: ((state: FeishuConnection) => void) | undefined, holding = false, replying = false;
+  let release!: () => void, releaseReply!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
+  const replyGate = new Promise<void>(resolve => { releaseReply = resolve; });
   const channel = feishuChannel(f.config, {
     start(_handlers, report) { connected = report; },
-    async send(type) { if (type === 'interactive') { holding = true; await gate; } return `om_${type}`; },
-  });
+    async send(type) {
+      if (type === 'interactive') { holding = true; await gate; }
+      else if (type === 'text') { replying = true; await replyGate; }
+      return `om_${type}`;
+    },
+  }, { managed: true });
   const controller = new AbortController(), running = runService(f.config, controller.signal, { channels: [channel] }); void running.catch(() => {});
   try {
     await waitFor(async () => holding);
     connected!({ state: 'connected' });
     const began = Date.now(); await channel.drain();
     assert.ok(Date.now() - began < 500, '展示写入不能挡住空收件');
+    await waitFor(async () => (await readLedger(f.config.dataDir)).tables.connections.feishu?.state === 'connected');
     await delay(31000); release();
     await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).some(r => r.kind === 'scan_completed'));
     await channel.capture(text('after-lock'));
-    await waitFor(async () => (await readFeedback(f.config.dataDir)).length === 1);
+    await waitFor(async () => (await readLedger(f.config.dataDir)).observations.filter(row => row.kind === 'feedback').length === 1);
     try {
-      await waitFor(async () => (await overview(f.config)).projection.feishuConnection?.state === 'connected');
+      await waitFor(async () => (await readLedger(f.config.dataDir)).tables.connections.feishu?.state === 'connected');
     } catch (error) {
       t.diagnostic(`连接状态未恢复时的构造服务日志：${JSON.stringify(await readJsonl(join(f.config.dataDir, 'service.log.jsonl')))}`);
       throw error;
     }
     await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length >= 2);
-    const view = await overview(f.config);
-    assert.match(renderOverview(view.records, view.projection), /飞书长连接：已连接/);
-    assert.equal((await readFeedback(f.config.dataDir))[0]!.comment, '测试');
-    assert.match(JSON.stringify((await f.sent()).find(m => m.key === 'reply:after-lock')!.content), /已记下/);
-  } finally { release(); controller.abort(); await running; }
+    await waitFor(async () => replying);
+    const view = await readLedger(f.config.dataDir);
+    assert.equal(view.tables.connections.feishu?.state, 'connected');
+    assert.ok(view.observations.some(row => row.kind === 'feedback' && row.detail === '漏了 测试'));
+    // 接入/研判与渠道drain独立：反馈入账和scan_completed都不代表确认发送已经完成。
+    // 用回话API闸门固定这段窗口，避免测试仅在I/O恰好够快时通过。
+    const receipt = view.tables.receipts['feishu:after-lock'];
+    assert.ok(receipt); assert.equal(JSON.parse(receipt.response).status, 'processed');
+    assert.notEqual(JSON.parse(receipt.response).reply, 'sent');
+    assert.equal((await f.sent()).some(m => m.key === 'reply:after-lock'), false, '回话API未放行时不能冒称已发出');
+    const replyBegan = performance.now(); releaseReply();
+    await waitFor(async () => (await f.sent()).some(m => m.key === 'reply:after-lock'));
+    await waitFor(async () => {
+      const saved = (await readLedger(f.config.dataDir)).tables.receipts['feishu:after-lock'];
+      return !!saved && JSON.parse(saved.response).reply === 'sent';
+    });
+    await channel.drain();
+    const replies = (await f.sent()).filter(m => m.key === 'reply:after-lock');
+    assert.equal(replies.length, 1); assert.match(JSON.stringify(replies[0]!.content), /已记下/);
+    assert.equal((await readLedger(f.config.dataDir)).observations.filter(row => row.kind === 'feedback').length, 1);
+    t.diagnostic(`卡片仍实际阻塞31000ms；反馈入账/两轮检测完成时回话仍被闸门阻塞；放行后 ${Math.round(performance.now() - replyBegan)}ms 内确认落盘，重复drain不重记或重发。`);
+  } finally { release(); releaseReply(); controller.abort(); await running; }
 });

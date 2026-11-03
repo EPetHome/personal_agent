@@ -9,6 +9,7 @@ import { event, packProjection, project } from './events.ts';
 import { acquireLock } from './locks.ts';
 import { parseEventLog, readEvents } from './store.ts';
 import { OperationFailure } from './failures.ts';
+import { isActiveNotice } from './judge.ts';
 import { hash, iso } from './utils.ts';
 import type { AgentEvent, ChannelDeliveryState } from './types.ts';
 
@@ -124,7 +125,14 @@ async function restoreDeliveryHistory(dataDir: string, events: AgentEvent[], now
   } finally { await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }); }
   return [...events, restored];
 }
-/** 调用方必须持有 .detect.lock。仅旧库首次恢复失败计数读归档；正常检测只读活动日志。 */
+/** 检测仅恢复仍需投递的 loop/PA 告警历史，不迁移格式、封存或清理任何旧文件。 */
+export async function prepareDeliveryLog(dataDir: string, now: string): Promise<AgentEvent[]> {
+  const events = await readEvents(dataDir), projection = project(events);
+  const active = new Set(projection.notices.filter(isActiveNotice).map(notice => notice.id));
+  if (![...projection.channelDeliveryStates].some(([key, state]) => state.historyUnknown && active.has(key.slice(key.indexOf(':') + 1)))) return events;
+  return restoreDeliveryHistory(dataDir, events, now, {});
+}
+/** 仅显式旧库维护/测试使用；常规检测不调用，不自动迁移或封存。 */
 export async function prepareEventLog(dataDir: string, nowInput: string, options: ArchiveOptions = {}): Promise<AgentEvent[]> {
   const now = iso(nowInput);
   let events = await readEvents(dataDir);

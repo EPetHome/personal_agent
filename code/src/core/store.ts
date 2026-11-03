@@ -24,6 +24,20 @@ export async function readJsonl<T>(path: string): Promise<T[]> {
   try { text = await handle.readFile('utf8'); } finally { await handle.close(); }
   return parseJsonl<T>(text, path);
 }
+/** 同一次安全读取的原字节与解析结果，供可复制的收件前缀校验；不改变旧readJsonl入口。 */
+export async function readJsonlSnapshot<T>(path: string): Promise<{ rows: T[]; content: Buffer; identity?: { dev: number; ino: number } }> {
+  if (!await exists(path)) return { rows: [], content: Buffer.alloc(0) };
+  await assertRegularFile(path);
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) throw new OperationFailure('unsafe_file', '收件快照不是安全的普通文件');
+    const content = await handle.readFile(), visible = await lstat(path);
+    if (!visible.isFile() || visible.isSymbolicLink() || visible.nlink !== 1 || visible.dev !== stat.dev || visible.ino !== stat.ino)
+      throw new OperationFailure('unsafe_file', '收件快照读取期间文件身份变化，保留现场');
+    return { rows: parseJsonl<T>(content.toString('utf8'), path), content, identity: { dev: stat.dev, ino: stat.ino } };
+  } finally { await handle.close(); }
+}
 function parseJsonl<T>(text: string, path: string): T[] {
   const rows: T[] = [];
   for (const [index, line] of text.split('\n').entries()) {
@@ -151,6 +165,12 @@ export async function measureStoreLocks<T>(operation: () => Promise<T>, value: {
   const timing = { active: true, value };
   try { return await storeLockTiming.run(timing, operation); }
   finally { timing.active = false; }
+}
+/** 新账本复用同一计时上下文；仅量实际持有短数据锁的时间，不含等锁和外部调用。 */
+export async function measureHeldStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+  const began = performance.now(), timing = storeLockTiming.getStore();
+  try { return await operation(); }
+  finally { if (timing?.active) timing.value.heldMs += performance.now() - began; }
 }
 export async function withStoreLock<T>(dataDir: string, operation: () => Promise<T>, waitMs = 0): Promise<T> {
   const release = await acquireLock(dataDir, '.detect.lock', waitMs);

@@ -4,6 +4,11 @@ import assert from 'node:assert/strict';
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { detect } from '../src/core/agent.ts';
+import { pi } from '../src/sources/pi/index.ts';
+import { codex } from '../src/sources/codex/index.ts';
+import { readFile } from 'node:fs/promises';
+import { readOutbox, readEvents } from '../src/core/store.ts';
+import type { SessionRecord } from '../src/core/types.ts';
 import { codexEvent, codexMeta, piHeader, piMessage, put, sandbox, start } from './fixtures.ts';
 
 test('A10 Pi error/aborted 中的 toolCall 不计待返回，重试答完即完成', async t => {
@@ -19,8 +24,13 @@ test('A10 Pi error/aborted 中的 toolCall 不计待返回，重试答完即完�
     ]);
   }
   const view = await detect(config, '2026-10-20T10:02:00Z');
-  assert.equal(view.records.length, 2);
-  assert.ok(view.records.every(r => r.status === '已完成' && !r.pendingTools.length));
+  assert.deepEqual(view.records, []);
+  assert.deepEqual(await readOutbox(config.dataDir), []);
+  for (const stopReason of ['error', 'aborted']) {
+    const record: SessionRecord = pi.parse(await readFile(join(config.sources.pi!, `${stopReason}.jsonl`), 'utf8'), { path: '/constructed', fingerprint: 'fp' })!;
+    assert.equal(record.assistantFinished, true); assert.equal(record.pendingTools.length, 0);
+  }
+  assert.equal((await readEvents(config.dataDir)).some(e => e.kind === 'model_call_started'), false);
 });
 
 test('A10 Codex task_complete 后的后台 item_completed 不重开；新 task_started 仍重开', async t => {
@@ -33,7 +43,10 @@ test('A10 Codex task_complete 后的后台 item_completed 不重开；新 task_s
     codexEvent({ type: 'task_complete', last_agent_message: '已完成' }),
     codexEvent({ item: { type: 'CommandExecution', id: 'background', command: 'npm test', status: 'completed' } }, 'item_completed', '2026-10-20T10:01:00Z')];
   await put(path, rows);
-  assert.equal((await detect(config, '2026-10-20T10:02:00Z')).records[0]?.status, '已完成');
+  assert.deepEqual((await detect(config, '2026-10-20T10:02:00Z')).records, []);
+  assert.equal(codex.parse(await readFile(path, 'utf8'), { path, fingerprint: 'fp' })!.assistantFinished, true);
   await put(path, [...rows, codexEvent({ type: 'task_started' }, 'event_msg', '2026-10-20T10:03:00Z')]);
-  assert.equal((await detect(config, '2026-10-20T10:04:00Z')).records[0]?.status, '进行中');
+  assert.deepEqual((await detect(config, '2026-10-20T10:04:00Z')).records, []);
+  assert.equal(codex.parse(await readFile(path, 'utf8'), { path, fingerprint: 'fp' })!.assistantFinished, false);
+  assert.deepEqual(await readOutbox(config.dataDir), []);
 });

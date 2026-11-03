@@ -75,6 +75,29 @@ export async function readRelayTranscript(config: Config, path: string): Promise
     fail((error as NodeJS.ErrnoException).code === 'ENOENT' ? '会话文件已经不在了' : '会话文件读不到、未写完或格式无法识别');
   }
 }
+/** 仅显式「转给 CC」时查找；不由常驻感知调用，不会退到更旧的闲会话。 */
+export async function latestRelayTarget(config: Config): Promise<RelayTarget> {
+  if (!config.relay?.enabled || !config.sources.cc) fail('转达总开关已关闭或未配置 CC 来源');
+  const root = config.sources.cc, files: { path: string; mtime: number }[] = [];
+  try {
+    const stat = await lstat(root); if (!stat.isDirectory() || stat.isSymbolicLink()) fail('CC 来源不可信');
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      if (files.length >= 2000) fail('CC 会话目录过大，无法可靠定位最近会话');
+      const path = join(root, entry.name);
+      if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push({ path, mtime: (await lstat(path)).mtimeMs });
+      else if (entry.isDirectory()) for (const child of await readdir(path, { withFileTypes: true })) {
+        if (files.length >= 2000) fail('CC 会话目录过大，无法可靠定位最近会话');
+        if (child.isFile() && child.name.endsWith('.jsonl')) {
+          const file = join(path, child.name); files.push({ path: file, mtime: (await lstat(file)).mtimeMs });
+        }
+      }
+    }
+    const latest = files.sort((a, b) => b.mtime - a.mtime || a.path.localeCompare(b.path))[0];
+    if (!latest) fail('没找到最近的 CC 会话');
+    const { sessionId, path, cwd, cursor } = await readRelayTranscript(config, latest.path);
+    return { sessionId, path, cwd, cursor };
+  } catch (error) { if (error instanceof RelayFailure) throw error; fail('CC 会话目录无法安全读取'); }
+}
 export async function relayTarget(config: Config, notice: Notice): Promise<RelayTarget> {
   if (notice.tool !== 'cc' || notice.kind !== 'waiting') fail('只支持 CC 的「在等你」卡片');
   const id = notice.memberSessionId ?? (notice.sessionKey?.startsWith('cc:') ? notice.sessionKey.slice(3) : undefined);

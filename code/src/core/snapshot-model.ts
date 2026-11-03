@@ -1,10 +1,19 @@
-import { timedModel } from './model-checks.ts';
+import { ComponentFailure } from './process.ts';
 import { piJudge, snapshotReplay } from './model.ts';
 import { protectReplay } from './replay.ts';
 import { modelSnapshot, noticeSnapshotKey, standaloneSnapshot } from './task-snapshot.ts';
 import type { Config, EventPayload, Judge, ModelReplay, Notice, Projection, TaskSnapshotInput } from './types.ts';
 
-/** 仅处理尚未计划过的新卡片。调用者持模型锁，persist 短持数据锁；模型等待绝不持数据锁。 */
+async function timedModel<T>(call: (signal: AbortSignal) => Promise<T>, milliseconds: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([Promise.resolve().then(() => call(controller.signal)), new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { reject(new ComponentFailure('timeout', '卡片起草超时')); controller.abort(); }, Math.max(1, milliseconds));
+    })]);
+  } finally { clearTimeout(timer); }
+}
+/** 只处理 loop 新卡片。调用者持模型锁，persist 短持数据锁；模型等待绝不持数据锁。 */
 export async function checkSnapshotModels(notices: Notice[], projection: Projection, config: Config, now: string,
   persist: (payload: EventPayload) => Promise<boolean | void>, injected?: Judge, deadline = Infinity): Promise<number> {
   if (!config.judge) return 0;
@@ -12,7 +21,7 @@ export async function checkSnapshotModels(notices: Notice[], projection: Project
   if (!judge.writeSnapshot) return 0;
   let written = 0;
   const day = now.slice(0, 10);
-  for (const notice of notices.filter(standaloneSnapshot)) {
+  for (const notice of notices.filter(notice => notice.tool === 'loop' && standaloneSnapshot(notice))) {
     const key = noticeSnapshotKey(notice);
     if (!notice.snapshot || projection.noticeSnapshots.has(key)) continue;
     const { goal, currentTask, lastOutput, factualStatus } = notice.snapshot;

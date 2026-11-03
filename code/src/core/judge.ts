@@ -1,101 +1,45 @@
 import { basename } from 'node:path';
 import { channelName, undeliveredNotices } from './delivery.ts';
 import { humanText, localTime, presentNotice } from './notice-text.ts';
-import { pushIdentity } from './events.ts';
-import { modelEvidenceKey, sameModelEvidenceScope } from './evidence.ts';
-import { batchWaitingNotices, decideWaiting, driftTrigger, humanRequests, routeNotice, waitingReady, WAITING_INTERVAL_MS } from './interaction.ts';
-import { traceSuppression, traceWaitingWindows } from './telemetry.ts';
-import { analysisSnapshot, shouldBlockWaiting, waitingAnalysis } from './intelligence.ts';
-import { addMemberWaiting, mergeWaitingViews, permissionReason, waitingFactViews } from './waiting-facts.ts';
-import { noticeSnapshotKey, ruleSnapshot, snapshotInput, stepSnapshotInput } from './task-snapshot.ts';
-import { feedbackSuppressionKey, isFeedbackSuppressed } from './feedback.ts';
+import { routeNotice, WAITING_INTERVAL_MS } from './interaction.ts';
+import { traceSuppression } from './telemetry.ts';
+import { noticeSnapshotKey, ruleSnapshot, snapshotInput } from './task-snapshot.ts';
+import { feedbackSuppressionKey } from './feedback.ts';
 import { compact, hash, shellQuote, truncateUtf8 } from './utils.ts';
 import { toolNames } from './types.ts';
-import { membersOf, mismatchedMemberIds, pushMatchesMember, sourceUnavailable } from './sessions.ts';
-import type { Config, EventPayload, JudgedRecord, Notice, NoticeContent, Projection, PushRecord, SessionRecord, TaskSnapshot, TaskSnapshotInput } from './types.ts';
+import type { Config, EventPayload, JudgedRecord, Notice, NoticeContent, Projection, TaskSnapshot, TaskSnapshotInput } from './types.ts';
 
-const THIRTY_MINUTES = 30 * 60 * 1000;
 const ONE_DAY = 24 * 60 * 60 * 1000;
 const FIRST_LOOKBACK = 60 * 60 * 1000;
-function comparePushes(a: PushRecord, b: PushRecord): number {
-  const order = ['waiting_permission', 'turn_end', 'session_end'];
-  return a.at.localeCompare(b.at) || order.indexOf(a.event) - order.indexOf(b.event);
+/** 不再投递聊天卡、报告和无法核实的旧停滞卡；历史记录仍可读取和反馈。 */
+export function isActiveNotice(notice: Notice): boolean {
+  return notice.tool === 'loop' && ['loop_paused', 'loop_completed', 'blind', 'unreadable'].includes(notice.kind)
+    || notice.tool === 'agent' && ['service_restart', 'delivery_failed', 'storage_full'].includes(notice.kind);
 }
 export function judgeRecords(projection: Projection, now: string): JudgedRecord[] {
-  return [...projection.sessions.values()].map(record => {
-    const judged: JudgedRecord = { ...record, status: '进行中', reason: '会话有新记录，尚未答完' };
-    let ruleId: NonNullable<JudgedRecord['rule']>['id'] = 'active_unfinished';
-    // 推送属于具体成员。父/兄弟的新动静不能解除这个子会话的等待，子会话结束也不能结束父会话。
-    const mismatches = mismatchedMemberIds(record, projection);
-    const activities = membersOf(record).map(member => {
-      const latest = projection.pushes.filter(p => p.recordKey === record.key && p.tool === record.tool && pushMatchesMember(p, member) && p.at <= now)
-        .sort(comparePushes).at(-1);
-      const unmatched = mismatches.has(member.sessionId);
-      const push = !unmatched && latest && member.lastActivityAt !== null && latest.at >= member.lastActivityAt ? latest : undefined;
-      const waiting = push?.event === 'waiting_permission' ? push : undefined;
-      const completed = !unmatched && !member.unavailable && !waiting && (member.sessionEnded || push?.event === 'session_end' || push?.event === 'turn_end' || (member.assistantFinished && !member.pendingTools.length));
-      return { member, push, waiting, completed, lastActivityAt: push?.at ?? member.lastActivityAt };
-    });
-    judged.lastActivityAt = activities.reduce((last, activity) => activity.lastActivityAt !== null && activity.lastActivityAt > last ? activity.lastActivityAt : last, record.lastActivityAt);
-    judged.pendingTools = activities.filter(a => !a.completed).flatMap(a => a.member.pendingTools);
-    const waiting = activities.filter(a => a.waiting).sort((a, b) => comparePushes(a.waiting!, b.waiting!)).at(-1);
-    if (sourceUnavailable(projection, record.tool)) {
-      ruleId = 'source_unavailable';
-      judged.status = '看不见了';
-      judged.reason = '来源或推送读取失败，保留最后一次读到的事实，当前状态不能确认';
-    } else if (mismatches.size && !waiting) {
-      ruleId = 'push_mismatch';
-      // 聚合展示的兜底未知态；模型阶段仍按健康成员判断，可展示其等待/跑偏，故障另按成员报。
-      judged.status = '看不见了';
-      judged.reason = '这个会话的报信与记录对不上，当前状态不能确认；同一工具的其他会话照常判断';
-    } else if (!activities.some(a => a.member.unavailable) && !activities.every(a => a.completed)
-      && Date.parse(now) - Date.parse(record.loop?.status === '暂停' ? record.loopPausedAt ?? now : judged.lastActivityAt) > ONE_DAY) {
-      ruleId = 'inactive_24h';
-      judged.status = '已搁置';
-      judged.reason = '尚无全部结束证据，超过 24 小时没有新动静；只进总览，不提醒';
+  return [...projection.sessions.values()].filter(record => record.tool === 'loop').map(record => {
+    // 轮次开始/总结mtime不是worker的最后活动；未采集实际活动时不能据此判停滞。
+    const judged: JudgedRecord = { ...record, status: '进行中', reason: 'loop 总结状态：进行中；总结时间不代表最后活动时间，未据此判断停滞' };
+    let id: NonNullable<JudgedRecord['rule']>['id'] = 'active_unfinished';
+    const health = projection.health.get('loop');
+    if (health?.errors.length) {
+      id = 'source_unavailable'; judged.status = '看不见了';
+      judged.reason = '来源读取失败，保留最后一次读到的事实，当前状态不能确认';
+    } else if (record.loop?.status === '暂停' && Date.parse(now) - Date.parse(record.loopPausedAt ?? now) > ONE_DAY) {
+      id = 'inactive_24h'; judged.status = '已搁置'; judged.reason = 'loop 暂停已超过 24 小时；只进总览，不提醒';
     } else if (record.loop?.status === '暂停') {
-      ruleId = 'loop_paused';
-      judged.status = '在等我';
-      judged.reason = record.loop.conclusion;
+      id = 'loop_paused'; judged.status = '在等我'; judged.reason = record.loop.conclusion;
     } else if (record.loop?.status === '完成') {
-      ruleId = 'loop_completed';
-      judged.status = '已完成';
-      judged.reason = 'loop 总结状态：完成';
-    } else if (waiting?.waiting) {
-      ruleId = 'permission_waiting';
-      judged.status = '在等我';
-      judged.reason = permissionReason(record, waiting.member, waiting.waiting);
-      judged.waiting = waiting.waiting;
-    } else if (activities.some(a => a.member.unavailable)) {
-      ruleId = 'member_unavailable';
-      judged.reason = '部分子会话本轮读不了，保留已知关联；没有全部完成证据，暂不能确认完成';
-    } else if (activities.every(a => a.completed)) {
-      ruleId = 'all_members_completed';
-      judged.status = '已完成';
-      judged.reason = activities.length > 1 ? '父会话及子会话均已结束或本轮答完' : activities[0]?.push?.event === 'session_end' || record.sessionEnded ? '会话已结束' : '本轮助手已答完，且没有未返回的工具调用（规则判断）';
-    } else if (Date.parse(now) - Date.parse(judged.lastActivityAt) > THIRTY_MINUTES) {
-      ruleId = 'unfinished_30m';
-      judged.status = '停滞';
-      judged.reason = '尚未答完，最后一条记录超过 30 分钟，且仍有会话没有结束';
+      id = 'loop_completed'; judged.status = '已完成'; judged.reason = 'loop 总结状态：完成';
     }
-    judged.rule = { id: ruleId, facts: { lastActivityAt: judged.lastActivityAt,
-      ...(record.loop ? { loopStatus: record.loop.status } : {}),
-      ...(record.loopPausedAt ? { loopPausedAt: record.loopPausedAt } : {}),
-      ...(ruleId === 'inactive_24h' ? { thresholdMs: ONE_DAY } : ruleId === 'unfinished_30m' ? { thresholdMs: THIRTY_MINUTES } : {}),
-      members: activities.map(({ member, push, completed }) => ({ sessionId: member.sessionId, lastActivityAt: member.lastActivityAt,
-        sessionEnded: member.sessionEnded, assistantFinished: member.assistantFinished, pendingTools: member.pendingTools.length,
-        unavailable: !!member.unavailable, completed, ...(push ? { pushEvent: push.event, pushAt: push.at } : {}) })),
-    } };
-    if (judged.status !== '已搁置' && !sourceUnavailable(projection, record.tool)) {
-      for (const activity of activities) if (activity.waiting) addMemberWaiting(judged, { kind: 'permission', waiting: activity.waiting });
-    }
+    judged.rule = { id, facts: { lastActivityAt: record.lastActivityAt,
+      ...(record.loop ? { loopStatus: record.loop.status } : {}), ...(record.loopPausedAt ? { loopPausedAt: record.loopPausedAt } : {}),
+      ...(id === 'inactive_24h' ? { thresholdMs: ONE_DAY } : {}),
+      members: [{ sessionId: record.sessionId, lastActivityAt: record.lastActivityAt, sessionEnded: record.sessionEnded,
+        assistantFinished: record.assistantFinished, pendingTools: record.pendingTools.length, unavailable: !!record.unavailable,
+        completed: record.loop?.status === '完成' }] } };
     return judged;
-  }).sort((a, b) => a.tool.localeCompare(b.tool) || a.project.localeCompare(b.project) || a.key.localeCompare(b.key));
-}
-function returnCommand(record: SessionRecord, config: Config, sessionId = record.sessionId): string {
-  if (record.tool === 'loop') return `open ${shellQuote(record.originals[0]!.path)}`;
-  const command = shellQuote(config.commands[record.tool]);
-  return `${command} ${record.tool === 'cc' ? '--resume' : record.tool === 'codex' ? 'resume' : '--session'} ${shellQuote(sessionId)}`;
+  }).sort((a, b) => a.project.localeCompare(b.project) || a.key.localeCompare(b.key));
 }
 export function renderNotice(content: NoticeContent, at?: string, evidenceAt = at): string {
   const e = content.evidence;
@@ -105,20 +49,15 @@ export function renderNotice(content: NoticeContent, at?: string, evidenceAt = a
     `意图原文：${e.intentOriginal ?? '原件未提供开工指令，未推测'}`,
     '你后来追加的要求：', ...(e.additionalRequirements.length ? e.additionalRequirements.map(text => `- ${text}`) : ['- 无']),
     '做到哪了（最近几步）：', ...(e.recentSteps.length ? e.recentSteps.map(step => `- ${step.at} ${step.text}`) : ['- 暂不可读']),
-    `判断依据：${e.reason}`,
-    ...(e.assistantReply ? [`助手原话：${e.assistantReply}`] : []),
+    `判断依据：${e.reason}`, ...(e.assistantReply ? [`助手原话：${e.assistantReply}`] : []),
     ...(e.presentation ? [`这件事（完整）：${e.presentation.situation}`, `要你做（完整）：${e.presentation.action}`] : []),
-    ...(e.needs ? [`还欠什么：${e.needs.length ? e.needs.join('；') : '无'}`] : []),
-    ...e.originals.map(original => `原件：${original.path}`),
+    ...(e.needs ? [`还欠什么：${e.needs.length ? e.needs.join('；') : '无'}`] : []), ...e.originals.map(original => `原件：${original.path}`),
   ].join('\n');
 }
-function createNotice(tool: Notice['tool'], kind: Notice['kind'], dedupeKey: string, at: string, content: NoticeContent, sessionKey?: string, evidenceAt?: string): Notice {
-  return {
-    version: 1, id: hash(dedupeKey), dedupeKey, at, tool, kind,
-    level: kind === 'stalled' || kind === 'loop_completed' ? '有空看' : '现在就要你',
-    ...(sessionKey ? { sessionKey } : {}), ...(evidenceAt ? { evidenceAt } : {}), content,
-    text: kind === 'blind' || kind === 'unreadable' ? truncateUtf8(renderNotice(content, at, evidenceAt), 4096) : renderNotice(content, at, evidenceAt),
-  };
+function createNotice(kind: Notice['kind'], key: string, at: string, content: NoticeContent, evidenceAt: string, sessionKey?: string): Notice {
+  return { version: 1, id: hash(key), dedupeKey: key, at, tool: 'loop', kind,
+    level: kind === 'loop_completed' ? '有空看' : '现在就要你',
+    ...(sessionKey ? { sessionKey } : {}), evidenceAt, content, text: renderNotice(content, at, evidenceAt) };
 }
 function attachSnapshot(notice: Notice, value: TaskSnapshot, projection: Projection): Notice {
   const snapshot = projection.noticeSnapshots.get(noticeSnapshotKey(notice)) ?? value;
@@ -129,260 +68,101 @@ function attachSnapshot(notice: Notice, value: TaskSnapshot, projection: Project
     ? truncateUtf8(renderNotice(notice.content, notice.at, notice.evidenceAt), 4096) : renderNotice(notice.content, notice.at, notice.evidenceAt);
   return notice;
 }
-export function planNotices(records: JudgedRecord[], projection: Projection, config: Config, now: string, suppressed?: EventPayload[]): Notice[] {
-  const candidates: Notice[] = [], memberViews = new Map<JudgedRecord, JudgedRecord[]>();
+export function planNotices(records: JudgedRecord[], projection: Projection, _config: Config, now: string, suppressed?: EventPayload[]): Notice[] {
+  const candidates: Notice[] = [];
   for (const record of records) {
-    traceWaitingWindows(record, projection, config, now, suppressed);
-    const views = waitingFactViews(record, projection, config, now);
-    if (views.length) memberViews.set(record, views);
-  }
-  for (const record of records.flatMap(record => memberViews.get(record) ?? [record])) {
-    if (record.status === '已搁置') continue;
-    let kind: Notice['kind'] | undefined;
-    let key = '';
-    let title = '';
-    const ai = `${basename(record.project) || record.project} 的 ${toolNames[record.tool]}`;
-    const waitingId = record.waiting?.sessionId ?? record.programWaiting?.sessionId ?? record.analysisWaiting?.sessionId ?? record.modelWaiting?.sessionId ?? record.ruleWaiting?.sessionId;
-    const targetId = waitingId ?? (record.drift && mismatchedMemberIds(record, projection).size ? record.drift.sessionId : undefined);
-    const waitingMember = targetId ? membersOf(record).find(member => member.sessionId === targetId) : undefined;
-    const modelReply = record.modelWaiting ? projection.pushes.findLast(p => p.recordKey === record.key && p.sessionId === record.modelWaiting!.sessionId
-      && p.event === 'turn_end' && p.at === record.modelWaiting!.evidenceAt)?.detail ?? waitingMember?.assistantReply?.text : undefined;
-    const last = record.loop?.phase ?? record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? waitingMember?.pendingTools.at(-1)?.text ?? (record.waiting?.detail || undefined) ?? record.pendingTools.at(-1)?.text ?? record.recentSteps.at(-1)?.text ?? '尚未答完';
-    const batch = record.loop ? humanText(record.loop.batch ?? '批次名暂未记录', record.project, now) : '';
-    if (record.loop && record.status !== '看不见了' && record.loop.status !== '进行中') {
-      kind = record.loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
-      // 展示用的批名/当前步骤/关联会话不改变旧版去重键，升级不能重发已交代的总结。
-      const { batch: _batch, phase: _phase, sessions: _sessions, summary: _summary, ...facts } = record.loop;
-      key = `${kind}:${record.key}:${hash(JSON.stringify(facts))}`;
-      title = `${ai}（${batch}）${record.loop.status === '暂停' ? '停下了，需要你决定' : '做完了，给你一份交代'}`;
-    } else if (record.status === '在等我' && record.waiting) {
-      kind = 'waiting';
-      key = `waiting:${record.key}:${pushIdentity(record.waiting)}`;
-      const child = record.waiting.sessionId !== record.sessionId;
-      title = `${ai}${child ? ' 子会话' : ''} 在等你授权`;
-    } else if (record.status === '在等我' && (record.programWaiting || record.analysisWaiting || record.modelWaiting || record.ruleWaiting)) {
-      kind = 'waiting';
-      const fact = record.programWaiting ? { ...record.programWaiting, recordKey: record.key, task: 'waiting' as const }
-        : record.analysisWaiting ? { ...record.analysisWaiting, recordKey: record.key, task: 'waiting' as const }
-        : record.modelWaiting ?? { ...record.ruleWaiting!, recordKey: record.key, task: 'waiting' as const };
-      key = `model_waiting:${record.key}:${modelEvidenceKey(fact)}`;
-      title = `${ai} 可能在等你回复`;
-    } else if (record.status === '疑似跑偏' && record.drift) {
-      kind = 'drift';
-      key = `drift:${record.key}:${modelEvidenceKey(record.drift)}`;
-      title = `${ai} 疑似跑偏`;
-    } else if (record.status === '停滞') {
-      kind = 'stalled';
-      key = `stalled:${record.key}`;
-      title = `${ai}${record.loop ? `（${batch}）` : ''} 干到一半没动静了`;
+    if (record.tool !== 'loop' || record.status === '已搁置' || record.status === '看不见了') continue;
+    const previous = projection.ruleDecisions.get(record.key)?.rule.facts;
+    if (previous?.loopStatus === '暂停' && record.loop?.status !== '暂停'
+      && !projection.notices.some(n => n.kind === 'loop_paused' && n.sessionKey === record.key && n.evidenceAt === previous.loopPausedAt)) {
+      traceSuppression(projection, suppressed, { dedupeKey: `loop_paused:${record.key}`, evidenceAt: previous.loopPausedAt ?? previous.lastActivityAt,
+        sessionKey: record.key, scope: 'notice', intervalMs: WAITING_INTERVAL_MS }, 'loop_resumed');
     }
-    if (!kind) continue;
-    const evidenceAt = kind === 'loop_paused' ? record.loopPausedAt ?? now
-      : record.waiting?.at ?? record.programWaiting?.evidenceAt ?? record.analysisWaiting?.evidenceAt ?? record.modelWaiting?.evidenceAt ?? record.ruleWaiting?.evidenceAt ?? record.drift?.evidenceAt ?? record.lastActivityAt;
-    const memberId = waitingId ?? record.drift?.sessionId ?? record.sessionId;
+    const loop = record.loop!;
+    if (loop.status === '进行中') continue;
+    const kind = loop.status === '暂停' ? 'loop_paused' : 'loop_completed';
+    // 展示字段不改变旧事实身份，升级不补发已交代的总结。
+    const { batch: _batch, phase: _phase, sessions: _sessions, summary: _summary, ...facts } = loop;
+    const key = `${kind}:${record.key}:${hash(JSON.stringify(facts))}`;
+    const evidenceAt = kind === 'loop_paused' ? record.loopPausedAt ?? now : record.lastActivityAt;
     const suppress = (reason: Parameters<typeof traceSuppression>[3]) => traceSuppression(projection, suppressed,
-      { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key, memberSessionId: memberId }, reason);
-    const existing = projection.notices.find(n => n.dedupeKey === key || ((record.waiting || record.programWaiting || record.analysisWaiting || record.modelWaiting || record.ruleWaiting || record.drift)
-      && (!record.drift || sameModelEvidenceScope(n, record.drift))
-      && n.kind === kind && n.sessionKey === record.key && (n.memberSessionId ?? record.sessionId) === memberId
-      && Date.parse(n.evidenceAt ?? '') === Date.parse(evidenceAt)));
-    const already = !!existing;
-    const analysis = kind === 'waiting' && waitingMember ? waitingAnalysis(record, waitingMember, evidenceAt, projection, config, now)?.result : undefined;
-    const waitingDecision = kind === 'waiting' && waitingMember
-      ? decideWaiting(record, waitingMember, evidenceAt, projection, config, now,
-        record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? '', !!record.waiting || !!record.programWaiting || !!analysis?.output?.redline) : undefined;
-    if (waitingDecision && !waitingDecision.ready && !already) {
-      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key,
-        memberSessionId: memberId, intervalMs: waitingDecision.intervalMs, waitingDecision },
-      waitingDecision.state === 'replied' ? 'user_replied' : 'waiting_interval');
-      continue;
+      { dedupeKey: key, evidenceAt, scope: 'notice', sessionKey: record.key, memberSessionId: record.sessionId }, reason);
+    if (kind === 'loop_paused' && Date.parse(now) - Date.parse(evidenceAt) < WAITING_INTERVAL_MS) { suppress('waiting_interval'); continue; }
+    const feedbackKey = feedbackSuppressionKey({ tool: 'loop', kind, sessionKey: record.key, memberSessionId: record.sessionId });
+    if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) { record.notice = '因你的误报没提醒'; suppress('feedback_false_positive'); continue; }
+    const existing = projection.notices.find(n => n.dedupeKey === key);
+    if (existing) { record.notice = projection.deliveredNoticeIds.has(existing.id) ? '已提醒，本轮去重' : '待写发件记录'; suppress('duplicate_notice'); continue; }
+    if (projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK) {
+      record.notice = '首次接入历史记录，不补发'; suppress('first_connection_history'); continue;
     }
-    if (kind === 'drift' && record.drift) {
-      const trigger = driftTrigger(record, record.drift), member = membersOf(record).find(member => member.sessionId === trigger.sessionId);
-      if (!member || !waitingReady(member, trigger.at, now)) {
-        suppress(!member ? 'missing_trigger_member' : humanRequests(member).some(ref => Date.parse(ref.at) > Date.parse(trigger.at) && ref.at <= now)
-          ? 'user_replied' : 'waiting_interval');
-        continue;
-      }
-    }
-    if (kind === 'loop_paused' && Date.parse(now) - Date.parse(record.loopPausedAt ?? now) < WAITING_INTERVAL_MS) {
-      suppress('waiting_interval'); continue;
-    }
-    const feedbackKey = feedbackSuppressionKey({ tool: record.tool, kind, sessionKey: record.key, memberSessionId: memberId });
-    if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) {
-      record.notice = '因你的误报没提醒';
-      suppress('feedback_false_positive');
-      continue;
-    }
-    const recovered = kind === 'waiting' && projection.pushes.some(push => push.recovered && push.recordKey === record.key
-      && (record.waiting ? pushIdentity(push) === pushIdentity(record.waiting)
-        : push.event === 'turn_end' && push.sessionId === waitingId && push.at === evidenceAt));
-    if (!already && (recovered || (projection.startedAt && Date.parse(evidenceAt) < Date.parse(projection.startedAt) - FIRST_LOOKBACK))) {
-      record.notice = '首次接入历史记录，不补发';
-      if (projection.suppressedNotices.get(key) !== evidenceAt) suppress(recovered ? 'recovered_push' : 'first_connection_history');
-      continue;
-    }
-    if (already) {
-      record.notice = projection.deliveredNoticeIds.has(existing.id) ? '已提醒，本轮去重' : '待写发件记录';
-      suppress('duplicate_notice'); continue;
-    }
-    if (kind === 'waiting' && waitingMember && shouldBlockWaiting(record, waitingMember, evidenceAt, projection, config, now, suppressed)) continue;
-    const content: NoticeContent = {
-      title, summary: '', returnCommand: returnCommand(record, config, memberId),
-      evidence: {
-        project: waitingMember?.project ?? record.project, intentOriginal: record.intent.initial,
-        additionalRequirements: record.intent.additions, recentSteps: waitingMember?.recentSteps ?? record.recentSteps,
-        reason: record.loop ? `${record.reason}；评审 ${record.loop.reviews} 次，返修 ${record.loop.repairs} 次` : record.reason,
-        originals: record.originals,
-        assistantReply: record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text,
-        ...(record.loop ? { needs: record.loop.needs, needsProvided: record.loop.needsProvided } : {}),
-      },
-    };
-    const notice = createNotice(record.tool, kind, key, now, content, record.key, evidenceAt);
-    const finding = record.modelWaiting ?? record.drift;
-    if (finding?.originals && JSON.stringify(finding.originals) !== JSON.stringify(record.originals)) notice.sourceEvidence = finding.originals;
-    const factualStatus: TaskSnapshotInput['factualStatus'] = kind === 'waiting' ? '在等你' : kind === 'drift' ? '跑偏'
-      : kind === 'stalled' ? '停滞' : kind === 'loop_paused' ? 'loop 暂停' : 'loop 完成';
-    const lastOutput = record.loop && kind !== 'stalled'
-      ? `${basename(record.project)} · ${batch}：${record.loop.conclusion}${record.loop.summary ? `；${record.loop.summary}` : ''}；还欠 ${record.loop.needs.length} 项${record.loop.needsProvided === false ? '；总结没写还欠什么' : ''}`
-      : kind === 'stalled' ? `${record.loop ? `${basename(record.project)} · ${batch}，` : ''}最后在做 ${record.loop?.phase ?? record.recentSteps.at(-1)?.text ?? last}；已 ${Math.floor((Date.parse(now) - Date.parse(record.lastActivityAt)) / 60000)} 分钟没动静`
-        : kind === 'drift' ? record.drift!.result.stepQuote ?? last : record.programWaiting?.reply ?? record.analysisWaiting?.reply ?? modelReply ?? record.ruleWaiting?.reply ?? record.waiting?.detail ?? record.assistantReply?.text ?? last;
-    const quotedStep = kind === 'drift' ? record.recentSteps.findLast(step => step.text.includes(record.drift!.result.stepQuote!)) : undefined;
-    const input = quotedStep ? stepSnapshotInput(record, quotedStep) : snapshotInput(record, lastOutput, factualStatus,
-      record.assistantReply && kind === 'waiting' && !record.waiting ? record.assistantReply.at : evidenceAt,
-      kind === 'waiting' && !record.waiting ? 'reply' : 'step');
-    const baseSnapshot = finding?.snapshot?.factualStatus === factualStatus ? finding.snapshot : ruleSnapshot(input, record.project, now);
-    attachSnapshot(notice, analysisSnapshot(notice, baseSnapshot, analysis), projection);
-    notice.memberSessionId = memberId;
-    if (waitingDecision) notice.waitingDecision = waitingDecision;
-    record.notice = '待写发件记录';
-    candidates.push(notice);
-  }
-  for (const [record, views] of memberViews) mergeWaitingViews(record, views);
-  const unmatchedSessions = new Set<string>();
-  for (const mismatch of projection.pushMismatches.values()) {
-    const push = mismatch.push, scope = `${push.tool}:${push.sessionId}`;
-    if (unmatchedSessions.has(scope)) continue;
-    unmatchedSessions.add(scope);
-    // 真正的来源整体故障仍用原来的来源告警，不重复把一条推送另报一次。
-    if (projection.health.get(push.tool)?.since || projection.health.get('inbox')?.since) continue;
-    const key = `blind:push:${scope}:${mismatch.episodeId}`;
-    const record = [...(projection.snapshotSessions ?? projection.sessions).values()].find(r => r.tool === push.tool
-      && membersOf(r).some(member => member.sessionId === push.sessionId));
-    const member = record && membersOf(record).find(m => m.sessionId === push.sessionId);
-    const feedbackKey = feedbackSuppressionKey({ tool: push.tool, kind: 'blind', feedbackScope: scope });
-    if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) {
-      const judged = records.find(r => r.key === record?.key);
-      if (judged) judged.notice = '因你的误报没提醒';
-      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt: mismatch.since, scope: 'notice', memberSessionId: push.sessionId }, 'feedback_false_positive');
-      continue;
-    }
-    if (projection.notices.some(n => n.dedupeKey === key)) {
-      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt: mismatch.since, scope: 'notice', memberSessionId: push.sessionId }, 'duplicate_notice');
-      continue;
-    }
-    const content: NoticeContent = {
-      title: `${basename(member?.project ?? push.project)} 的 ${toolNames[push.tool]} 的盯防看不见了`, summary: '',
-      returnCommand: `${shellQuote(config.commands[push.tool])} ${push.tool === 'cc' ? '--resume' : push.tool === 'codex' ? 'resume' : '--session'} ${shellQuote(push.sessionId)}`,
-      evidence: { project: member?.project ?? push.project, intentOriginal: record?.intent.initial ?? null,
-        additionalRequirements: [], recentSteps: [], originals: [],
-        reason: `从 ${localTime(mismatch.since, now)} 起，这个会话的报信与记录对不上；只影响这一个会话，同一工具的其他会话照常判断和提醒。\n${mismatch.reason}` },
-    };
-    const notice = { ...createNotice(push.tool, 'blind', key, now, content, record?.key, mismatch.since),
-      sourceEvidence: record?.originals ?? [], feedbackScope: scope, ...(record ? { memberSessionId: push.sessionId } : {}) };
-    const seen = member?.assistantReply?.text ?? member?.recentSteps.at(-1)?.text;
-    const lastOutput = `这个会话报信与记录未核对上；只影响这一个会话，其他会话继续检测${seen ? `；最后看到：${seen}` : ''}`;
-    const input = record ? snapshotInput(record, lastOutput, '看不见了', mismatch.since)
-      : { goal: null, currentTask: null, lastOutput, factualStatus: '看不见了' as const };
-    candidates.push(attachSnapshot(notice, ruleSnapshot(input, push.project, now), projection));
+    const batch = humanText(loop.batch ?? '批次名暂未记录', record.project, now), ai = `${basename(record.project)} 的 loop（${batch}）`;
+    const content: NoticeContent = { title: `${ai}${kind === 'loop_paused' ? '停下了，需要你决定' : '做完了，给你一份交代'}`,
+      summary: '', returnCommand: `open ${shellQuote(record.originals[0]!.path)}`,
+      evidence: { project: record.project, intentOriginal: record.intent.initial, additionalRequirements: record.intent.additions,
+        recentSteps: record.recentSteps, reason: `${record.reason}；评审 ${loop.reviews} 次，返修 ${loop.repairs} 次`, originals: record.originals,
+        assistantReply: record.assistantReply?.text, needs: loop.needs, needsProvided: loop.needsProvided } };
+    const notice = createNotice(kind, key, now, content, evidenceAt, record.key);
+    const lastOutput = `${basename(record.project)} · ${batch}：${loop.conclusion}${loop.summary ? `；${loop.summary}` : ''}；还欠 ${loop.needs.length} 项${loop.needsProvided === false ? '；总结没写还欠什么' : ''}`;
+    const input = snapshotInput(record, lastOutput, kind === 'loop_paused' ? 'loop 暂停' : 'loop 完成', evidenceAt);
+    notice.memberSessionId = record.sessionId; record.notice = '待写发件记录';
+    candidates.push(attachSnapshot(notice, ruleSnapshot(input, record.project, now), projection));
   }
   for (const health of projection.health.values()) {
+    if (health.source !== 'loop') continue;
     const kind = health.since ? 'blind' : health.fileFailures?.count ? 'unreadable' : null;
     if (!kind) continue;
-    const key = `${kind}:${health.source}:${kind === 'blind' ? health.episodeId : health.fileFailureEpisodeId}`;
-    const failures = health.fileFailures;
-    const failureDetails = [...health.errors, ...(failures?.examples ?? [])].join('\n');
-    const affected = health.affectedSessions?.[0] ?? records.find(r => r.tool === health.source && r.originals.some(o => failureDetails.includes(o.path)));
-    const feedbackScope = affected && health.source !== 'inbox' && (health.affectedSessions?.length ?? 1) <= 1
-      && (health.fileFailures?.count ?? 0) <= 1 && health.errors.length <= 1 ? `${health.source}:${affected.sessionId}` : undefined;
-    const feedbackKey = feedbackSuppressionKey({ tool: health.source, kind, feedbackScope });
+    const evidenceAt = (kind === 'blind' ? health.since : health.fileFailureSince) ?? now;
+    const key = `${kind}:loop:${kind === 'blind' ? health.episodeId : health.fileFailureEpisodeId}`;
+    const failureDetails = [...health.errors, ...(health.fileFailures?.examples ?? [])].join('\n');
+    const affected = health.affectedSessions?.[0] ?? records.find(r => r.originals.some(o => failureDetails.includes(o.path)));
+    const scope = affected && (health.affectedSessions?.length ?? 1) <= 1 && (health.fileFailures?.count ?? 0) <= 1 && health.errors.length <= 1
+      ? `loop:${affected.sessionId}` : undefined;
+    const feedbackKey = feedbackSuppressionKey({ tool: 'loop', kind, feedbackScope: scope });
     if (feedbackKey && projection.feedbackSuppressions.has(feedbackKey)) {
-      for (const record of records) if (record.tool === health.source && membersOf(record).some(m => m.sessionId === affected?.sessionId)) record.notice = '因你的误报没提醒';
-      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt: (kind === 'blind' ? health.since : health.fileFailureSince) ?? now, scope: 'notice' }, 'feedback_false_positive');
-      continue;
+      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt, scope: 'notice' }, 'feedback_false_positive'); continue;
     }
     if (projection.notices.some(n => n.dedupeKey === key)) {
-      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt: (kind === 'blind' ? health.since : health.fileFailureSince) ?? now, scope: 'notice' }, 'duplicate_notice');
-      continue;
+      traceSuppression(projection, suppressed, { dedupeKey: key, evidenceAt, scope: 'notice' }, 'duplicate_notice'); continue;
     }
-    const affectedRecord = affected && [...(projection.snapshotSessions ?? projection.sessions).values()].find(r => r.tool === health.source
-      && membersOf(r).some(m => m.sessionId === affected.sessionId));
-    const intent = affectedRecord?.intent.initial ?? (affected && ('intentOriginal' in affected ? affected.intentOriginal : 'intent' in affected ? affected.intent.initial : null));
-    const ai = affected ? `${basename(affected.project)} 的 ${toolNames[health.source]}` : `${toolNames[health.source]}（项目和会话暂时无法辨认）`;
-    const mismatch = health.errors.some(error => /推送与已读取会话对不上/.test(error));
-    const since = localTime((kind === 'blind' ? health.since : health.fileFailureSince) ?? now, now);
-    const scope = health.source === 'inbox' ? '所有 AI 工具会话的当前状态都暂时不能确认；loop 仍继续检测。'
-      : `${toolNames[health.source]} 的所有会话当前状态都暂时不能确认；其他工具继续检测。`;
-    const what = mismatch ? `从 ${since} 起，这个会话的报信和记录没能核对上；${scope}`
-      : kind === 'blind' ? `从 ${since} 起，暂时读不了${affected ? '这个会话的记录' : `${toolNames[health.source]} 的会话记录`}；${scope}`
-        : `从 ${since} 起发现 ${failures!.count} 份会话读不了；其余会话照常判断和显示。`;
-    const command = affected && health.source !== 'inbox'
-      ? health.source === 'loop' && 'originals' in affected ? `open ${shellQuote(affected.originals[0]!.path)}`
-        : health.source !== 'loop' ? `${shellQuote(config.commands[health.source])} ${health.source === 'cc' ? '--resume' : health.source === 'codex' ? 'resume' : '--session'} ${shellQuote(affected.sessionId)}` : '暂时无法定位总结，请打开 loop 检查。'
-      : `暂时无法定位具体会话，请打开 ${toolNames[health.source]} 检查。`;
-    const content: NoticeContent = {
-      title: kind === 'blind' ? `${affected ? ai : toolNames[health.source]} 的盯防看不见了`
-        : `${affected ? ai : toolNames[health.source]} 有 ${failures!.count} 份会话读不了`,
-      summary: '',
-      returnCommand: command,
-      evidence: {
-        project: affected?.project ?? null, intentOriginal: intent ?? null, additionalRequirements: [], recentSteps: [],
-        reason: [what, ...(kind === 'blind' ? health.errors.slice(0, 3) : []), ...(failures?.examples.slice(0, 3) ?? [])]
-          .map(error => compact(error, 240)).join('\n'), originals: [],
-      },
-    };
-    const notice = { ...createNotice(health.source, kind, key, now, content, undefined, (kind === 'blind' ? health.since : health.fileFailureSince) ?? now), ...(feedbackScope ? { feedbackScope } : {}) };
-    notice.sourceEvidence = affectedRecord?.originals ?? [];
-    const seen = affectedRecord?.assistantReply?.text ?? affectedRecord?.recentSteps.at(-1)?.text;
-    const unreadable = `${mismatch ? '这个会话报信与记录未核对上' : kind === 'blind' ? '会话记录暂时读不了' : `${failures!.count} 份会话读不了`}；${kind === 'blind' ? scope : '其他会话继续检测'}`;
-    const lastOutput = [unreadable, seen ? `最后看到：${seen}` : '', what, failureDetails].filter(Boolean).join('\n');
-    const input: TaskSnapshotInput = affectedRecord ? snapshotInput(affectedRecord, lastOutput, '看不见了', notice.evidenceAt!)
-      : { goal: intent ?? null, currentTask: null, lastOutput: compact(lastOutput, 1200), factualStatus: '看不见了' };
+    const record = affected && [...(projection.snapshotSessions ?? projection.sessions).values()].find(r => r.sessionId === affected.sessionId);
+    const seen = record?.assistantReply?.text ?? record?.recentSteps.at(-1)?.text;
+    const what = kind === 'blind' ? `从 ${localTime(evidenceAt, now)} 起暂时读不了 loop 的记录，当前批次状态不能确认`
+      : `从 ${localTime(evidenceAt, now)} 起发现 ${health.fileFailures!.count} 份 loop 总结读不了；其余批次照常判断和显示`;
+    const content: NoticeContent = { title: kind === 'blind' ? 'loop 的盯防看不见了' : `loop 有 ${health.fileFailures!.count} 份会话读不了`, summary: '',
+      returnCommand: record ? `open ${shellQuote(record.originals[0]!.path)}` : '暂时无法定位总结，请打开 loop 检查。',
+      evidence: { project: affected?.project ?? null, intentOriginal: record?.intent.initial ?? null, additionalRequirements: [], recentSteps: [], originals: [],
+        reason: [what, ...health.errors.slice(0, 3), ...(health.fileFailures?.examples.slice(0, 3) ?? [])].map(error => compact(error, 240)).join('\n') } };
+    const notice = createNotice(kind, key, now, content, evidenceAt);
+    notice.sourceEvidence = record?.originals ?? []; if (scope) notice.feedbackScope = scope;
+    const lastOutput = [what, seen ? `最后看到：${seen}` : '', failureDetails].filter(Boolean).join('\n');
+    const input: TaskSnapshotInput = record ? snapshotInput(record, lastOutput, '看不见了', evidenceAt)
+      : { goal: null, currentTask: null, lastOutput: compact(lastOutput, 1200), factualStatus: '看不见了' };
     candidates.push(attachSnapshot(notice, ruleSnapshot(input, affected?.project ?? '', now), projection));
   }
-  return batchWaitingNotices(candidates.map(notice => routeNotice(notice, projection, now)));
+  return candidates.map(notice => routeNotice(notice, projection, now));
 }
 export function renderOverview(records: JudgedRecord[], projection: Projection): string {
   const lines = ['工具 | 项目 | 意图 | 状态 | 最后活动时间 | 提醒'];
   for (const record of records) {
     const intent = [record.intent.initial ?? '总结未提供开工指令', ...record.intent.additions].join('；');
-    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, [record.intelligenceNote ?? record.notice ?? '—', ...new Set(record.modelNotes ?? [])].join('；')].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
+    lines.push([toolNames[record.tool], record.project, compact(intent), record.status, record.lastActivityAt, record.notice ?? '—'].map(v => v.replaceAll('|', '｜').replace(/[\r\n]/g, ' ')).join(' | '));
   }
   if (!records.length) lines.push('暂无会话');
   for (const health of projection.health.values()) {
-    if (health.since) lines.push(`盯防异常：${toolNames[health.source]}，从 ${health.since} 起看不见；${projection.notices.some(n => n.kind === 'blind' && n.dedupeKey === `blind:${health.source}:${health.episodeId}` && projection.deliveredNoticeIds.has(n.id)) ? '已提醒，本轮去重' : '待写发件记录'}`);
+    if (health.since) lines.push(`盯防异常：${toolNames[health.source]}，从 ${health.since} 起看不见；${projection.notices.some(n => n.dedupeKey === `blind:${health.source}:${health.episodeId}` && projection.deliveredNoticeIds.has(n.id)) ? '已提醒，本轮去重' : '待写发件记录'}`);
     else if (health.fileFailures?.count) lines.push(`${toolNames[health.source]} 有 ${health.fileFailures.count} 份会话读不了，其余会话照常显示。`);
   }
-  const unmatched = new Set<string>();
-  for (const { push, since } of projection.pushMismatches.values()) {
-    const scope = `${push.tool}:${push.sessionId}`;
-    if (unmatched.has(scope)) continue;
-    unmatched.add(scope);
-    lines.push(`会话看不见了：${toolNames[push.tool]} · ${push.project}，从 ${since} 起报信与记录对不上；仅这个会话，其他会话照常。`);
-  }
-  const day = projection.lastScanAt?.slice(0, 10);
-  if (day && projection.modelCalls.has(day)) lines.push(`模型用量（UTC ${day}）：${projection.modelCalls.get(day)} 次；失败或额度用完的会话已标「仅规则判断」。`);
   const undelivered = undeliveredNotices(projection);
-  const failed = undelivered.filter(item => item.channel === 'local' && !item.stopped).length;
-  if (failed) lines.push(`本机通知尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
+  for (const name of ['local', 'feishu']) {
+    const failed = undelivered.filter(item => item.channel === name && !item.stopped).length;
+    if (failed) lines.push(`${name === 'local' ? '本机通知' : '飞书'}尚未成功：${failed} 条；已写发件记录，下轮检测重试。`);
+  }
   if (projection.feishuConnection) {
     const connection = projection.feishuConnection;
     const status = connection.state === 'connected' ? '已连接' : connection.state === 'fake' ? '假渠道（未连接真实飞书）'
       : connection.state === 'connecting' ? '未连接（连接中）' : connection.state === 'reconnecting' ? '未连接（重连中）' : '未连接';
     lines.push(`飞书长连接：${status}${connection.failure ? `；${connection.failure.category}：${connection.failure.message}` : ''}`);
   }
-  const feishuFailed = undelivered.filter(item => item.channel === 'feishu' && !item.stopped).length;
-  if (feishuFailed) lines.push(`飞书尚未成功：${feishuFailed} 条；已写发件记录，下轮检测重试。`);
   for (const item of undelivered.filter(item => item.stopped)) lines.push(`没发出去：${item.title} → ${channelName(item.channel)}；${item.historyUnknown
     ? '历史失败次数待恢复，暂停发送' : `连续失败 ${item.failures} 次，已停发`}；${item.failure.category}：${item.failure.reason}`);
   return lines.join('\n');

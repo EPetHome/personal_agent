@@ -1,4 +1,4 @@
-import type { IntelligenceConfig, IntelligenceEvent, IntelligenceState } from './intelligence-types.ts';
+import type { IntelligenceEvent, IntelligenceState } from './intelligence-types.ts';
 
 export const tools = ['cc', 'codex', 'pi', 'loop'] as const;
 export type Tool = typeof tools[number];
@@ -10,29 +10,36 @@ export interface Config {
   sources: Record<Tool, string | null>;
   inboxDir: string | null;
   dataDir: string;
-  commands: Record<'cc' | 'codex' | 'pi', string>;
+  commands: { cc: string };
   /** 词法目录边界匹配，不读取项目本身；未配置时不忽略。 */
   ignoreProjectPrefixes?: string[];
-  /** 省略/null 保持纯规则模式，不启动任何模型或通知进程。 */
+  /** 可选的 loop 卡片起草器；不用于聊天判断。省略/null 为规则文案。 */
   judge?: JudgeConfig | null;
   localChannel?: { executable: string; timeoutMs: number } | null;
   feishu?: FeishuConfig | null;
   /** IM 原话转达；缺省关闭，目录必须显式配置，绝不推导真实主目录。 */
   relay?: { enabled: boolean; ccSessionsDir?: string; timeoutMs?: number };
   service?: { intervalMs: number; restartWindowMs: number; restartThreshold: number };
-  learning?: boolean;
-  /** 「在等你」专用；分钟，启动时读取，缺省使用起步值。 */
-  waiting?: Partial<WaitingConfig>;
-  /** 带只读工具的后台分析；沿用 judge 的模型，不占其每日额度。 */
-  intelligence?: IntelligenceConfig;
+  /** 新运行入口只读 loop 事件；intervalMs 仅兼容旧配置，不再驱动大循环。 */
+  managedLoop?: { verifyAfterMs: number; inspectEveryMs: number; intakeEveryMs: number; staleAfterMs: number };
+  /** 独立任务只读主心跳；去重/回执仍在同一本账本，不连接飞书。 */
+  heartbeat?: { everyMs: number; timeoutMs: number; checkEveryMs: number; executable: string; notifyTimeoutMs: number };
+  /** 可执行文件 + 固定参数，不经 shell；末尾追加 status/send/push/merge/stop，stdin/stdout JSON。 */
+  worker?: { executable: string; args: string[]; timeoutMs: number; candidateRefs: string[] };
+  /** Pi 单次查询/skill协议；命令与skill映射只能来自本人配置，不接受材料中的命令。 */
+  piWorker?: { executable: string; args: string[]; timeoutMs: number };
+  /** 本机网页只绑定127.0.0.1；不配置不启动，不自动弹浏览器。 */
+  sidebar?: { port: number; refreshMs: number };
+  /** 仅此目录顶层的新普通文件；缺省不读取任何工作区。 */
+  workspace?: { inboxDir: string; pollEveryMs: number; settleMs: number };
+  /** 只读本人配置的日历和妙记；凭证只从环境或数据目录外.env取。 */
+  schedule?: { mode: 'fake' | 'real'; calendarIds: string[]; minuteTokens: string[]; minuteOwnerIds?: string[]; pollEveryMs: number; timeoutMs: number; fakeFile?: string; envFile?: string };
+  dispatch?: {
+    projects: { name: string; path: string; workspace: string; done: string }[];
+    skills: { transcribe?: string; summary?: string; wiki?: string };
+  };
 }
-export interface WaitingConfig {
-  awayMinutes: number;
-  otherSessionMinutes: number;
-  inactiveMinutes: number;
-  activeConversationMinutes: number;
-}
-export const DEFAULT_WAITING: Readonly<WaitingConfig> = { awayMinutes: 20, otherSessionMinutes: 25, inactiveMinutes: 5, activeConversationMinutes: 10 };
+// 下方聊天/模型/影子字段仅兼容旧事件、旧卡片和检查点，不再驱动检测行为。
 export interface WaitingDecision {
   evidenceAt: string;
   activeConversation: boolean;
@@ -116,7 +123,8 @@ export interface TaskSnapshot extends TaskSnapshotInput, TaskSnapshotDraft {
   nextHumanReply?: RequestRef;
 }
 export interface Judge {
-  judge(request: JudgmentRequest, options?: { signal?: AbortSignal }): Promise<JudgmentResult>;
+  /** 旧替身接口仅用于兼容；当前检测不会调用。 */
+  judge?(request: JudgmentRequest, options?: { signal?: AbortSignal }): Promise<JudgmentResult>;
   /** 替身省略此方法即只做规则兜底，不偷偷调用真实模型。 */
   writeSnapshot?(input: TaskSnapshotInput, options?: { signal?: AbortSignal }): Promise<TaskSnapshotDraft>;
 }

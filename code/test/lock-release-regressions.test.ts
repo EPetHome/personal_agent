@@ -18,7 +18,7 @@ const locksUrl = new URL('../src/core/locks.ts', import.meta.url).href;
 const cli = fileURLToPath(new URL('../src/cli/main.ts', import.meta.url));
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  f.config.sources.cc = null; f.config.learning = false;
+  f.config.sources.cc = null;
   f.config.feishu = { mode: 'fake', receiverId: 'ou_test', timeoutMs: 2000 };
   f.config.service = { intervalMs: 100, restartWindowMs: 60000, restartThreshold: 3 };
   const configPath = join(f.root, 'config.json'); await put(configPath, JSON.stringify(f.config));

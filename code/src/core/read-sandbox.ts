@@ -19,6 +19,8 @@ function forbidden(path: string, directory = false): string | null {
   if (dirs.some(p => /^(?:\.ssh|\.aws|\.gnupg|\.personal-agent|\.bak|\.git|keychains?|钥匙串|passwords?|密码管理器|私人聊天|private.?chats?|1password|bitwarden|lastpass|keepass|wechat|微信|telegram)$/i.test(p)
     || /backup|备份|私人聊天|密码管理器|钥匙串/i.test(p)
     || /^(?:\.1password|keepassxc|dashlane|enpass|messages|whatsapp|signal|com\.tencent\.xinwechat|wechat\s*files)$/i.test(p))) return '不许读的目录';
+  if (dirs.some((p, i) => (p === '.claude' && dirs[i + 1] === 'projects') || (p === '.codex' && dirs[i + 1] === 'sessions')
+    || (p === '.pi' && dirs[i + 1] === 'agent' && dirs[i + 2] === 'sessions'))) return 'AI聊天会话目录';
   if (dirs.some((p, i) => p.toLowerCase() === 'eval' && /^(?:cases|runs|待标注)$/i.test(dirs[i + 1] ?? ''))) return '真实评测数据目录';
   if (directory) return null;
   const name = basename(path);
@@ -64,7 +66,14 @@ export class ReadSandbox {
   }
   async authorize(input: string, directory: boolean | 'either' = false): Promise<string> {
     const path = this.absolute(input), session = path === this.transcript && directory !== true;
-    if (!session) {
+    const evidence = directory !== true && this.scope.evidenceFiles?.some(file => resolve(file) === path);
+    if (evidence) {
+      const reason = forbidden(path);
+      if (reason) return this.deny(path, reason);
+      if (within(resolve(this.scope.dataDir), path) || this.scope.sourceDirs.some(root => within(resolve(root), path)))
+        return this.deny(path, '运行数据或其他会话目录');
+    }
+    if (!session && !evidence) {
       if (!this.project || !within(this.project, path)) return this.deny(path, '不在当前会话的项目范围内');
       const reason = forbidden(path, directory === true);
       if (reason) return this.deny(path, reason);
@@ -75,7 +84,7 @@ export class ReadSandbox {
       const actual = await realpath(path);
       if (actual !== path) return this.deny(path, '不跟随符号链接或路径别名');
       // 连同祖先检查；不能从允许目录里的链接跳到其他项目/敏感目录。
-      const root = session ? dirname(path) : this.project!;
+      const root = session || evidence ? dirname(path) : this.project!;
       for (let current = path;; current = dirname(current)) {
         const stat = await lstat(current);
         if (stat.isSymbolicLink()) return this.deny(path, '不跟随符号链接');
