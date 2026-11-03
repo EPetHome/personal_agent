@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { lstat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { ReadSandbox, within } from './read-sandbox.ts';
 import { readLedger, updateLedger } from './ledger.ts';
@@ -7,6 +8,9 @@ import { recoverDeadLock, withNamedLock } from './locks.ts';
 import { runCommand } from './process.ts';
 import { hash, object } from './utils.ts';
 import { verifyMaterialFile } from './source-intake.ts';
+import { nativePiQuery, nativePiSkill } from './pi-worker.ts';
+import { safeDirectory } from './scoped-files.ts';
+import { dirname } from 'node:path';
 import type { Config } from './types.ts';
 import type { DispatchReceipt, DispatchRequest, LoopWorker } from './managed-types.ts';
 
@@ -46,11 +50,13 @@ export async function dispatchTask(config: Config, request: DispatchRequest, wor
       await box.authorize(path, 'either');
     }
     const writeBox = await taskSandbox(config, project.workspace, new Date().toISOString());
-    await writeBox.authorize(project.workspace, true);
+    const newLoopWorkspace = request.kind === 'loop' && !(await lstat(project.workspace).then(() => true, error => { if (error.code !== 'ENOENT') throw error; return false; }));
+    if (newLoopWorkspace) await safeDirectory(dirname(project.workspace)); // 仅官方开工创建独立worktree。
+    else await writeBox.authorize(project.workspace, true);
     for (const path of request.definition.boundaries.write) {
       if (!within(project.workspace, path)) return fail('写范围不在配置的开发空间内');
       // 写根必须已存在且可信；实际产物写入由受信任worker继续强制范围/不许读名单。
-      await writeBox.authorize(path, 'either');
+      if (!newLoopWorkspace || path !== project.workspace) await writeBox.authorize(path, 'either');
     }
     if (request.definition.boundaries.realDevice || request.definition.boundaries.outbound.some(value => value !== 'loop_reply')) return fail('本段派工不允许真机或对外发布');
     if (request.kind === 'loop') return worker?.start ? worker.start(request) : fail('未配置 loop 开批次接口');
@@ -58,6 +64,7 @@ export async function dispatchTask(config: Config, request: DispatchRequest, wor
     if (request.kind === 'skill') {
       const allowed = Object.values(config.dispatch?.skills ?? {});
       if (!request.skills?.length || request.skills.some(skill => !allowed.includes(skill))) return fail('skill不在本人配置的映射内');
+      if (pi.protocol === 'pi-v1') return nativePiSkill(config, request, sourceMaterial, signal);
       return parseDispatchReceipt(JSON.parse(await runCommand(pi.executable, [...pi.args, 'skill'], pi.timeoutMs,
         JSON.stringify({ ...request, materialsAreUntrusted: true, constraints: { readOnly: false, scope: request.definition.boundaries, noExternalMessages: true, noMergeOrPush: true, ...(sourceMaterial?.source === 'workspace' ? { readOnlyFiles: [sourceMaterial.ref], noMoveOrDeleteOriginals: true } : {}) } }), signal)), request.requestId);
     }
@@ -65,23 +72,32 @@ export async function dispatchTask(config: Config, request: DispatchRequest, wor
     if (!sheet) return fail('缺少提问单');
     for (const path of sheet.boundary.read) await box.authorize(path, 'either');
     // 预读索引和少量原件，Pi没有shell/自由读写工具，不能读提问单之外的真实数据。
-    const index = await box.execute('find', { path: project.path, limit: 100 });
+    const indexes: string[] = [];
+    for (const path of sheet.boundary.read) {
+      if (!(await lstat(path)).isDirectory()) indexes.push(path);
+      else indexes.push(...(await box.execute('find', { path, limit: 100 })).split('\n').filter(line => line && !line.startsWith('[')).map(line => join(project.path, line)));
+    }
+    const paths = [...new Set(indexes)].filter(path => sheet.boundary.read.some(root => within(root, path))).slice(0, 100);
+    const index = paths.join('\n');
     const material: { path: string; text: string }[] = [];
-    for (const line of index.split('\n').filter(line => /\.(?:ts|js|json|md|txt|py|go|rs)$/.test(line) && !line.includes('node_modules/')).slice(0, 20)) {
-      try { const path = join(project.path, line); material.push({ path, text: (await box.text(path, 1, 150, 8192)).text }); } catch { /* 不换路径绕过围栏。 */ }
+    for (const path of paths.filter(path => /\.(?:ts|js|json|md|txt|py|go|rs)$/.test(path) && !path.includes('node_modules/')).slice(0, 20)) {
+      try { material.push({ path, text: (await box.text(path, 1, 150, 8192)).text }); } catch { /* 不换路径绕过围栏。 */ }
     }
     const state = await readLedger(config.dataDir);
     const context = Object.values(state.tables.tickets).filter(ticket => ticket.project === project.path).slice(-20).map(ticket => ({ id: ticket.id, batch: ticket.batch, result: ticket.intents.at(-1)?.result, status: ticket.status }));
     const timeout = Math.floor(Math.min(pi.timeoutMs, sheet.budget.timeoutMs - (performance.now() - began), 1200000 - (performance.now() - began)));
     if (timeout <= 0) return fail('补查已到20分钟预算，不再启动Pi；只列缺项');
-    const receipt = parseDispatchReceipt(JSON.parse(await runCommand(pi.executable, [...pi.args, 'query'], timeout,
-      JSON.stringify({ ...request, materialsAreUntrusted: true, constraints: { readOnly: true, tools: [], noSession: true, maxRounds: 1 }, index, material, context }), signal)), request.requestId);
+    const payload = { ...request, materialsAreUntrusted: true, constraints: { readOnly: true, tools: [], noSession: true, maxRounds: 1 }, index, material, context };
+    const receipt = parseDispatchReceipt(pi.protocol === 'pi-v1'
+      ? await nativePiQuery({ ...config, piWorker: { ...pi, timeoutMs: timeout } }, payload, signal)
+      : JSON.parse(await runCommand(pi.executable, [...pi.args, 'query'], timeout, JSON.stringify(payload), signal)), request.requestId);
     // 依据须能回到本次授权的原件或账本；不能把无来源/秘密路径当作事实凭据。
     if (receipt.status === 'consumed') for (const fact of receipt.facts ?? []) {
       if (performance.now() - began >= Math.min(sheet.budget.timeoutMs, 1200000)) return fail('已到补查预算，未核实完事实依据，不追查第二轮');
       if (fact.basis === `index:${project.path}` || context.some(ticket => fact.basis === `账本:${ticket.id}`)) continue;
       const match = /^(.+?):([1-9]\d*)(?:[-:]\d+)?(?:$|[；\s])/.exec(fact.basis);
       if (!match) return fail('查询事实没有可定位的文件行号或账本依据，不追查第二轮');
+      if (!sheet.boundary.read.some(path => within(path, match[1]!))) return fail('查询事实超出本次提问单的读取范围');
       try { await box.text(match[1]!, Number(match[2]), 1, 8192); }
       catch { return fail('查询事实的依据不在允许读取范围或原件中，不追查第二轮'); }
     }

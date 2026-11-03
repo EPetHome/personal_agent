@@ -18,13 +18,26 @@ export function safeFailure(error: unknown): { category: FailureCategory; detail
     : { category: 'unknown', detail: '判断器调用异常（未保存原始错误）' };
 }
 
+/** 非零业务回执也要解析JSON；stderr与非法stdout永不回写账本。 */
+export function runJsonCommand(executable: string, args: string[], timeoutMs: number, input?: string, cwd?: string, environment?: NodeJS.ProcessEnv): Promise<unknown> {
+  return new Promise((accept, reject) => {
+    const env: NodeJS.ProcessEnv = { ...(environment ?? process.env), PATH: componentPath((environment ?? process.env).PATH) };
+    for (const key of Object.keys(env)) if (/^FEISHU_/.test(key)) delete env[key];
+    const child = execFile(executable, args, { env, cwd, timeout: timeoutMs, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, killSignal: 'SIGKILL' }, (error, stdout) => {
+      if (error && (typeof error.code !== 'number' || error.killed || error.signal)) { reject(new ComponentFailure('unknown', '协议进程超时/中断或无法启动；结果未知，不重试')); return; }
+      try { accept(JSON.parse(stdout)); } catch { reject(new ComponentFailure('parse', '协议没有交回合法JSON；结果未知，不重试')); }
+    });
+    child.stdin?.on('error', () => {}); child.stdin?.end(input);
+  });
+}
+
 /** 不经 shell；调用者决定如何降级，外部 stderr（可能带敏感数据）不进入记录。 */
 export function runCommand(executable: string, args: string[], timeoutMs: number, input?: string, signal?: AbortSignal, cwd?: string, environment?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve, reject) => {
     // 显式环境是完整替换，不再混入宿主变量；现有调用缺省仍沿用原行为。
     const base = environment ?? process.env;
     const env: NodeJS.ProcessEnv = { ...base, PATH: componentPath(base.PATH) };
-    delete env.FEISHU_APP_ID; delete env.FEISHU_APP_SECRET;
+    for (const key of Object.keys(env)) if (/^FEISHU_/.test(key)) delete env[key];
     const child = execFile(executable, args, { env, cwd, encoding: 'utf8', timeout: timeoutMs, signal, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
       if (!error) { resolve(stdout); return; }
       const code = error.code;

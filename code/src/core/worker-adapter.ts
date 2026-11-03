@@ -1,4 +1,6 @@
 import { runCommand } from './process.ts';
+import { nativeLoopWorker } from './loop-worker.ts';
+import { decodeJson } from './protocol-json.ts';
 import { object } from './utils.ts';
 import { parseDispatchReceipt } from './task-adapter.ts';
 import type { Config } from './types.ts';
@@ -16,9 +18,10 @@ export function parseLoopStatus(raw: unknown, batch: string): LoopStatus {
 /** 接入层唯一的 worker 写口；不能接受模型提供的命令或动作。 */
 export function commandWorker(config: Config): LoopWorker | undefined {
   if (!config.worker) return undefined;
+  if (config.worker.protocol === 'loop-v1') return nativeLoopWorker(config);
   const worker = config.worker;
   async function request(action: 'status' | 'send' | 'push' | 'merge' | 'stop' | 'start', input: unknown): Promise<unknown> {
-    return JSON.parse(await runCommand(worker.executable, [...worker.args, action], worker.timeoutMs, JSON.stringify(input)));
+    return decodeJson(await runCommand(worker.executable, [...worker.args, action], worker.timeoutMs, JSON.stringify(input)));
   }
   return {
     async status(batch, project) { return parseLoopStatus(await request('status', { schema: 1, batch, project, readOnly: true }), batch); },

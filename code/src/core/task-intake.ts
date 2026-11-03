@@ -184,12 +184,13 @@ export async function draftTask(config: Config, input: TextInput, parent?: Ticke
   if (selected) {
     const box = await taskSandbox(config, path, input.at);
     try { await box.authorize(path, true); } catch { missing.push('可安全读取的项目目录'); read = []; }
+    if (skillKeys.length) read = []; // 材料处理只读点名的原件，不把整个项目当材料。
     for (const file of files) {
       const target = isAbsolute(file) ? resolve(file) : join(path, file);
       try {
         if (material?.source === 'workspace' && material.file && target === material.ref && config.workspace?.inboxDir === material.file.root) {
           const materialBox = await taskSandbox(config, material.file.root, input.at); await materialBox.authorize(target); read.push(target);
-        } else await box.authorize(target, 'either');
+        } else { await box.authorize(target, 'either'); if (skillKeys.length) read.push(target); }
       } catch (error) {
         const denied = /凭证|私钥|证书|不许读|链接|登录态|运行数据|会话目录/.test(error instanceof Error ? error.message : '');
         missing.push(denied ? `读取围栏拦下的文件 ${file}（不能派查绕过）` : `能定位且允许读取的文件 ${file}`);

@@ -3,11 +3,17 @@ import type { ReadAudit } from './intelligence-types.ts';
 export const LOOP_STATES = ['started', 'needs_decision', 'paused', 'repair_limit', 'completed', 'failed', 'resumed', 'queue'] as const;
 export type LoopState = typeof LOOP_STATES[number];
 export interface LoopEvent {
-  schema: 1; id: string; seq: number; at: string; project: string; batch: string; stage: string; state: LoopState;
+  schema: 1; id: string; seq: number; at: string; project: string; batch: string; batchFile?: string; stage: string; state: LoopState;
   reason: { category: string; text: string }; evidence: string[]; detail: Record<string, unknown>;
+  /** 官方原事件保真；schema/state仅是PA内部视图。 */
+  native?: { v: 1; id: string; seq: number; at: string; project: string; batch: { file: string; name: string; recipe: string };
+    stage: string | null; status: string; reason: { category: string; text: string }; evidence: Record<string, string>; detail: Record<string, unknown> };
 }
 export interface LoopStatus {
-  schema: 1; batch: string; updatedAt: string; lastActivityAt?: string;
+  schema: 1; batch: string; updatedAt: string; lastActivityAt?: string; batchFile?: string;
+  native?: Record<string, unknown>;
+  /** 当前真实执行端能力缺口；不可显示成可执行发布按钮。 */
+  executionBlock?: string;
   stages: { name: string; state: string; reason?: { category: string; text: string }; detail?: Record<string, unknown>; evidence?: string[]; sessionPresent?: boolean; sessionId?: string }[];
   branch?: string; commit?: string; candidateRef?: string; queue?: { status: string; returns: number; candidateRef?: string };
   pushTarget?: { remote: string; visibility: 'public' | 'private' | 'unknown' };
@@ -22,13 +28,13 @@ export interface IntentVersion {
   change?: { inputId: string; text: string; fields: string[]; affectedWrites: string[] };
 }
 export interface Ticket {
-  id: string; project: string; batch: string; threadId: string; parentId?: string; intents: IntentVersion[];
+  id: string; project: string; batch: string; batchFile?: string; threadId: string; parentId?: string; intents: IntentVersion[];
   status: string; reportedState?: LoopState; lastEventId: string; updatedAt: string;
   closure?: { kind: 'merged' | 'stopped'; requestId: string; at: string; commit?: string };
 }
 export interface Thread { id: string; ticketId: string; source: 'loop' | 'feishu' | 'workspace' | 'minutes'; project: string; batch: string }
 export interface Assignment {
-  id: string; ticketId: string; worker: 'loop' | 'pi'; project: string; batch: string; stage: string;
+  id: string; ticketId: string; worker: 'loop' | 'pi'; project: string; batch: string; batchFile?: string; stage: string;
   origin: 'registered' | 'dispatched'; proposalId?: string; startRequestId?: string; purpose?: 'task' | 'supplement' | 'cc'; state: LoopState; lastEventId: string; seq: number; updatedAt: string;
   dueAt?: string; assessedEventId?: string; lastActivityAt?: string;
   session?: { present: boolean; id?: string; at: string }; endedAt?: string;
@@ -124,12 +130,12 @@ export interface WorkerReceipt {
   outcome?: 'pushed' | 'merged' | 'stopped' | 'blocked'; commit?: string; code?: string; failure?: boolean;
 }
 export interface ExecutionRequest extends ExecutionTarget {
-  requestId: string; project: string; batch: string; stage: string; source: 'user_via_pa';
+  requestId: string; project: string; batch: string; batchFile?: string; stage: string; source: 'user_via_pa';
   force: false; checkSecrets: true; protectedBranches: string[];
 }
 export interface LoopWorker {
-  status(batch: string, project: string): Promise<LoopStatus>;
-  send(input: { requestId: string; batch: string; stage: string; text: string; source: 'user_via_pa' | 'pa_auto' }): Promise<WorkerReceipt>;
+  status(batch: string, project: string, batchFile?: string): Promise<LoopStatus>;
+  send(input: { requestId: string; project?: string; batch: string; batchFile?: string; stage: string; text: string; source: 'user_via_pa' | 'pa_auto' }): Promise<WorkerReceipt>;
   execute?(input: ExecutionRequest): Promise<WorkerReceipt>;
   start?(input: DispatchRequest): Promise<DispatchReceipt>;
 }

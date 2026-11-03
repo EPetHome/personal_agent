@@ -1,0 +1,26 @@
+{
+  "name": "真机接通-20261103",
+  "recipe": "develop",
+  "branch": "fix/真机接通",
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max",
+    "tools": "read,edit,write,bash"
+  },
+  "stages": {
+    "真实接入": {
+      "prompt": "../../prompt/提示词-真机接通.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/真机接通-20261103/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    }
+  }
+}

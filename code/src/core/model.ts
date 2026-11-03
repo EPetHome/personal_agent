@@ -1,4 +1,5 @@
 import { ComponentFailure, runCommand } from './process.ts';
+import { decodeJson } from './protocol-json.ts';
 import { contentText, hash, object, requiredString } from './utils.ts';
 import { actionTypes } from './task-snapshot.ts';
 import { validActionItems } from './action-items.ts';
@@ -19,7 +20,7 @@ function finalAssistant(stdout: string): { text: string; usage?: PiReadUsage } {
   let text = '', successful = false, usage: PiReadUsage | undefined;
   for (const line of stdout.split('\n')) {
     if (!line.trim()) continue;
-    const row = object(JSON.parse(line), 'Pi JSON 事件');
+    const row = object(decodeJson(line), 'Pi JSON 事件');
     if (row.type === 'tool_execution_start') throw new Error('起草器不允许使用工具');
     if (row.type === 'message_end' && row.message?.role === 'assistant') {
       if (row.message.stopReason !== 'stop' || row.message.content?.some((b: { type?: string }) => b.type === 'toolCall')) throw new Error('起草器没有正常答完');
@@ -38,10 +39,10 @@ function finalAssistant(stdout: string): { text: string; usage?: PiReadUsage } {
 export async function piReadOnly(config: JudgeConfig, prompt: string, signal?: AbortSignal): Promise<unknown> {
   return (await piReadOnlyWithUsage(config, prompt, signal)).value;
 }
-export async function piReadOnlyWithUsage(config: JudgeConfig, prompt: string, signal?: AbortSignal): Promise<{ value: unknown; usage?: PiReadUsage }> {
+export async function piReadOnlyWithUsage(config: JudgeConfig, prompt: string, signal?: AbortSignal, instructions = systemPrompt): Promise<{ value: unknown; usage?: PiReadUsage }> {
   const stdout = await runCommand(config.executable, [
     '-p', '--no-tools', '--no-session', '--no-extensions', '--no-context-files', '--mode', 'json',
-    '--no-skills', '--no-prompt-templates', '--no-approve', '--offline', '--model', config.model, '--system-prompt', systemPrompt,
+    '--no-skills', '--no-prompt-templates', '--no-mcp', '--no-themes', '--no-approve', '--offline', '--model', config.model, '--system-prompt', instructions,
   ], config.timeoutMs, prompt, signal);
   try { const result = finalAssistant(stdout); return { value: JSON.parse(result.text.trim().replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```$/, '')), ...(result.usage ? { usage: result.usage } : {}) }; }
   catch { throw new ComponentFailure('parse', '无法解析正常结束的最终 JSON 答案'); }

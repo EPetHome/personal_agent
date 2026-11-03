@@ -49,6 +49,11 @@ export async function validateConfig(value: unknown): Promise<Config> {
       cc: commands.cc === undefined ? 'claude' : requiredString(commands.cc, 'commands.cc'),
     },
   };
+  if (data.loopEvents != null) {
+    const events = object(data.loopEvents, 'loopEvents');
+    if (events.since !== undefined && (typeof events.since !== 'string' || !Number.isFinite(Date.parse(events.since)) || !/(?:Z|[+-]\d\d:\d\d)$/.test(events.since))) throw new Error('loopEvents.since 必须是带时区的时间');
+    config.loopEvents = { dir: absolute(events.dir, 'loopEvents.dir'), ...(events.since === undefined ? {} : { since: events.since }) };
+  }
   const managed = data.managedLoop == null ? {} : object(data.managedLoop, 'managedLoop');
   config.managedLoop = {
     verifyAfterMs: integer(managed.verifyAfterMs, 180000, 'managedLoop.verifyAfterMs', 0),
@@ -70,14 +75,23 @@ export async function validateConfig(value: unknown): Promise<Config> {
     const args = worker.args ?? [], refs = worker.candidateRefs ?? ['refs/pa/candidate', 'refs/loop/candidate'];
     if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) throw new Error('worker.args 必须是字符串数组');
     if (!Array.isArray(refs) || refs.some(ref => typeof ref !== 'string' || !/^refs\/[A-Za-z0-9_./-]+$/.test(ref) || ref.includes('..'))) throw new Error('worker.candidateRefs 必须是完整 Git ref 数组');
+    if (worker.protocol !== undefined && !['json', 'loop-v1'].includes(worker.protocol)) throw new Error('worker.protocol 不支持');
     config.worker = { executable: requiredString(worker.executable, 'worker.executable'), args,
-      timeoutMs: integer(worker.timeoutMs, 10000, 'worker.timeoutMs', 1), candidateRefs: refs };
+      timeoutMs: integer(worker.timeoutMs, 10000, 'worker.timeoutMs', 1), candidateRefs: refs,
+      ...(worker.protocol ? { protocol: worker.protocol } : {}) };
   }
   if (data.piWorker != null) {
     const pi = object(data.piWorker, 'piWorker'), args = pi.args ?? [];
     if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string' || arg.includes('\0'))) throw new Error('piWorker.args 必须是字符串数组');
+    if (pi.protocol !== undefined && !['json', 'pi-v1'].includes(pi.protocol)) throw new Error('piWorker.protocol 不支持');
+    if (pi.protocol === 'pi-v1' && args.length) throw new Error('真实Pi不接受附加自由参数');
+    const transcriber = pi.transcriber == null ? undefined : object(pi.transcriber, 'transcriber');
     config.piWorker = { executable: requiredString(pi.executable, 'piWorker.executable'), args,
-      timeoutMs: Math.min(1200000, integer(pi.timeoutMs, 1200000, 'piWorker.timeoutMs', 1)) };
+      timeoutMs: Math.min(1200000, integer(pi.timeoutMs, 1200000, 'piWorker.timeoutMs', 1)),
+      ...(pi.protocol ? { protocol: pi.protocol } : {}),
+      ...(pi.protocol === 'pi-v1' ? { model: requiredString(pi.model, 'piWorker.model') } : {}),
+      ...(transcriber ? { transcriber: { executable: absolute(transcriber.executable, 'transcriber.executable'),
+        modelFile: absolute(transcriber.modelFile, 'transcriber.modelFile'), ffmpeg: absolute(transcriber.ffmpeg, 'transcriber.ffmpeg') } } : {}) };
   }
   if (data.dispatch != null) {
     const dispatch = object(data.dispatch, 'dispatch'), skills = object(dispatch.skills ?? {}, 'dispatch.skills');
@@ -86,8 +100,16 @@ export async function validateConfig(value: unknown): Promise<Config> {
     config.dispatch = { projects: dispatch.projects.map((raw: unknown) => {
       const project = object(raw, 'dispatch.project'), name = requiredString(project.name, 'project.name');
       if (names.has(name)) throw new Error('派工项目名不能重复'); names.add(name);
+      const loop = project.loop == null ? undefined : object(project.loop, 'project.loop');
+      const prefixes = (value: unknown): string[] => {
+        if (!Array.isArray(value) || !value.length || value.some(p => typeof p !== 'string' || !p || isAbsolute(p) || p.split('/').includes('..') || /[\0\\*?]/.test(p))) throw new Error('Loop范围须是非空的项目相对路径前缀数组');
+        return value as string[];
+      };
+      if (loop && (typeof loop.batchDir !== 'string' || !loop.batchDir || isAbsolute(loop.batchDir) || loop.batchDir.split('/').some((p: string) => !p || p === '..' || p === '.') || /[\0\\]/.test(loop.batchDir))) throw new Error('loop.batchDir 须是项目内的相对目录');
       return { name, path: absolute(project.path, 'project.path'), workspace: absolute(project.workspace, 'project.workspace'),
-        done: project.done === undefined ? '门禁通过、评审无必须修改、一次提交到批次分支；不合入、不推送' : requiredString(project.done, 'project.done') };
+        done: project.done === undefined ? '门禁通过、评审无必须修改、一次提交到批次分支；不合入、不推送' : requiredString(project.done, 'project.done'),
+        ...(loop ? { loop: { batchDir: loop.batchDir, ...(loop.workspace === undefined ? {} : { workspace: requiredString(loop.workspace, 'loop.workspace') }), allow: prefixes(loop.allow), deny: loop.deny?.length ? prefixes(loop.deny) : [],
+          ...(loop.review ? { review: { base: requiredString(loop.review.base, 'review.base'), head: requiredString(loop.review.head, 'review.head') } } : {}) } } : {}) };
     }), skills: Object.fromEntries(['transcribe', 'summary', 'wiki'].filter(key => skills[key] !== undefined).map(key => {
       if (typeof skills[key] !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(skills[key])) throw new Error('skill 名必须是固定标识符');
       return [key, skills[key]];
@@ -163,7 +185,7 @@ export async function validateConfig(value: unknown): Promise<Config> {
   config.sources.cc = typeof sources.cc === 'string' && isAbsolute(sources.cc) ? resolve(sources.cc) : null;
   if (config.relay?.enabled && !config.sources.cc) throw new Error('开启 relay 必须配置绝对路径 sources.cc');
   config.sources.loop = sources.loop == null ? null : absolute(sources.loop, 'sources.loop');
-  const readPaths = [config.sources.loop, config.workspace?.inboxDir, config.schedule?.fakeFile, ...(config.relay?.enabled ? [config.sources.cc, config.relay.ccSessionsDir] : [])]
+  const readPaths = [config.sources.loop, config.loopEvents?.dir, config.workspace?.inboxDir, config.schedule?.fakeFile, ...(config.relay?.enabled ? [config.sources.cc, config.relay.ccSessionsDir] : [])]
     .filter((p): p is string => typeof p === 'string');
   const dataPath = await canonical(config.dataDir);
   const repository = await canonical(resolve(import.meta.dirname, '../../..'));
@@ -171,6 +193,7 @@ export async function validateConfig(value: unknown): Promise<Config> {
   for (const envFile of [config.feishu?.envFile, config.schedule?.envFile]) if (envFile && contains(dataPath, await canonical(envFile))) throw new Error('.env 须独立放在数据目录外，避免把凭证混进运行数据/导出');
   for (const path of readPaths) {
     const source = await canonical(path, true);
+    if (path === config.loopEvents?.dir && config.inboxDir && (contains(await canonical(config.inboxDir, true), source) || contains(source, await canonical(config.inboxDir, true)))) throw new Error('官方Loop事件目录必须独立于旧inboxDir');
     if (contains(source, dataPath) || contains(dataPath, source)) {
       throw new Error('数据目录与来源/推送目录不能重叠（包括符号链接）；请使用新的独立临时目录');
     }

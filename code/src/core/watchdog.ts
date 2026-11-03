@@ -1,19 +1,21 @@
 import type { Config } from './types.ts';
+import { BATCH_STAGE } from './loop-protocol.ts';
 import type { LedgerChange, LedgerState } from './managed-types.ts';
 
 /** 只读机械事实、只写账本。不起模型、不发消息、不读取worker会话文件。 */
 export function watchManagedFacts(state: LedgerState, add: (change: LedgerChange) => void, at: string, config: Config, inspect = false) {
   for (const assignment of Object.values(state.tables.assignments)) {
-    const inactive = !!assignment.endedAt || !!state.tables.tickets[assignment.ticketId]?.closure || assignment.state === 'completed';
+    const inactive = !!assignment.endedAt || !!state.tables.tickets[assignment.ticketId]?.closure || assignment.state === 'completed' || assignment.state === 'queue';
+    const sessionApplicable = !(assignment.batchFile && assignment.stage === BATCH_STAGE);
     const missingId = `session:${assignment.id}`, staleId = `stale:${assignment.id}`;
     for (const id of [missingId, staleId]) {
       const old = state.tables.attentions[id];
-      if (old && old.status !== 'resolved' && (inactive || id === missingId && assignment.session?.present === true
+      if (old && old.status !== 'resolved' && (inactive || id === missingId && (!sessionApplicable || assignment.session?.present === true)
         || id === staleId && Date.parse(at) - Date.parse(assignment.lastActivityAt ?? assignment.updatedAt) < (config.managedLoop?.staleAfterMs ?? 1800000)))
         add({ kind: 'put', table: 'attentions', value: { ...old, status: 'resolved' } });
     }
     if (inactive) continue;
-    const missing = assignment.session?.present === false;
+    const missing = sessionApplicable && assignment.session?.present === false;
     const stale = inspect && ['started', 'resumed'].includes(assignment.state)
       && Date.parse(at) - Date.parse(assignment.lastActivityAt ?? assignment.updatedAt) >= (config.managedLoop?.staleAfterMs ?? 1800000);
     if (!missing && !stale) continue;
