@@ -1,59 +1,64 @@
-import { detect, overview, rebuild } from '../core/agent.ts';
-import { undeliveredNotices } from '../core/delivery.ts';
+import { processManagedLoop } from '../core/managed-loop.ts';
+import { ledgerSummary, readLedger } from '../core/ledger.ts';
+import { configuredChannels } from '../channels/index.ts';
+import { withStorageAlerts } from '../core/alerts.ts';
+import { recordManagedFeedback } from '../core/managed-actions.ts';
 import { restoreEventLog } from '../core/event-archive.ts';
 import { withStoreLock } from '../core/store.ts';
 import { loadConfig } from '../core/config.ts';
-import { renderOverview } from '../core/judge.ts';
 import { receiveFeedback } from '../core/feedback.ts';
-import { evaluate } from '../core/evaluate.ts';
-import { renderStatistics, statistics } from '../core/statistics.ts';
 import { changeExperience, exportExperiences, layers, readLearning } from '../core/learning.ts';
 import type { Layer, MemoryStatus } from '../core/learning.ts';
 import { feishuChannel } from '../channels/feishu/index.ts';
 import { runService } from '../service/daemon.ts';
+import { checkHeartbeat } from '../service/heartbeat.ts';
+import { startSidebar } from '../channels/sidebar/index.ts';
 import { installService, uninstallService } from '../service/launchd.ts';
 import { errorMessage, iso } from '../core/utils.ts';
 
-const help = `personal agent（只读盯防、可选模型与渠道）
-用法：node code/src/cli/main.ts <detect|overview|rebuild|stats|feishu-poll|daemon> --config <绝对路径.json> [--now <ISO时间>] [--json]
+const help = `personal agent（托管loop，执行红线须本人明确点击）
+用法：node code/src/cli/main.ts <detect|overview|rebuild|stats|feishu-poll|daemon|sidebar> --config <绝对路径.json> [--now <ISO时间>] [--json]
       node code/src/cli/main.ts feedback <正确|误报|漏了|看不懂> [说明] --config <配置> [--id <提醒编号>|--unlinked] [--now <ISO时间>]
       node code/src/cli/main.ts restore-events --output <新的绝对文件路径> --config <配置>
-      node code/src/cli/main.ts evaluate --samples <样本目录> --config <配置> [--json]
       node code/src/cli/main.ts experience <list|export|confirm|revise|obsolete|revoke> [经验编号] --config <配置> [--countermeasure <对策>] [--layer <归因层>] [--reason <依据>] [--note <说明>] [--json]
       node code/src/cli/main.ts service-install --target <绝对目标目录> --config <绝对配置> [--activate] [--launchctl <可执行文件>]
       node code/src/cli/main.ts service-uninstall --target <绝对目标目录> --config <配置> [--launchctl <可执行文件>]
-  detect    检测一轮、读取假飞书收件、生成到期小结与复盘
-  overview / rebuild  只从事件查询/重建，不读来源、不发提醒
-  stats     从发件与反馈现算最近七天统计，不另存
-  daemon    前台常驻（默认每分钟检测），Ctrl-C 正常退出；不自行安装 launchd
+      node code/src/cli/main.ts heartbeat-install --target <绝对临时目录> --config <配置> [--activate] [--launchctl <可执行文件>]
+      node code/src/cli/main.ts heartbeat-uninstall --target <绝对目录> --config <配置> [--launchctl <可执行文件>]
+      node code/src/cli/main.ts heartbeat-check --config <配置> [--now <ISO时间>] [--json]
+  detect    消费一次 loop JSONL 事件、核实到期事项和待写；不扫描总结或聊天
+  overview / rebuild  只重放新账本，不读来源、不发提醒
+  stats     只从新账本查看观测计数，不推送、不另存
+  sidebar   只读本机网页与原卡动作入口；不启动worker消费，需另开daemon或detect
+  daemon    loop事件驱动、默认3分钟核实与10分钟巡检；Ctrl-C正常退出
   service-install 默认只生成 plist；--activate 才执行 launchctl
 来源和数据目录没有默认值；使用说明见 code/使用说明.md。`;
 async function main() {
   const args = process.argv.slice(2);
   if (args[0] === '--help' || args[0] === '-h') { console.log(help); return; }
   const command = args.shift();
-  if (!['detect', 'overview', 'rebuild', 'feedback', 'evaluate', 'stats', 'feishu-poll', 'daemon', 'experience', 'service-install', 'service-uninstall', 'restore-events'].includes(command ?? '')) throw new Error(help);
+  if (!['detect', 'overview', 'rebuild', 'feedback', 'stats', 'feishu-poll', 'daemon', 'experience', 'service-install', 'service-uninstall', 'restore-events', 'heartbeat-check', 'heartbeat-install', 'heartbeat-uninstall', 'sidebar'].includes(command ?? '')) throw new Error(help);
   const words: string[] = [];
   if (command === 'feedback' || command === 'experience') while (args[0] && !args[0].startsWith('--')) words.push(args.shift()!);
   let noticeId: string | null | undefined;
-  let sampleDir: string | undefined, configPath: string | undefined, now: string | undefined, target: string | undefined, launchctl: string | undefined, output: string | undefined;
+  let configPath: string | undefined, now: string | undefined, target: string | undefined, launchctl: string | undefined, output: string | undefined;
   let json = false, activate = false;
   const changes: Partial<Record<'layer' | 'countermeasure' | 'reason' | 'note', string>> = {};
   const seen = new Set<string>();
-  const serviceCommand = command === 'service-install' || command === 'service-uninstall';
+  const serviceCommand = ['service-install', 'service-uninstall', 'heartbeat-install', 'heartbeat-uninstall'].includes(command ?? '');
+  const installCommand = command === 'service-install' || command === 'heartbeat-install';
   while (args.length) {
     const arg = args.shift()!;
     if (seen.has(arg)) throw new Error(`参数重复：${arg}`);
     seen.add(arg);
     if (arg === '--json') { json = true; continue; }
-    if (arg === '--activate' && command === 'service-install') { activate = true; continue; }
+    if (arg === '--activate' && installCommand) { activate = true; continue; }
     if (arg === '--unlinked' && command === 'feedback') { if (seen.has('--id')) throw new Error('--unlinked 不能和 --id 同用'); noticeId = null; continue; }
-    if (!['--config', '--now', ...(command === 'feedback' ? ['--id'] : []), ...(command === 'evaluate' ? ['--samples'] : []), ...(command === 'restore-events' ? ['--output'] : []), ...(serviceCommand ? ['--target', '--launchctl'] : []), ...(command === 'experience' ? ['--countermeasure', '--layer', '--reason', '--note'] : [])].includes(arg)) throw new Error(`未知参数：${arg}`);
+    if (!['--config', '--now', ...(command === 'feedback' ? ['--id'] : []), ...(command === 'restore-events' ? ['--output'] : []), ...(serviceCommand ? ['--target', '--launchctl'] : []), ...(command === 'experience' ? ['--countermeasure', '--layer', '--reason', '--note'] : [])].includes(arg)) throw new Error(`未知参数：${arg}`);
     const value = args.shift();
     if (!value || value.startsWith('--')) throw new Error(`${arg} 缺少值`);
     if (arg === '--config') configPath = value;
     else if (arg === '--id') { if (seen.has('--unlinked')) throw new Error('--id 不能和 --unlinked 同用'); noticeId = value; }
-    else if (arg === '--samples') sampleDir = value;
     else if (arg === '--target') target = value;
     else if (arg === '--output') output = value;
     else if (arg === '--launchctl') launchctl = value;
@@ -61,6 +66,7 @@ async function main() {
     else changes[arg.slice(2) as keyof typeof changes] = value;
   }
   const config = await loadConfig(configPath);
+  const currentTime = () => now ?? new Date().toISOString(); // 显式--now固定回放，否则各次投递用实时钟。
   if (command === 'restore-events') {
     if (!output) throw new Error('必须显式指定 --output，且目标文件不能已存在');
     await withStoreLock(config.dataDir, () => restoreEventLog(config.dataDir, output!));
@@ -68,9 +74,23 @@ async function main() {
   }
   if (serviceCommand) {
     if (!target) throw new Error('必须显式指定 --target；没有真实 LaunchAgents 默认值');
-    if (command === 'service-install') await installService(configPath!, target, activate, launchctl);
-    else await uninstallService(configPath!, target, launchctl);
-    console.log(command === 'service-install' ? `已安装到 ${target}${activate ? ' 并激活' : '（仅生成配置，未激活）'}` : '已卸载，保留其他原有文件'); return;
+    if (installCommand) await installService(configPath!, target, activate, launchctl, command === 'heartbeat-install');
+    else await uninstallService(configPath!, target, launchctl, command === 'heartbeat-uninstall');
+    console.log(installCommand ? `已安装到 ${target}${activate ? ' 并激活' : '（仅生成配置，未激活）'}` : '已卸载，保留其他原有文件'); return;
+  }
+  if (command === 'heartbeat-check') {
+    const result = await checkHeartbeat(config, now ?? new Date().toISOString());
+    console.log(json ? JSON.stringify(result) : `独立心跳：${result.status}`); return;
+  }
+  if (command === 'sidebar') {
+    if (now || json) throw new Error('侧边栏不接受 --now 或 --json');
+    config.sidebar ??= { port: 17321, refreshMs: 2000 };
+    const server = await startSidebar(config); console.log(`PA 侧边栏：${server.url}\n在系统浏览器打开并缩成小窗；只陈列，不响不弹。动作由daemon/detect消费。`);
+    await new Promise<void>(resolve => {
+      const stop = () => { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); resolve(); };
+      process.once('SIGINT', stop); process.once('SIGTERM', stop);
+    });
+    await server.close(); return;
   }
   if (command === 'daemon') {
     if (now || json) throw new Error('常驻使用系统时间，不接受 --now 或 --json');
@@ -80,10 +100,12 @@ async function main() {
     return;
   }
   if (command === 'stats') {
-    const result = await statistics(config.dataDir, now); console.log(json ? JSON.stringify(result, null, 2) : renderStatistics(result)); return;
+    const result = ledgerSummary(await readLedger(config.dataDir)).observations;
+    console.log(json ? JSON.stringify(result, null, 2) : `已叫 ${result.called} 次；核实后没叫 ${result.notCalled} 次；loop误报 ${result.loopMisreports} 次；按建议比例 ${result.suggestionRatio === null ? '无样本' : result.suggestionRatio}；查询 ${result.queries} 次，共 ${result.queryMs}ms`); return;
   }
   if (command === 'feishu-poll') {
-    const channel = feishuChannel(config), count = await channel.drain(now);
+    const channel = feishuChannel(config, undefined, { managed: true }), count = await channel.drain(now);
+    await withStorageAlerts(config, [channel], () => processManagedLoop(config, now ?? new Date().toISOString(), { channels: [channel], intake: false, now: currentTime }));
     await channel.settled();
     console.log(json ? JSON.stringify({ processed: count }) : `已处理 ${count} 条渠道事件`); return;
   }
@@ -103,21 +125,24 @@ async function main() {
     return;
   }
   if (command === 'feedback') {
-    const message = await receiveFeedback(config.dataDir, 'local', { noticeId, content: words.join(' '), at: now ?? new Date().toISOString() });
+    const content = words.join(' '), at = now ?? new Date().toISOString();
+    const managed = await recordManagedFeedback(config, { id: `local:${at}:${content}`, actor: 'local', at, content, cardId: noticeId });
+    const message = managed ?? await receiveFeedback(config.dataDir, 'local', { noticeId, content, at });
     console.log(json ? JSON.stringify({ message }) : message); return;
   }
-  if (command === 'evaluate') {
-    if (!sampleDir) throw new Error('评测必须指定 --samples <样本目录>');
-    const result = await evaluate(config, sampleDir, now);
-    console.log(json ? JSON.stringify(result, null, 2) : `共 ${result.total} 份样本\n是/否：判对 ${result.binary.correct} 份，失败 ${result.binary.failed} 份\n高/中/低：判对 ${result.confidence.correct} 份，失败 ${result.confidence.failed} 份\n只记录，不设通过线。`); return;
-  }
-  const view = command === 'detect' ? await detect(config, now)
-    : command === 'rebuild' ? await rebuild(config, now) : await overview(config, now);
-  if (json) console.log(JSON.stringify({ at: view.at, records: view.records, health: [...view.projection.health.values()], undeliveredNotices: undeliveredNotices(view.projection), ...(view.projection.pushMismatches.size ? { pushMismatches: [...view.projection.pushMismatches.values()] } : {}), ...(view.projection.feishuConnection ? { feishuConnection: view.projection.feishuConnection } : {}), ...('noticesAdded' in view ? { noticesAdded: view.noticesAdded } : {}) }, null, 2));
+  const at = now ?? new Date().toISOString();
+  const channels = configuredChannels(config, true);
+  if (command === 'detect') for (const channel of channels) if ('drain' in channel && typeof channel.drain === 'function') await channel.drain(at);
+  const state = command === 'detect' ? await withStorageAlerts(config, channels, () => processManagedLoop(config, at, { channels, now: currentTime })) : await readLedger(config.dataDir);
+  const view = ledgerSummary(state);
+  if (json) console.log(JSON.stringify({ at, ...view }, null, 2));
   else {
-    if ('noticesAdded' in view) console.log(`检测完成，新增 ${view.noticesAdded} 条发件记录。`);
-    if (command === 'rebuild') console.log('已从 events.jsonl 重建 state.json。');
-    console.log(renderOverview(view.records, view.projection));
+    if (command === 'rebuild') console.log('已从 ledger.jsonl 重放全部状态；不改旧数据，不另存第二份状态。');
+    for (const ticket of Object.values(state.tables.tickets)) console.log(`${ticket.batch} · ${ticket.status}`);
+    for (const attention of Object.values(state.tables.attentions)) if (attention.status !== 'resolved') console.log(`等你：${attention.reason}`);
+    for (const health of Object.values(state.tables.health)) if (!health.ok) console.log(health.reason);
+    for (const brief of Object.values(state.tables.handoffs)) console.log(`交接简报 ${brief.id}\n目标：${brief.goal}\n做到哪：${brief.progress}\n关键决定：${brief.decisions.join('；')}\n遗留问题：${brief.unresolved.join('；')}\n代码位置：${brief.codeLocation.join('；')}`);
+    if (!Object.keys(state.tables.tickets).length) console.log('暂无托管事情。');
   }
 }
 main().catch(error => { console.error(`错误：${errorMessage(error)}`); process.exitCode = 1; });

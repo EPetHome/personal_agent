@@ -2,20 +2,21 @@
 import { mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import type { Config } from '../src/core/types.ts';
+import type { Config, PushRecord } from '../src/core/types.ts';
+import type { TestContext } from 'node:test';
+import assert from 'node:assert/strict';
+import { rm, readFile } from 'node:fs/promises';
+import { detect, overview, rebuild } from '../src/core/agent.ts';
+import { readEvents, readOutbox } from '../src/core/store.ts';
 
 export const start = '2026-10-20T10:00:00.000Z';
 export const later = '2026-10-20T10:31:00.000Z';
-// 旧回归主要检查版式、存储、渠道等，显式固定原来的5分钟测试时钟；产品默认值由
-// waiting-presence.test.ts 用 sandbox(null) 单独验，不把真实20/25分钟默认值改成测试值。
-export async function sandbox(waiting: Config['waiting'] | null = { awayMinutes: 5, otherSessionMinutes: 5 }) {
+// 保留旧调用参数的位置便于回放样例；聊天等待设置已删除，不进入有效配置。
+export async function sandbox(_legacyWaiting?: unknown) {
   const root = await mkdtemp(join(tmpdir(), 'personal-agent-test-'));
   const config: Config = {
     dataDir: join(root, 'data'), sources: { cc: join(root, 'cc'), codex: null, pi: null, loop: null },
-    inboxDir: join(root, 'inbox'), commands: { cc: 'claude', codex: '/sample tools/codex', pi: 'pi' },
-    ...(waiting ? { waiting } : {}),
-    // 旧回归只测原判断/版式/渠道；工具分析由 intelligence.test.ts 显式开启并注入替身。
-    intelligence: { enabled: false },
+    inboxDir: join(root, 'inbox'), commands: { cc: 'claude' },
   };
   await mkdir(config.sources.cc!);
   await mkdir(config.inboxDir!);
@@ -50,6 +51,41 @@ export function codexMeta(id = 'demo-codex', parent?: string) {
   return { timestamp: start, type: 'session_meta', payload: { id, cwd: '/sample/codex', timestamp: start, ...(parent ? { source: { subagent: { thread_spawn: { parent_thread_id: parent } } } } : {}) } };
 }
 export function codexEvent(payload: Record<string, unknown>, type = 'event_msg', at = start) { return { timestamp: at, type, payload }; }
+/** 被删除的聊天检测共用负向契约；各回归仍传自己的构造会话和钩子。 */
+export async function unmanaged(t: TestContext, tool: PushRecord['tool'], rows: unknown[] | string, options: { pushes?: unknown[] | string; now?: string } = {}) {
+  const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
+  const root = join(f.root, tool); f.config.sources[tool] = root;
+  f.config.feishu = { mode: 'fake', receiverId: 'ou_constructed', timeoutMs: 1000 };
+  f.config.judge = { executable: '/constructed/must-not-run', model: 'fake', timeoutMs: 100 };
+  const path = join(root, 'session.jsonl'); await put(path, rows); const before = await readFile(path);
+  const inbox = join(f.config.inboxDir!, `${tool}.jsonl`);
+  if (options.pushes !== undefined) await put(inbox, options.pushes);
+  let calls = 0;
+  const components = { judge: { async judge() { calls++; throw new Error('不再分析聊天'); }, async writeSnapshot() { calls++; throw new Error('不再为聊天起草'); } } };
+  for (const now of [start, options.now ?? later, '2026-10-21T12:00:00Z']) {
+    const view = await detect(f.config, now, components); assert.deepEqual(view.records, []); assert.equal(view.projection.health.size, 0);
+  }
+  assert.deepEqual((await overview(f.config)).records, []); await rebuild(f.config);
+  assert.equal(calls, 0); assert.deepEqual(await readOutbox(f.config.dataDir), []);
+  const events = await readEvents(f.config.dataDir);
+  assert.equal(events.some(e => e.kind === 'model_call_started' || e.kind.startsWith('analysis_') || e.kind.startsWith('push_') || e.kind.startsWith('shadow_') || e.kind === 'session_delta'), false);
+  assert.deepEqual(await readFile(path), before);
+  return { ...f, path, inbox, events };
+}
+export async function putLoop(config: Config, root: string, status = '暂停', at = '2026-10-20T09:55:00Z', id = '11111111-1111-4111-8111-111111111111') {
+  config.sources.loop ??= join(root, 'loop');
+  const path = join(config.sources.loop, 'project', `${id}.md`);
+  await put(path, loopSummary(status, '/sample/project', '- 构造人工项', at).replace('- 状态：', `- 暂停时间：${at}\n- 状态：`).replace('loop-demo', id));
+  return path;
+}
+/** 新常驻/CLI构造入口；旧总结样本仅供历史解析与兼容测试。 */
+export async function putManagedLoop(config: Config, root: string, state: 'started' | 'paused' | 'completed' = 'paused', at = start) {
+  config.inboxDir ??= join(root, 'managed-inbox');
+  const path = join(config.inboxDir, 'loop', '构造服务批次.jsonl');
+  await put(path, [{ schema: 1, id: `managed-${state}`, seq: 1, at, project: root, batch: '构造服务批次', stage: '甲', state,
+    reason: { category: 'unknown', text: state }, evidence: [], detail: state === 'completed' ? { branch: 'feat/fake', commit: 'deadbeef' } : {} }]);
+  return path;
+}
 export function loopSummary(status = '完成', project = '/sample/real-project', needs = '- A2 需人工确认文案', at = start) {
   const date = new Date(at);
   const pad = (value: number) => String(value).padStart(2, '0');

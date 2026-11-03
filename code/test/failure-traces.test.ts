@@ -18,21 +18,22 @@ import { agentNotice } from '../src/core/learning.ts';
 import { renderOverview } from '../src/core/judge.ts';
 import { undeliveredNotices } from '../src/core/delivery.ts';
 import { readEvents, readJsonl, readOutbox, withStoreLock } from '../src/core/store.ts';
-import { restoreEventLog } from '../src/core/event-archive.ts';
+import { prepareEventLog, restoreEventLog } from '../src/core/event-archive.ts';
 import { acquireLock, recoverDeadLock } from '../src/core/locks.ts';
 import { localChannel } from '../src/channels/local/index.ts';
 import { hash } from '../src/core/utils.ts';
 import { feishuChannel } from '../src/channels/feishu/index.ts';
 import { realTransport } from '../src/channels/feishu/transport.ts';
 import { runService } from '../src/service/daemon.ts';
+import { processManagedLoop } from '../src/core/managed-loop.ts';
 import type { AgentEvent, Channel, Notice } from '../src/core/types.ts';
-import { ccCall, ccUser, put, sandbox, start } from './fixtures.ts';
+import { ccCall, ccUser, put, putLoop, sandbox, start } from './fixtures.ts';
 
 const cli = resolve(import.meta.dirname, '../src/cli/main.ts');
 const raw = 'SYNTHETIC_PRIVATE_RESPONSE_WITH_TOKEN_AND_CARD_BODY';
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
-  f.config.sources.cc = null; f.config.learning = false;
+  f.config.sources.cc = null;
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 1000 };
   const alerts: Notice[] = [];
   const local: Channel = { name: 'local', async send(notice) { alerts.push(notice); }, async receive() { return ''; } };
@@ -100,11 +101,13 @@ test('丙 A1/A2：实际飞书适配替身连续失败只发5次，每次分类�
   assert.equal(JSON.parse(await readFile(join(f.config.dataDir, 'state.json'), 'utf8')).undeliveredNotices[0].failures, 5);
   const path = join(f.root, 'config.json'); await put(path, JSON.stringify(f.config));
   const result = spawnSync(process.execPath, [cli, 'overview', '--config', path, '--json'], { encoding: 'utf8' });
-  assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).undeliveredNotices[0].title, f.notice.content.title);
+  assert.equal(result.status, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout).deliveries, {}, '新CLI不恢复或补发旧队列；旧兼容查询在上面单独验证');
   const outbox = await readOutbox(f.config.dataDir); assert.deepEqual(outbox.map(n => n.id), [f.notice.id]);
   assert.ok(!(await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8')).includes(raw));
   // 检查点保留计数和通知去重，正常查询/重建也不需要已封存原件。
   const beforeOutbox = await readFile(join(f.config.dataDir, 'outbox.jsonl'));
+  // 减法后不再自动封存；显式准备旧检查点以继续验证失败计数的兼容读取。
+  await withStoreLock(f.config.dataDir, () => prepareEventLog(f.config.dataDir, '2026-10-29T10:00:00Z'));
   await detect(f.config, '2026-10-29T10:00:00Z', { channels });
   assert.equal((await readEvents(f.config.dataDir))[0]!.kind, 'store_checkpoint');
   await rename(join(f.config.dataDir, 'archives'), join(f.config.dataDir, 'archives-hidden'));
@@ -205,7 +208,7 @@ test('丙 返修1 A4：旧检查点的654次归档失败升级零重发，持久
   await rename(join(f.config.dataDir, 'archives'), join(f.config.dataDir, 'archives-hidden'));
   const configPath = join(f.root, 'config.json'); await put(configPath, JSON.stringify(f.config));
   const child = spawnSync(process.execPath, [cli, 'detect', '--config', configPath, '--now', at(3), '--json'], { encoding: 'utf8' });
-  assert.equal(child.status, 0, child.stderr); assert.equal(JSON.parse(child.stdout).undeliveredNotices[0].failures, 654);
+  assert.equal(child.status, 0, child.stderr); assert.deepEqual(JSON.parse(child.stdout).deliveries, {}, '新账本不迁移旧渠道状态');
   await rebuild(f.config); await detect(f.config, at(4), { channels: [channel, f.local] });
   assert.equal(calls, 0); assert.equal(f.alerts.length, 1);
   assert.equal((await readEvents(f.config.dataDir)).filter(e => e.kind === 'channel_delivery_history_restored').length, 1);
@@ -328,7 +331,7 @@ test('丙 飞书拒收/连接/超时分类：真实适配边界的SDK替身不�
 
 test('丙 A5：实际常驻检测坏JSONL时，服务日志带data_corrupt而无原件/异常原文', async t => {
   const f = await fixture(t); f.config.feishu = null;
-  await put(join(f.config.dataDir, 'events.jsonl'), `{${raw}\n`);
+  await put(join(f.config.dataDir, 'ledger.jsonl'), `{${raw}\n`);
   const control = new AbortController();
   const run = runService(f.config, control.signal, { channels: [f.local] });
   t.after(() => { control.abort(); return run.catch(() => {}); });
@@ -341,7 +344,7 @@ test('丙 A5：实际常驻检测坏JSONL时，服务日志带data_corrupt而无
   const log = await readFile(join(f.config.dataDir, 'service.log.jsonl'), 'utf8');
   const failed = (await readJsonl<{ kind: string; category?: string }>(join(f.config.dataDir, 'service.log.jsonl'))).find(row => row.kind === 'scan_failed');
   assert.equal(failed?.category, 'data_corrupt'); assert.ok(!log.includes(raw));
-  assert.equal(await readFile(join(f.config.dataDir, 'events.jsonl'), 'utf8'), `{${raw}\n`);
+  assert.equal(await readFile(join(f.config.dataDir, 'ledger.jsonl'), 'utf8'), `{${raw}\n`);
 });
 
 test('丙 A6：很久前的单次异常也留痕，已知原因重分类；正常停止后不误报', async t => {
@@ -373,11 +376,13 @@ test('丙 A7：实际状态写入时磁盘写满，连续失败本机只告警�
 
 test('丙 A7：常驻满盘检测日志带storage_full，连续失败不会被内部成功写入错误解除', async t => {
   const f = await fixture(t); f.config.feishu = null;
-  f.config.service = { intervalMs: 1, restartWindowMs: 60000, restartThreshold: 3 };
+  f.config.inboxDir = null;
+  f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 1, staleAfterMs: 1800000 };
   const control = new AbortController(); let writes = 0;
-  faultOpen(t, path => {
-    if (!path.startsWith(join(f.config.dataDir, '.state-'))) return false;
-    if (++writes === 3) control.abort(); return true;
+  faultOpen(t, (path, flags) => {
+    if (path !== join(f.config.dataDir, 'ledger.jsonl') || typeof flags === 'number' && !(flags & fs.constants.O_WRONLY) || flags === 'r') return false;
+    // 新入口先尝试一次启动心跳，之后仍须完整记录三轮处理写满失败。
+    if (++writes === 4) control.abort(); return true;
   });
   await runService(f.config, control.signal, { channels: [f.local] });
   const failed = (await readJsonl<{ kind: string; category?: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(row => row.kind === 'scan_failed');
@@ -385,17 +390,20 @@ test('丙 A7：常驻满盘检测日志带storage_full，连续失败不会被�
   assert.equal(f.alerts.length, 1); assert.equal(f.alerts[0]!.kind, 'storage_full');
 });
 
-test('丙 A7 验收返修：启动归档满盘后夹有lock_busy轮次，不算恢复，实际通知命令只执行一次', { timeout: 10000 }, async t => {
+test('丙 A7 验收返修：状态写满后夹有lock_busy轮次，不算恢复，实际通知命令只执行一次', { timeout: 10000 }, async t => {
   const f = await fixture(t), notify = await notifyStub(f.root); f.config.localChannel = notify;
-  f.config.service = { intervalMs: 10, restartWindowMs: 60000, restartThreshold: 3 };
+  f.config.inboxDir = null;
+  f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 10, staleAfterMs: 1800000 };
   const old = new Date(Date.now() - 8 * 86400000).toISOString();
   await put(join(f.config.dataDir, 'events.jsonl'), [event({ kind: 'store_format', format: 2 }, old), event({ kind: 'scan_completed' }, old)]);
-  faultOpen(t, path => path.startsWith(join(f.config.dataDir, 'archives', '.archive-')));
+  faultOpen(t, (path, flags) => path === join(f.config.dataDir, 'ledger.jsonl') && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY)));
   const channel = feishuChannel(f.config), startChannel = channel.start;
   let release: (() => Promise<void>) | undefined;
   channel.start = async () => {
-    // 真正的归档写入先报ENOSPC，随后保持数据锁，确定复现验收日志中的非满盘失败轮次。
-    await startChannel(); release = await acquireLock(f.config.dataDir, '.detect.lock');
+    // 状态写入先报ENOSPC，随后保持数据锁，复现满盘夹杂非满盘失败的轮次。
+    await startChannel();
+    await assert.rejects(processManagedLoop(f.config, new Date().toISOString(), { channels: [localChannel(f.config.dataDir, f.config.localChannel!)], inspect: true }), { code: 'ENOSPC' });
+    release = await acquireLock(f.config.dataDir, '.managed-work.lock');
   };
   const control = new AbortController(), running = runService(f.config, control.signal, {
     channels: [localChannel(f.config.dataDir, f.config.localChannel), channel],
@@ -411,13 +419,13 @@ test('丙 A7 验收返修：启动归档满盘后夹有lock_busy轮次，不算�
   };
   try {
     await waitForFailure('lock_busy', 2);
-    assert.equal((await readJsonl<string[]>(notify.output)).length, 1, '启动归档满盘已通知一次');
+    assert.equal((await readJsonl<string[]>(notify.output)).length, 1, '状态写满已通知一次');
     await release!(); release = undefined;
     await waitForFailure('storage_full', 3);
     control.abort(); await running;
     const notifications = await readJsonl<string[]>(notify.output);
     assert.equal(notifications.filter(args => args.at(-2) === '磁盘已满，盯防可能停了').length, 1,
-      'lock_busy被捕获且日志成功，不代表归档卷已经恢复，不能重新弹满盘告警');
+      'lock_busy被捕获且日志成功，不代表存储已经恢复，不能重新弹满盘告警');
     const log = await readJsonl<{ kind: string; category?: string }>(join(f.config.dataDir, 'service.log.jsonl'));
     assert.equal(log.some(row => row.kind === 'scan_completed'), false);
     assert.equal(log.at(-1)!.kind, 'stopped');
@@ -426,10 +434,11 @@ test('丙 A7 验收返修：启动归档满盘后夹有lock_busy轮次，不算�
 
 test('丙 A7：连服务日志也写不进时仍通知且不每轮重弹，恢复后补记原因', async t => {
   const f = await fixture(t); f.config.feishu = null;
-  f.config.service = { intervalMs: 1, restartWindowMs: 60000, restartThreshold: 3 };
+  f.config.inboxDir = null;
+  f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 1, staleAfterMs: 1800000 };
   const control = new AbortController(); let attempts = 0, full = false;
   faultOpen(t, (path, flags) => {
-    if (path.startsWith(join(f.config.dataDir, '.state-'))) full = true;
+    if (path === join(f.config.dataDir, 'ledger.jsonl') && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY))) full = true;
     if (!full || !path.startsWith(f.config.dataDir) || flags === 'r' || typeof flags === 'number' && !(flags & fs.constants.O_WRONLY)) return false;
     if (++attempts >= 9) full = false, control.abort();
     return true;
@@ -461,11 +470,10 @@ for (const limit of [undefined, 2, 0]) test(`丙 A8：配置每日上限${limit 
   const rows: AgentEvent[] = [event({ kind: 'store_format', format: 2 }, start)];
   if (limit === undefined) for (let i = 0; i < 240; i++) rows.push(event({ kind: 'model_call_started', task: 'drift', key: `old-${i}` }, start));
   await put(join(f.config.dataDir, 'events.jsonl'), rows);
-  const transcript = join(f.config.sources.cc, 'session.jsonl'); await put(transcript, [ccUser('只改A'), ccCall(start)]);
   let calls = 0;
-  const judge = { async judge() { calls++; return { answer: '否' as const, reason: '构造的无跑偏' }; } };
+  const judge = { async writeSnapshot() { calls++; return { situation: '构造loop已完成', action: '看人工项', actionType: '去看一眼' as const }; } };
   for (let i = 0; i < 3; i++) {
-    if (i) await appendFile(transcript, JSON.stringify(ccCall(at(i * 11), `step-${i}`)) + '\n');
+    await putLoop(f.config, f.root, '完成', at(i * 11), `${String(i + 1).padStart(8, '0')}-1111-4111-8111-111111111111`);
     await detect(f.config, at(i * 11 + 1), { judge, channels: [] });
   }
   assert.equal(calls, limit ?? 3);

@@ -18,15 +18,16 @@ async function main() {
     try { if ((await lstat(path)).isDirectory()) return path; throw new Error(`${path} 不是目录`); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   }
+  // 历史样本配置仍保留旧路径供对照；当前CLI只消费inbox/loop/*.jsonl，不扫描旧总结。
   const config = await validateConfig({
-    sources: { cc: await source('claude-projects'), codex: await source('codex-sessions'), pi: await source('pi-sessions'), loop: await source('pi-autoreview') },
+    sources: { cc: null, codex: null, pi: null, loop: await source('pi-autoreview') },
     inboxDir: await source('inbox'), dataDir,
     // 仅生成回看文字，绝不启动这些工具。验收不需要安装它们。
-    commands: { cc: 'claude', codex: '/sample-tools/codex', pi: 'pi' },
+    commands: { cc: 'claude' },
   });
   // 同样检查符号链接别名，不能通过临时路径把配置/数据写回样本树。
   for (const destination of [dataDir, output]) {
-    await validateConfig({ ...config, dataDir: destination, sources: { cc: dirname(scene), codex: null, pi: null, loop: null }, inboxDir: null });
+    await validateConfig({ ...config, dataDir: destination, sources: { cc: null, codex: null, pi: null, loop: dirname(scene) }, inboxDir: null });
   }
   await mkdir(dirname(output), { recursive: true, mode: 0o700 });
   await writeFile(output, JSON.stringify(config, null, 2) + '\n', { flag: 'wx', mode: 0o600 });

@@ -5,14 +5,15 @@ export const CONFIDENCES = ['有把握', '拿不准', '不知道'] as const;
 export type Confidence = typeof CONFIDENCES[number];
 export const AGREEMENTS = ['一致', '部分一致', '不一致', '无法判断'] as const;
 export type Agreement = typeof AGREEMENTS[number];
-export interface IntelligenceConfig { enabled?: boolean; timeoutMs?: number; maxToolCalls?: number }
-export const DEFAULT_INTELLIGENCE = { enabled: true, timeoutMs: 90000, maxToolCalls: 24 } as const;
+// 保留旧事件的只读 schema 与读沙箱审计类型，不保留后台分析配置或执行器。
 export interface ReadTrace { path: string; startLine: number; endLine: number; startColumn?: number; endColumn?: number; contentSha256: string }
 export interface BlockedRead { path: string; reason: string }
 export type ReadAudit = { kind: 'read'; read: ReadTrace } | { kind: 'blocked'; blocked: BlockedRead }
   | { kind: 'call' } | { kind: 'limit' };
 export interface ReadScope {
   transcript: string; project: string; home: string; dataDir: string; sourceDirs: string[]; maxToolCalls: number;
+  /** loop 只读核实的显式原件；仍过不许读名单，不获得会话的敏感文件例外。 */
+  evidenceFiles?: string[];
 }
 export interface AnalysisRequest {
   id: string; recordKey: string; sessionId: string; tool: Exclude<Tool, 'loop'>; project: string;
@@ -84,8 +85,4 @@ export function validateIntelligenceEvent(event: IntelligenceEvent): void {
     case 'shadow_guard': { const g = event.guard; valid = !!g && text(g.category) && text(g.week) && typeof g.paused === 'boolean'; break; }
   }
   if (!valid) throw new Error('智能分析事件结构损坏，保留现场');
-}
-export interface IntelligenceModel {
-  analyze(prompt: string, tools: { execute(name: string, args: Record<string, unknown>): Promise<string> }, signal: AbortSignal): Promise<unknown>;
-  compare?(prompt: string, signal: AbortSignal): Promise<unknown>;
 }

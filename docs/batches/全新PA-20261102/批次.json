@@ -1,0 +1,119 @@
+{
+  "name": "全新PA-20261102",
+  "branch": "feat/全新PA",
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max"
+  },
+  "stages": {
+    "甲-减法": {
+      "prompt": "../../prompt/提示词-全新PA-甲-减法.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    },
+    "乙-底座与托管": {
+      "prompt": "../../prompt/提示词-全新PA-乙-底座与托管loop.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    },
+    "丙-执行与自检": {
+      "prompt": "../../prompt/提示词-全新PA-丙-执行与自检.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    },
+    "丁-飞书与派活": {
+      "prompt": "../../prompt/提示词-全新PA-丁-飞书与派活.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    },
+    "戊-放权与记忆": {
+      "prompt": "../../prompt/提示词-全新PA-戊-放权与记忆.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    },
+    "己-侧边栏与日程": {
+      "prompt": "../../prompt/提示词-全新PA-己-侧边栏与日程.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/全新PA-20261102/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    }
+  },
+  "steps": [
+    [
+      "甲-减法"
+    ],
+    [
+      "乙-底座与托管"
+    ],
+    [
+      "丙-执行与自检"
+    ],
+    [
+      "丁-飞书与派活"
+    ],
+    [
+      "戊-放权与记忆"
+    ],
+    [
+      "己-侧边栏与日程"
+    ]
+  ],
+  "e2e": {
+    "workDir": "/Users/Admin/Desktop/personal agent-dev分支",
+    "criteria": "整批验收标准.md",
+    "maxRounds": 3
+  }
+}

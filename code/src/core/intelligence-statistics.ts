@@ -1,4 +1,3 @@
-import { shadowCategory } from './intelligence.ts';
 import { AGREEMENTS } from './intelligence-types.ts';
 import type { Agreement } from './intelligence-types.ts';
 import type { Projection } from './types.ts';
@@ -15,7 +14,8 @@ export function intelligenceStatistics(projection: Projection, from: string, to:
     const result = projection.analysisResults.get(request.id), decision = projection.shadowDecisions.get(request.id);
     const comparison = projection.shadowComparisons.get(request.id), label = projection.shadowLabels.get(request.id);
     if (![result?.at, decision?.at, comparison?.at, label?.at].some(at => at && inPeriod(at))) continue;
-    const category = shadowCategory(request, result);
+    // 旧影子记录的离线统计，不再导入或启动分析行为。
+    const category = `在等你 × ${result?.output?.actionType ?? request.actionType} × ${request.tool} × ${request.ruleRedline || result?.output?.redline ? '红线' : '非红线'}`;
     if (!cells.has(category)) cells.set(category, { category, shadows: 0, attempts: 0, failed: 0, blockedReads: 0, blockedReminders: 0,
       couldSkip: 0, uncertainReferred: 0, agreements: Object.fromEntries(AGREEMENTS.map(a => [a, 0])) as Record<Agreement, number>,
       agreementRate: null, owed: 0, finished: 0, unknown: 0, correct: 0, incorrect: 0, needlessDaily: {} });

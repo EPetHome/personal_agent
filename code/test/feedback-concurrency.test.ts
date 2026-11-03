@@ -15,19 +15,20 @@ import { appendJsonl, readJsonl, readOutbox } from '../src/core/store.ts';
 import { feishuChannel } from '../src/channels/feishu/index.ts';
 import type { SentMessage } from '../src/channels/feishu/index.ts';
 import { runService } from '../src/service/daemon.ts';
+import { readLedger } from '../src/core/ledger.ts';
 import type { Channel, Feedback } from '../src/core/types.ts';
-import { ccCall, ccUser, put, pushed, sandbox } from './fixtures.ts';
+import { ccCall, ccUser, put, pushed, sandbox, putLoop, putManagedLoop } from './fixtures.ts';
 
 const exec = promisify(execFile);
 async function fixture(t: TestContext) {
   const f = await sandbox(); t.after(() => rm(f.root, { recursive: true, force: true }));
   f.config.feishu = { mode: 'fake', receiverId: 'ou_synthetic', timeoutMs: 40000 };
-  f.config.learning = false;
   const at = new Date(Date.now() - 12 * 60000).toISOString();
   const transcript = join(f.config.sources.cc!, 'sample.jsonl');
   await put(transcript, [ccUser('构造长检测', at), ccCall(at)]);
   await put(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(transcript, 'waiting_permission', at)]);
-  await detect(f.config); // 已过等待窗口且真人不在场，便于测飞书反馈链。
+  await putLoop(f.config, f.root, '暂停', at);
+  await detect(f.config); // loop 已过等待窗口，便于测飞书反馈链。
   const notice = (await readOutbox(f.config.dataDir))[0]!;
   const sent = () => readJsonl<SentMessage>(join(f.config.dataDir, 'feishu-sent.jsonl'));
   const message = (await sent()).find(m => m.noticeId === notice.id)!;
@@ -51,12 +52,11 @@ async function waitFor(check: () => Promise<boolean>, timeout = 5000) {
   throw new Error('构造结果未在期限内出现');
 }
 
-test('反馈 A1/A2：常驻检测实际持数据锁35秒，按钮、飞书文字、本机CLI在结束前均落盘并确认；重投不重复', { timeout: 50000 }, async t => {
+test('反馈 A1/A2：新事件处理在渠道阻塞35秒时，旧卡按钮/飞书文字/新账本CLI反馈均先落盘；不长持数据锁', { timeout: 50000 }, async t => {
   const f = await fixture(t);
-  f.config.service = { intervalMs: 100, restartWindowMs: 1000, restartThreshold: 3 };
-  // 新的等待证据产生另一条提醒；第一张旧卡片留给按钮反馈。
-  const at = new Date(Date.now() - 6 * 60000).toISOString();
-  await appendJsonl(join(f.config.inboxDir!, 'cc.jsonl'), [pushed(f.transcript, 'waiting_permission', at)]);
+  f.config.managedLoop = { intakeEveryMs: 25, verifyAfterMs: 0, inspectEveryMs: 600000, staleAfterMs: 1800000 };
+  // 第一张旧卡用于显式兼容反馈；新事件卡来自新协议，不恢复旧总结队列。
+  await putManagedLoop(f.config, f.root, 'paused');
   let release!: () => void, holding = false;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const local: Channel = { name: 'local', async send() { holding = true; await gate; }, receive: reply => receiveFeedback(f.config.dataDir, 'local', reply) };
@@ -66,37 +66,39 @@ test('反馈 A1/A2：常驻检测实际持数据锁35秒，按钮、飞书文字
   try {
     await waitFor(async () => holding);
     const began = performance.now();
-    const newNotice = (await readOutbox(f.config.dataDir)).find(n => n.id !== f.notice.id)!;
+    const newNotice = Object.values((await readLedger(f.config.dataDir)).tables.cards)[0]!;
     assert.ok(newNotice);
+    const scansBefore = (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(row => row.kind === 'scan_completed').length;
     const input = click('during-lock', f.message.messageId, f.notice.id);
     await channel.capture(input); await channel.capture(input);
     await channel.capture(text('text-during-lock'));
     const configPath = join(f.root, 'config.json'); await put(configPath, JSON.stringify(f.config));
     const cli = await exec(process.execPath, [join(import.meta.dirname, '../src/cli/main.ts'), 'feedback', '误报', '--id', newNotice.id, '--config', configPath], { timeout: 5000, env: { ...process.env, HOME: f.root } });
-    assert.match(cli.stdout.trim(), /^已记下：这个会话之后不会再/); assert.equal(cli.stderr, '');
+    assert.match(cli.stdout.trim(), /^已记下/); assert.equal(cli.stderr, '');
     await waitFor(async () => (await f.sent()).filter(m => m.type === 'text').length === 2);
     const rows = await readFeedback(f.config.dataDir);
-    assert.equal(rows.length, 3);
+    assert.equal(rows.length, 2);
     assert.equal(rows.filter(r => r.replyId === 'during-lock').length, 1);
     assert.ok(rows.some(r => r.noticeId === f.notice.id && r.verdict === '正确'));
     assert.ok(rows.some(r => r.noticeId === null && r.verdict === '漏了' && r.comment === '测试'));
-    assert.ok(rows.some(r => r.noticeId === newNotice.id && r.verdict === '误报' && r.channel === 'local'));
+    assert.ok((await readLedger(f.config.dataDir)).observations.some(row => row.ticketId === newNotice.ticketId && row.actor === 'local' && row.kind === 'feedback' && row.detail === '误报'));
     assert.ok((await f.sent()).filter(m => m.type === 'text').every(m => JSON.stringify(m.content).includes('已记下')));
     const feedbackMs = Math.round(performance.now() - began);
     assert.ok(feedbackMs < 5000, '反馈确认不能排在35秒检测后面');
-    assert.ok(await readFile(join(f.config.dataDir, '.detect.lock/owner.json'), 'utf8'));
-    assert.equal((await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length, 0);
+    const releaseLedger = await acquireLock(f.config.dataDir, '.ledger.lock', 2000); await releaseLedger();
+    assert.equal((await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length, scansBefore);
     await delay(Math.max(0, 35000 - (performance.now() - began)));
-    assert.ok(await readFile(join(f.config.dataDir, '.detect.lock/owner.json'), 'utf8'));
+    assert.ok(await readFile(join(f.config.dataDir, '.managed-work.lock/owner.json'), 'utf8'));
     release();
-    await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length >= 2);
+    await waitFor(async () => (await readJsonl<{ kind: string }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed').length > scansBefore);
     const scans = (await readJsonl<{ kind: string; durationMs: number; storeLockHeldMs: number }>(join(f.config.dataDir, 'service.log.jsonl'))).filter(r => r.kind === 'scan_completed');
     assert.ok(scans.every(r => Number.isFinite(r.durationMs) && Number.isFinite(r.storeLockHeldMs) && r.durationMs >= r.storeLockHeldMs && r.storeLockHeldMs >= 0));
-    assert.ok(scans[0]!.storeLockHeldMs >= 35000, '检测主流程仍持有同一把数据锁35秒，只量不改');
+    const slow = scans.find(row => row.durationMs >= 35000)!; assert.ok(slow, '仍实际保持35秒慢渠道，不缩短负载');
+    assert.ok(slow.storeLockHeldMs < 5000, '外部调用不在新账本短锁内，计时不再覆盖35秒渠道等待');
     // 常驻仍在轮询，复用同一实例的在途收件；另建实例会和自己抢零等待收件锁。
     await channel.drain();
-    assert.equal((await readFeedback(f.config.dataDir)).length, 3);
-    t.diagnostic(`三路反馈在 ${feedbackMs} ms 内全部落盘并确认；长轮检测 ${scans[0]!.durationMs} ms、持数据锁 ${scans[0]!.storeLockHeldMs} ms；同事件只记一次。`);
+    assert.equal((await readFeedback(f.config.dataDir)).length, 2);
+    t.diagnostic(`三路反馈在 ${feedbackMs} ms 内全部落盘并确认；事件处理 ${slow.durationMs} ms、实际持短数据锁 ${slow.storeLockHeldMs} ms；同事件只记一次。`);
   } finally { release(); controller.abort(); await running; }
 });
 
@@ -180,7 +182,8 @@ test('已有失败处理记录和仅含id的旧记录，即使现在能处理也
 
 test('计时 A9：失败的检测轮次也记录总耗时和实际持数据锁时长，不带原始错误', async t => {
   const f = await fixture(t); f.config.service = { intervalMs: 50, restartWindowMs: 1000, restartThreshold: 3 };
-  await appendFile(join(f.config.dataDir, 'events.jsonl'), 'PRIVATE_UPSTREAM_RAW');
+  f.config.managedLoop = { intakeEveryMs: 25, verifyAfterMs: 0, inspectEveryMs: 50, staleAfterMs: 1800000 };
+  await put(join(f.config.dataDir, 'ledger.jsonl'), 'PRIVATE_UPSTREAM_RAW');
   const channel = feishuChannel(f.config), controller = new AbortController();
   const running = runService(f.config, controller.signal, { channels: [channel] }); void running.catch(() => {});
   try {
