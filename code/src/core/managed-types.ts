@@ -79,7 +79,7 @@ export interface Handoff {
 export type WriteState = 'pending' | 'sending' | 'delivered' | 'consumed' | 'uncertain' | 'failed' | 'blocked' | 'revoked';
 export interface ManagedWrite {
   id: string; ticketId: string; assignmentId: string; cardId: string; cardRevision: number; eventId: string; intentVersion: number;
-  actor: string; inputId: string; at: string; dispatchedAt?: string; text: string; action: string; state: WriteState;
+  actor: string; inputId: string; at: string; dispatchedAt?: string; attemptSeq?: number; text: string; action: string; state: WriteState;
   redline: boolean; explicitConfirmation: boolean; basis: string; reason?: string; withdrawnAt?: string;
   execution?: ExecutionTarget; dispatch?: DispatchRequest; outcome?: WorkerReceipt['outcome']; commit?: string; code?: string; failure?: boolean;
   automation?: AutomaticApproval;

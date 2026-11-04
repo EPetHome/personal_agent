@@ -1,0 +1,26 @@
+{
+  "name": "账本减负-20261103",
+  "recipe": "develop",
+  "branch": "fix/账本减负",
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max",
+    "tools": "read,edit,write,bash"
+  },
+  "stages": {
+    "账本减负": {
+      "prompt": "../../prompt/提示词-账本减负.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/账本减负-20261103/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      }
+    }
+  }
+}

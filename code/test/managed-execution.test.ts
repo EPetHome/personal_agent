@@ -15,6 +15,7 @@ import { readLedger, updateLedger } from '../src/core/ledger.ts';
 import { processManagedLoop } from '../src/core/managed-loop.ts';
 import { commandWorker } from '../src/core/worker-adapter.ts';
 import { recordHeartbeat, checkHeartbeat } from '../src/service/heartbeat.ts';
+import { readRuntimeState, runtimeStatePath } from '../src/core/runtime-state.ts';
 import { readJsonl } from '../src/core/store.ts';
 import type { ExecutionRequest, ManagedCard, LoopEvent } from '../src/core/managed-types.ts';
 import { installService, uninstallService, heartbeatLabel, serviceLabel } from '../src/service/launchd.ts';
@@ -211,8 +212,8 @@ for (const absent of ['explicit', 'missing_stage']) test(`丙 A5：会话消失 
 });
 test('丙 A6：送话通道失败，当前轮马上发话没送到卡；不依赖巡检、不重新送话', async t => {
   const f = await fixture(t); await emit(f, 'paused'); await tick(f); await tick(f, after); await set(f, { receipt: 'failed', reason: '构造送话通道失败' });
-  await click(f, 'suggest'); await tick(f, after); const state = await f.ledger(), health = Object.values(state.tables.cards).find(row => row.title.includes('话没送到'))!;
-  assert.ok(health); assert.ok((await f.sent()).some(row => row.noticeId === health.id));
+  await click(f, 'suggest'); await tick(f, after); const state = await f.ledger(), health = state.tables.cards['health:write:message']!;
+  assert.ok(health); assert.match(health.fact, /没能确认你的话已送到/); assert.ok((await f.sent()).some(row => row.noticeId === health.id));
   await tick(f, after); assert.equal((await readJsonl(join(f.workerDir, 'attempts.jsonl'))).length, 1);
   assert.equal((await f.sent()).filter(row => row.noticeId === health.id).length, 1);
 });
@@ -220,7 +221,7 @@ test('丙：派工停滞不推，来源查询失败马上报故障，不把失�
   const f = await fixture(t); await emit(f, 'started'); await tick(f); await tick(f, '2026-11-02T10:31:00Z', true);
   assert.equal((await f.sent()).length, 0); assert.ok(Object.values((await f.ledger()).tables.attentions).some(row => row.id.startsWith('stale:')));
   await set(f, { statusError: true }); await tick(f, '2026-11-02T10:32:00Z', true);
-  const state = await f.ledger(); assert.ok(Object.values(state.tables.cards).some(row => row.fact.includes('看不见 loop 状态'))); assert.ok(!Object.values(state.tables.attentions).some(row => row.id.startsWith('session:')));
+  const state = await f.ledger(); assert.ok(Object.values(state.tables.cards).some(row => row.fact.includes('暂时读不到 Loop 的工作进展'))); assert.ok(!Object.values(state.tables.attentions).some(row => row.id.startsWith('session:')));
 });
 test('丙：公开远端在按钮上明说；确认后远端公开状态改变则不执行', async t => {
   const f = await fixture(t); await set(f, { pushTarget: { remote: 'test', visibility: 'public' } }); await completed(f);
@@ -274,13 +275,13 @@ async function startDaemon(f: F, t: TestContext) {
   const child = spawn(process.execPath, [cli, 'daemon', '--config', f.configPath], { stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', value => stderr += value); child.stdout.resume();
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) { const exit = once(child, 'exit'); child.kill('SIGKILL'); await exit; } });
-  await waitFor(f.ledger, state => !!state.tables.receipts['heartbeat:main']);
+  await waitFor(() => readRuntimeState(f.config.dataDir), state => !!state?.completedAt);
   return { child, stderr: () => stderr };
 }
 test('丙 A7：实际主进程SIGKILL后，独立CLI心跳超时由另一进程弹一次本机替身通知', async t => {
-  const f = await fixture(t), run = await startDaemon(f, t), pulse = (await f.ledger()).tables.receipts['heartbeat:main']!;
+  const f = await fixture(t), run = await startDaemon(f, t), pulse = (await readRuntimeState(f.config.dataDir))!;
   const exit = once(run.child, 'exit'); run.child.kill('SIGKILL'); await exit;
-  const time = new Date(Date.parse(pulse.at) + 5001).toISOString();
+  const time = new Date(Date.parse(pulse.completedAt!) + 5001).toISOString();
   const result = spawnSync(process.execPath, [cli, 'heartbeat-check', '--config', f.configPath, '--now', time, '--json'], { encoding: 'utf8', timeout: 10000 });
   assert.equal(result.status, 0, result.stderr); assert.equal(JSON.parse(result.stdout).status, 'notified');
   const messages = await readJsonl<any>(f.notifications); assert.equal(messages.length, 1); assert.ok(messages[0].args.includes('personal agent 停了')); assert.equal(messages[0].parentPid, result.pid); assert.notEqual(result.pid, run.child.pid);
@@ -288,8 +289,8 @@ test('丙 A7：实际主进程SIGKILL后，独立CLI心跳超时由另一进程�
   assert.equal((await readJsonl(f.notifications)).length, 1);
 });
 test('丙 A8：实际主进程持续更新心跳，独立进程多次检查不弹任何通知', async t => {
-  const f = await fixture(t), run = await startDaemon(f, t), first = (await f.ledger()).tables.receipts['heartbeat:main']!.at;
-  await waitFor(f.ledger, state => state.tables.receipts['heartbeat:main']!.at !== first);
+  const f = await fixture(t), run = await startDaemon(f, t), first = (await readRuntimeState(f.config.dataDir))!.completedAt;
+  await waitFor(() => readRuntimeState(f.config.dataDir), state => !!state?.completedAt && state.completedAt !== first);
   for (let i = 0; i < 3; i++) {
     const checked = spawnSync(process.execPath, [cli, 'heartbeat-check', '--config', f.configPath, '--json'], { encoding: 'utf8', timeout: 10000 });
     assert.equal(checked.status, 0, checked.stderr); assert.equal(JSON.parse(checked.stdout).status, 'healthy'); await delay(100);
@@ -303,11 +304,11 @@ test('丙：心跳从未启动安静；通知未确认不重弹，恢复后第�
   await checkHeartbeat(f.config, after, async () => { calls++; }); assert.equal(calls, 1);
   await recordHeartbeat(f.config, after, 'run'); await checkHeartbeat(f.config, '2026-11-02T10:04:00Z', async () => { calls++; }); assert.equal(calls, 2);
 });
-test('丙：并发独立检查只弹一次；坏账本降级报心跳无法核实而不改原文件', async t => {
+test('丙：并发独立检查只弹一次；坏心跳状态降级报无法核实而不改原文件', async t => {
   const f = await fixture(t); await recordHeartbeat(f.config, at, 'concurrent'); let calls = 0;
   const notify = async () => { calls++; await delay(100); };
   await Promise.all([checkHeartbeat(f.config, after, notify), checkHeartbeat(f.config, after, notify)]); assert.equal(calls, 1);
-  const g = await fixture(t); await mkdir(g.config.dataDir); const path = join(g.config.dataDir, 'ledger.jsonl'), corrupt = '{broken ledger}\n'; await writeFile(path, corrupt);
+  const g = await fixture(t); await mkdir(g.config.dataDir); const path = runtimeStatePath(g.config.dataDir), corrupt = '{broken runtime state}\n'; await writeFile(path, corrupt);
   let title = ''; const result = await checkHeartbeat(g.config, after, async value => { title = value; });
   assert.equal(result.status, 'unavailable_notified'); assert.equal(title, 'personal agent 心跳无法核实'); assert.equal(await readFile(path, 'utf8'), corrupt);
 });

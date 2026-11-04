@@ -4,6 +4,7 @@ import { hash } from './utils.ts';
 import { automaticApproval, choiceFor, settleChoice } from './autonomy-policy.ts';
 import { dispatchTask } from './task-adapter.ts';
 import { recoverDeadLock, withNamedLock } from './locks.ts';
+import { recordWriteHealth } from './managed-health.ts';
 import type { Config } from './types.ts';
 import type { Assignment, AutomaticApproval, DispatchReceipt, DispatchRequest, LedgerChange, LedgerState, LoopWorker, ManagedInput, ManagedWrite } from './managed-types.ts';
 
@@ -77,6 +78,7 @@ async function saveResult(config: Config, id: string, receipt: DispatchReceipt, 
     const facts = receipt.facts ?? [], questions = (receipt.questions ?? []).slice(0, 3);
     if (receipt.status === 'consumed' && querying && (!facts.length || facts.some(fact => !fact.text.trim() || !fact.basis.trim()))) receipt = { requestId: id, status: 'failed', reason: '查询交回没有带依据的事实；不追查第二轮' };
     const success = receipt.status === 'consumed';
+    recordWriteHealth(state, add, write, at, success, receipt.reason ?? `派工回执：${receipt.status}`);
     settleChoice(state, add, write, at, success);
     add({ kind: 'put', table: 'writes', value: { ...write, state: receipt.status, reason: receipt.reason, failure: !success } });
     if (assignment.lastEventId === write.eventId) add({ kind: 'put', table: 'assignments', value: { ...assignment,
@@ -107,13 +109,21 @@ async function saveResult(config: Config, id: string, receipt: DispatchReceipt, 
 }
 /** adapter消费待写，外部调用只发生在fsync sending之后。崩溃/未知一律不重发。 */
 export async function dispatchTasks(config: Config, at: string, worker?: LoopWorker, signal?: AbortSignal, now: () => string = () => at) {
-  if (!Object.values((await readLedger(config.dataDir)).tables.writes).some(write => write.dispatch && ['pending', 'sending'].includes(write.state))) return;
+  const state = await readLedger(config.dataDir);
+  const candidates = Object.values(state.tables.writes).filter(write => {
+    if (!write.dispatch || !['pending', 'sending'].includes(write.state)) return false;
+    if (write.state === 'sending') return true;
+    const decision = guardWrite(state, write);
+    return decision.waitFor !== 'card_delivery' || write.reason !== decision.reason
+      || write.dispatch.kind === 'supplement' && !!queryAllowance(state, write.ticketId, now(), write.id);
+  });
+  if (!candidates.length) return;
   await recoverDeadLock(config.dataDir, '.task-work.lock');
-  try { await withNamedLock(config.dataDir, '.task-work.lock', () => dispatchTasksOnce(config, at, worker, signal, now)); }
+  try { await withNamedLock(config.dataDir, '.task-work.lock', () => dispatchTasksOnce(config, candidates, worker, signal, now)); }
   catch (error) { if ((error as { category?: string }).category !== 'lock_busy') throw error; }
 }
-async function dispatchTasksOnce(config: Config, at: string, worker?: LoopWorker, signal?: AbortSignal, now: () => string = () => at) {
-  for (const candidate of Object.values((await readLedger(config.dataDir)).tables.writes).filter(write => write.dispatch)) {
+async function dispatchTasksOnce(config: Config, candidates: ManagedWrite[], worker: LoopWorker | undefined, signal: AbortSignal | undefined, now: () => string) {
+  for (const candidate of candidates) {
     if (candidate.state === 'sending') { await saveResult(config, candidate.id, { requestId: candidate.id, status: 'uncertain', reason: '上次派工中断，未确定结果，不重发' }, now()); continue; }
     if (candidate.state !== 'pending' || signal?.aborted) continue;
     const claimedAt = now();
@@ -137,7 +147,8 @@ async function dispatchTasksOnce(config: Config, at: string, worker?: LoopWorker
         add({ kind: 'put', table: 'cards', value: { ...card, revision: card.revision + 1, interrupt: false, taskAction: undefined, deliveryText: `没派：${reason}` } });
         return;
       }
-      add({ kind: 'put', table: 'writes', value: { ...write, state: 'sending', dispatchedAt: claimedAt, reason: undefined } }); return write;
+      const sending = { ...write, state: 'sending' as const, dispatchedAt: claimedAt, attemptSeq: state.seq + 1, reason: undefined };
+      add({ kind: 'put', table: 'writes', value: sending }); return sending;
     });
     if (!claimed) continue;
     const began = performance.now();
