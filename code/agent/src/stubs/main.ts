@@ -1,0 +1,13 @@
+import { fakeFeishu, scriptModel, type Script } from './servers.js';
+import { jsonFile, atomicJson } from '../util.js';
+const mode = process.argv[2];
+const arg = (name: string) => process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : undefined;
+const port = Number(arg('--port') ?? 0);
+if (!['feishu', 'model'].includes(mode ?? '')) throw new Error('用法：node dist/src/stubs/main.js feishu|model [--port 0] [--state /临时文件] [--script /脚本.json] [--ready-file /文件]');
+const server = mode === 'feishu' ? await fakeFeishu(port, arg('--state')) : await scriptModel(arg('--script') ? await jsonFile<Script>(arg('--script')!) : { flow: [{ tools: [{ name: 'query_loop' }] }, { tools: [{ name: 'reply', arguments: { text: '当前授权项目有 {{loopCount}} 个 Loop 批次。' } }] }, { text: 'done' }] }, port, arg('--state'));
+const ready = { ready: true, mode, url: server.url, pid: process.pid };
+if (arg('--ready-file')) await atomicJson(arg('--ready-file')!, ready);
+console.log(JSON.stringify(ready));
+let stopped = false;
+const stop = async () => { if (stopped) return; stopped = true; await server.close(); process.exit(0); };
+process.on('SIGTERM', () => { void stop(); }); process.on('SIGINT', () => { void stop(); });
