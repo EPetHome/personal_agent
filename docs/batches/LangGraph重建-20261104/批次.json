@@ -1,0 +1,81 @@
+{
+  "name": "LangGraph重建-20261104",
+  "branch": "feat/LangGraph重建",
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max",
+    "tools": "read,edit,write,bash"
+  },
+  "stages": {
+    "甲": {
+      "prompt": "../../prompt/提示词-LangGraph重建-甲-能聊能查.md",
+      "scope": {
+        "allow": [
+          "code/agent/",
+          "docs/batches/LangGraph重建-20261104/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      },
+      "acceptance": {
+        "guide": "验收操作说明.md"
+      }
+    },
+    "乙": {
+      "prompt": "../../prompt/提示词-LangGraph重建-乙-派给Loop.md",
+      "scope": {
+        "allow": [
+          "code/agent/",
+          "docs/batches/LangGraph重建-20261104/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      },
+      "acceptance": {
+        "guide": "验收操作说明.md"
+      }
+    },
+    "丙": {
+      "prompt": "../../prompt/提示词-LangGraph重建-丙-派给Pi.md",
+      "scope": {
+        "allow": [
+          "code/agent/",
+          "docs/batches/LangGraph重建-20261104/结果.md"
+        ],
+        "deny": [
+          "docs/batches/闭环1-感知与总览-20261025/samples",
+          "docs/batches/真实格式兼容-20261025/samples",
+          "eval/"
+        ]
+      },
+      "acceptance": {
+        "guide": "验收操作说明.md"
+      }
+    }
+  },
+  "steps": [
+    [
+      "甲"
+    ],
+    [
+      "乙"
+    ],
+    [
+      "丙"
+    ]
+  ],
+  "acceptance": {
+    "workDir": "/Users/Admin/Desktop/personal agent-dev分支",
+    "criteria": "整批验收标准.md",
+    "guide": "/Users/Admin/Desktop/personal agent-dev分支/docs/batches/LangGraph重建-20261104/验收操作说明.md",
+    "maxRounds": 3,
+    "timeoutMin": 150,
+    "idleTimeoutSec": 600
+  }
+}
