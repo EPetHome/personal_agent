@@ -351,7 +351,7 @@ for (const [value, recipe] of [
   const f = await fixture(t); await text(f, value); await tick(f); const card = await latest(f), proposal = (await f.ledger()).tables.proposals[card.proposalId!]!;
   assert.equal(proposal.kind, 'loop'); assert.equal(proposal.recipe, recipe); assert.equal(proposal.skills, undefined);
   assert.equal(proposal.definition.result, value); await click(f);
-  const matching = await f.ledger(), pending = Object.values(matching.tables.writes).find(write => write.state === 'pending')!;
+  const matching = structuredClone(await f.ledger()), pending = Object.values(matching.tables.writes).find(write => write.state === 'pending')!;
   // 即使旧候选把定义和待写一致降为summary，派出前的硬围栏也不能放过代码任务。
   const wrong = structuredClone(pending); wrong.dispatch!.kind = 'skill'; wrong.dispatch!.recipe = undefined; wrong.dispatch!.skills = ['summary'];
   const plan = matching.tables.proposals[wrong.dispatch!.proposalId]!; plan.kind = 'skill'; plan.recipe = undefined; plan.skills = ['summary'];
@@ -552,7 +552,7 @@ for (const [open, close] of [['`', '`'], ['"', '"'], ["'", "'"], ['“', '”'],
     await text(f, original); await tick(f); const card = await latest(f), state = await f.ledger(), proposal = state.tables.proposals[card.proposalId!]!;
     assert.equal(proposal.kind, 'loop'); assert.equal(proposal.recipe, 'develop'); assert.equal(proposal.definition.result, original);
     assert.deepEqual(proposal.definition.boundaries.write, [f.project]); await click(f);
-    const matching = await f.ledger(), write = Object.values(matching.tables.writes).find(row => row.state === 'pending')!;
+    const matching = structuredClone(await f.ledger()), write = Object.values(matching.tables.writes).find(row => row.state === 'pending')!;
     const wrong = structuredClone(write); wrong.dispatch!.kind = 'skill'; wrong.dispatch!.recipe = undefined; wrong.dispatch!.skills = ['summary'];
     const plan = matching.tables.proposals[card.proposalId!]!; plan.kind = 'skill'; plan.recipe = undefined; plan.skills = ['summary'];
     assert.match(guardWrite(matching, wrong).reason, /必须走对应loop配方/);

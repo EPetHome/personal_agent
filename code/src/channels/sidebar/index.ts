@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { readLedger } from '../../core/ledger.ts';
 import { recordManagedAction } from '../../core/managed-actions.ts';
 import { guardCard } from '../../core/guard.ts';
+import { activeFaultCards } from '../../core/managed-health.ts';
 import { hash } from '../../core/utils.ts';
 import { managedControls } from '../feishu/card.ts';
 import { sidebarHtml } from './page.ts';
@@ -23,9 +24,10 @@ export function sidebarSnapshot(state: LedgerState) {
     groups[index]!.items.push({ id: ticket.id, name: ticket.batch, status: ticket.status,
       ...(card && guardCard(state, card) ? { card } : {}), controls: card && guardCard(state, card) ? managedControls(card) : [], reasons: attentions.map(row => row.reason) });
   }
+  const activeFaults = activeFaultCards(state);
   for (const card of Object.values(state.tables.cards)) {
     if (card.ticketId && state.tables.tickets[card.ticketId] || !guardCard(state, card)) continue;
-    if (card.id.startsWith('health:') && !Object.values(state.tables.health).some(row => !row.ok && row.episode === card.eventId)) continue;
+    if (card.id.startsWith('health:') && !activeFaults.has(card.id)) continue;
     const index = card.id.startsWith('health:') ? 2 : 1;
     groups[index]!.items.push({ id: card.id, name: card.title, status: '陈列', card, controls: managedControls(card), reasons: [] });
   }

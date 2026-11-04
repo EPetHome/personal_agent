@@ -91,6 +91,59 @@ test('己 A1：真实本机HTTP按账本四组陈列三件事，今天先做哪�
   await updateLedger(f.config.dataDir, at, (_state, add) => add({ kind: 'put', table: 'receipts', value: { id: 'poll-only', at, response: '构造无界面变化的轮询' } }));
   const after = await server.state(); assert.ok(after.sequence > state.sequence); assert.equal(after.viewVersion, state.viewVersion); // 轮询/心跳不重建DOM抢输入焦点。
 });
+for (const [healthId, kind] of [['processing', 'service'], ['source:workspace', 'source']] as const)
+  test(`账本减负返修1-2：仅侧边栏的${healthId}首次失败、更新、恢复和复发显示当前卡`, async t => {
+    const f = await fixture(t); f.config.feishu = undefined;
+    const server = await web(t, f), id = `health:${healthId}`;
+    const putHealth = async (ok: boolean, episode: string, step: number) => {
+      f.clock = new Date(Date.parse(at) + step * 1000).toISOString();
+      await updateLedger(f.config.dataDir, f.clock, (_state, add) => add({ kind: 'put', table: 'health', value: {
+        id: healthId, kind, at: f.clock, ok, episode, reason: ok ? '实际检查恢复' : `构造实际失败 ${step}`,
+      } }));
+    };
+    const scan = () => processManagedLoop(f.config, f.clock, { channels: [], intake: false, dispatch: false });
+    const assertCurrent = async (revision: number) => {
+      const state = await server.state(), faults = state.groups[2]!.items.filter(row => row.id.startsWith('health:'));
+      assert.deepEqual(faults.map(row => row.id), [id]); assert.equal(faults[0]!.card!.revision, revision);
+      assert.match(faults[0]!.card!.eventId, /^health-status:/); assert.equal(state.today!.id, id);
+    };
+    await putHealth(false, 'episode-first', 0); await scan(); await assertCurrent(1);
+    await putHealth(false, 'episode-first', 1); await scan(); await assertCurrent(2);
+    await putHealth(true, '', 2);
+    assert.equal((await server.state()).groups[2]!.items.length, 0, '恢复事实已入账，旧故障卡不能继续陈列');
+    await scan(); assert.equal((await server.state()).today, null);
+    assert.match((await f.state()).tables.cards[id]!.title, /已恢复/);
+    await putHealth(false, 'episode-again', 3); await scan(); await assertCurrent(4);
+    await updateLedger(f.config.dataDir, f.clock, (state, add) => {
+      const current = state.tables.cards[id]!;
+      for (const episode of ['episode-first', 'episode-again']) add({ kind: 'put', table: 'cards', value: {
+        ...current, id: `${id}:historical:${episode}`, eventId: episode, at, revision: 1, title: '已被取代的历史故障卡',
+      } });
+    });
+    const before = await f.state(); await assertCurrent(4); assert.equal((await f.state()).seq, before.seq, 'GET只读且不迁移旧卡');
+    assert.equal((await f.sent()).length, 0, '没有通知渠道，故障仍必须在侧边栏可见');
+  });
+test('账本减负返修1-2：旧episode卡只显示当前一张，升级为状态哈希后仍兼容且恢复不复活历史', async t => {
+  const f = await fixture(t); f.config.feishu = undefined;
+  await updateLedger(f.config.dataDir, at, (_state, add) => {
+    add({ kind: 'put', table: 'health', value: { id: 'processing', kind: 'service', at, ok: false, episode: 'legacy-current', reason: '构造旧版当前故障' } });
+    for (const [suffix, eventId, time] of [['old', 'legacy-old', '2026-11-05T09:00:00Z'], ['duplicate', 'legacy-current', '2026-11-05T09:30:00Z'], ['current', 'legacy-current', at]]) {
+      const id = `health:processing:${suffix}`;
+      add({ kind: 'put', table: 'cards', value: { id, ticketId: '', assignmentId: '', eventId: eventId!, at: time!, revision: 1,
+        title: `构造旧卡 ${suffix}`, fact: '构造旧版故障', question: '', suggestion: '检查', basis: '构造账本', options: [], redline: false, actionMode: 'none' } });
+      add({ kind: 'put', table: 'deliveries', value: { id: `feishu:${id}:1`, cardId: id, eventId: eventId!, revision: 1, channel: 'feishu', state: 'sent', failures: 0, messageId: `om_${suffix}` } });
+    }
+  });
+  const server = await web(t, f), id = 'health:processing:current';
+  assert.deepEqual((await server.state()).groups[2]!.items.map(row => row.id), [id]);
+  await processManagedLoop(f.config, at, { channels: [], intake: false, dispatch: false });
+  const updated = await server.state(); assert.deepEqual(updated.groups[2]!.items.map(row => row.id), [id]);
+  assert.match(updated.groups[2]!.items[0]!.card!.eventId, /^health-status:/); assert.equal(updated.today!.id, id);
+  await updateLedger(f.config.dataDir, at, (state, add) => add({ kind: 'put', table: 'health', value: { ...state.tables.health.processing!, ok: true, episode: '' } }));
+  await processManagedLoop(f.config, at, { channels: [], intake: false, dispatch: false });
+  const recovered = await server.state(); assert.equal(recovered.groups[2]!.items.length, 0); assert.equal(recovered.today, null);
+  assert.equal(Object.keys((await f.state()).tables.cards).length, 3, '只筛展示，不迁移或删除旧卡');
+});
 test('己 A2：侧边栏按建议先落待写，经同一围栏逐字送回，飞书沿原messageId更新', async t => {
   const f = await fixture(t); await emit(f, 'needs_decision', '等你点', { question: '怎样选', options: ['A', 'B'] });
   const old = Object.values((await f.state()).tables.cards)[0]!, message = (await f.sent()).find(row => row.noticeId === old.id)!.messageId;
@@ -208,7 +261,7 @@ test('己：重叠会议延后到最后结束，取消会则下轮释放；日�
   f.clock = end; await tick(f); const card = Object.values((await f.state()).tables.cards).find(card => card.title.includes('构造完成'))!; assert.equal((await f.sent()).filter(row => row.noticeId === card.id).length, 0);
   await writeFile(f.scheduleFile, '{broken synthetic-secret-upstream'); f.clock = '2026-11-05T11:00:01Z'; await tick(f);
   assert.equal((await f.state()).tables.calendars['calendar:calendar-test']!.meetings.length, 2); assert.doesNotMatch(await readFile(join(f.config.dataDir, 'ledger.jsonl'), 'utf8'), /synthetic-secret-upstream/);
-  assert.ok((await f.sent()).some(row => JSON.stringify(row.content).includes('来源故障')));
+  assert.ok((await f.sent()).some(row => JSON.stringify(row.content).includes('日程读取出了问题')));
   await writeFile(f.scheduleFile, JSON.stringify({ meetings: [], minutes: [] })); f.clock = '2026-11-05T11:00:02Z'; await tick(f); assert.equal((await f.sent()).filter(row => row.noticeId === card.id).length, 1);
 });
 test('己 A8：编造纪要待办走丁段派工建议，点派才开loop；同纪要新版相同待办不重复', async t => {

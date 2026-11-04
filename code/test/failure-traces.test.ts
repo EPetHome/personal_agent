@@ -380,8 +380,8 @@ test('丙 A7：常驻满盘检测日志带storage_full，连续失败不会被�
   f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 1, staleAfterMs: 1800000 };
   const control = new AbortController(); let writes = 0;
   faultOpen(t, (path, flags) => {
-    if (path !== join(f.config.dataDir, 'ledger.jsonl') || typeof flags === 'number' && !(flags & fs.constants.O_WRONLY) || flags === 'r') return false;
-    // 新入口先尝试一次启动心跳，之后仍须完整记录三轮处理写满失败。
+    if (!path.startsWith(join(f.config.dataDir, '.runtime-')) || typeof flags === 'number' && !(flags & fs.constants.O_WRONLY) || flags === 'r') return false;
+    // 运行信号不再入账：启动信号先尝试一次，之后仍须完整记录三轮小状态写满失败。
     if (++writes === 4) control.abort(); return true;
   });
   await runService(f.config, control.signal, { channels: [f.local] });
@@ -396,7 +396,7 @@ test('丙 A7 验收返修：状态写满后夹有lock_busy轮次，不算恢复�
   f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 10, staleAfterMs: 1800000 };
   const old = new Date(Date.now() - 8 * 86400000).toISOString();
   await put(join(f.config.dataDir, 'events.jsonl'), [event({ kind: 'store_format', format: 2 }, old), event({ kind: 'scan_completed' }, old)]);
-  faultOpen(t, (path, flags) => path === join(f.config.dataDir, 'ledger.jsonl') && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY)));
+  faultOpen(t, (path, flags) => path.startsWith(join(f.config.dataDir, '.runtime-')) && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY)));
   const channel = feishuChannel(f.config), startChannel = channel.start;
   let release: (() => Promise<void>) | undefined;
   channel.start = async () => {
@@ -419,7 +419,7 @@ test('丙 A7 验收返修：状态写满后夹有lock_busy轮次，不算恢复�
   };
   try {
     await waitForFailure('lock_busy', 2);
-    assert.equal((await readJsonl<string[]>(notify.output)).length, 1, '状态写满已通知一次');
+    assert.equal((await readJsonl<string[]>(notify.output)).filter(args => args.at(-2) === '磁盘已满，盯防可能停了').length, 1, '同类满盘故障只通知一次；可写账本里的其他故障另计');
     await release!(); release = undefined;
     await waitForFailure('storage_full', 3);
     control.abort(); await running;
@@ -438,7 +438,7 @@ test('丙 A7：连服务日志也写不进时仍通知且不每轮重弹，恢�
   f.config.managedLoop = { intakeEveryMs: 20, verifyAfterMs: 0, inspectEveryMs: 1, staleAfterMs: 1800000 };
   const control = new AbortController(); let attempts = 0, full = false;
   faultOpen(t, (path, flags) => {
-    if (path === join(f.config.dataDir, 'ledger.jsonl') && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY))) full = true;
+    if (path.startsWith(join(f.config.dataDir, '.runtime-')) && flags !== 'r' && (typeof flags !== 'number' || !!(flags & fs.constants.O_WRONLY))) full = true;
     if (!full || !path.startsWith(f.config.dataDir) || flags === 'r' || typeof flags === 'number' && !(flags & fs.constants.O_WRONLY)) return false;
     if (++attempts >= 9) full = false, control.abort();
     return true;

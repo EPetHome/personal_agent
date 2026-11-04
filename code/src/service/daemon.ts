@@ -7,10 +7,11 @@ import type { SafeFailure } from '../core/failures.ts';
 import { validateConfig } from '../core/config.ts';
 import { acquireLock, recoverDeadLock } from '../core/locks.ts';
 import { appendJsonl, measureStoreLocks, readJsonl } from '../core/store.ts';
-import { readLedger, updateLedger } from '../core/ledger.ts';
+import { measureLedgerReads, readLedger, updateLedger } from '../core/ledger.ts';
 import { intakeLoop } from '../core/loop-intake.ts';
 import { deliverManagedHealth, nextManagedDue, processManagedLoop } from '../core/managed-loop.ts';
 import { recordHeartbeat } from './heartbeat.ts';
+import { recordRuntimeProgress } from '../core/runtime-state.ts';
 import { dispatchTasks } from '../core/task-actions.ts';
 import { commandWorker } from '../core/worker-adapter.ts';
 import { codeVersion } from '../core/runtime-version.ts';
@@ -75,7 +76,7 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[], n
     });
   }
   try {
-    for (const name of ['.detect.lock', '.ledger.lock', '.managed-work.lock', '.task-work.lock', '.source-intake.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock']) await recoverDeadLock(dir, name);
+    for (const name of ['.detect.lock', '.ledger.lock', '.managed-work.lock', '.task-work.lock', '.source-intake.lock', '.runtime-state.lock', '.model.lock', '.learning.lock', '.feedback.lock', '.outbox.lock', '.feishu-send.lock', '.feishu-reply-send.lock', '.feishu-sent.lock', '.feishu-receive.lock', '.feishu-inbound.lock', '.relay.lock', '.relay-ui.lock']) await recoverDeadLock(dir, name);
     const history = await readJsonl<RunEvent>(runsPath), at = now();
     await appendJsonl(runsPath, [{ kind: 'start', at, runId, pid: process.pid, codeVersion } satisfies RunEvent]);
     const windowStart = Date.parse(at) - (config.service?.restartWindowMs ?? 300000);
@@ -92,11 +93,10 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[], n
         reason: `personal agent 短时间内反复重启；异常退出 ${crashes.length} 次。运行日志：${logPath}` } }));
       await appendJsonl(runsPath, [{ kind: 'alerted', at, runId, codeVersion } satisfies RunEvent]);
     }
-    try { await recordHeartbeat(config, at, runId); }
+    try { await recordRuntimeProgress(dir, { runId, startedAt: at, completedAt: undefined }); }
     catch (error) {
-      // 启动时账本损坏/写满也仍进入原有的失败留痕循环，不能让新增心跳把常驻提前打退。
       await reportStorageFailure(config, error, channels);
-      await log('heartbeat_pending', { message: '启动心跳暂未写入，保留现场；独立任务可报告无法核实', ...safeProcessingFailure(error) });
+      await log('heartbeat_pending', { message: '主流程启动信号暂未写入，未伪造完成心跳', ...safeProcessingFailure(error) });
     }
     for (const channel of channels) if ('start' in channel && typeof channel.start === 'function') await channel.start();
     if (config.sidebar) {
@@ -172,12 +172,15 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[], n
       const clock = now(), inspect = Date.parse(clock) >= inspectAt;
       if (inspect) inspectAt = Date.parse(clock) + inspectEveryMs;
       pending = false;
-      const began = performance.now(), timing = { heldMs: 0 };
-      await withStorageAlerts(config, channels, async () => {
+      const began = performance.now(), timing = { heldMs: 0 }, ledgerReads = { fullReads: 0 };
+      await measureLedgerReads(() => withStorageAlerts(config, channels, async () => {
         let kind = 'scan_completed', result: Record<string, unknown>;
         try {
           const state = await measureStoreLocks(() => processManagedLoop(config, clock, { channels, worker, intake: false, inspect, dispatch: false, now }), timing);
           await health('processing', true, '', 'service');
+          const serviceFault = state.tables.health.service;
+          if (serviceFault?.ok === false && (!serviceFault.reason.startsWith('personal agent 短时间内反复重启；')
+            || Date.parse(now()) - Date.parse(at) >= (config.service?.restartWindowMs ?? 300000))) await health('service', true, '', 'service');
           await recordHeartbeat(config, now(), runId);
           result = { ledgerSequence: state.seq, inspect };
         } catch (error) {
@@ -188,9 +191,9 @@ async function serve(config: Config, signal: AbortSignal, channels: Channel[], n
             await deliverManagedHealth(config, now(), channels, false, now).catch(() => {});
           }
         }
-        await log(kind, { ...result, durationMs: Math.round(performance.now() - began), storeLockHeldMs: Math.round(timing.heldMs) });
+        await log(kind, { ...result, durationMs: Math.round(performance.now() - began), storeLockHeldMs: Math.round(timing.heldMs), ledgerFullReads: ledgerReads.fullReads });
         return kind;
-      }, kind => kind === 'scan_completed' && intakeHealthy && [...receiveHealthy.values()].every(Boolean));
+      }, kind => kind === 'scan_completed' && intakeHealthy && [...receiveHealthy.values()].every(Boolean)), ledgerReads);
       let due: number | undefined;
       try { due = await nextManagedDue(dir, now(), config.schedule?.calendarIds ?? []); }
       catch { due = Date.parse(now()) + Math.min(1000, inspectEveryMs); }

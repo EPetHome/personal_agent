@@ -42,13 +42,18 @@ async function workspaceIntake(config: Config, at: string) {
     await updateLedger(config.dataDir, at, (state, add) => { if (!state.tables.materials[id]) add({ kind: 'put', table: 'materials', value: material }); });
   }
 }
+const fakeReaders = new WeakMap<Config, { path: string; signature: string; reader: ScheduleReader }>();
 async function fakeReader(config: Config, at: string): Promise<ScheduleReader> {
-  const path = config.schedule!.fakeFile!, box = await taskSandbox(config, dirname(path), at);
+  const path = config.schedule!.fakeFile!, stat = await lstat(path, { bigint: true });
+  const signature = [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+  const cached = fakeReaders.get(config);
+  if (stat.isFile() && stat.nlink === 1n && cached?.path === path && cached.signature === signature) return cached.reader;
+  const box = await taskSandbox(config, dirname(path), at);
   const page = await box.text(path, 1, 1000, 524288);
   if (!page.eof) throw new Error('假日程超过读取上限');
   const raw = object(decodeJson(page.text), '假日程快照');
   if (!Array.isArray(raw.meetings ?? []) || !Array.isArray(raw.minutes ?? [])) throw new Error('假日程格式不合法');
-  return { async calendar(calendarId) {
+  const reader: ScheduleReader = { async calendar(calendarId) {
     return (raw.meetings ?? []).filter((row: any) => row?.calendarId === calendarId && row.cancelled !== true && row.busy !== false).map((row: any) => {
       if (typeof row.id !== 'string' || !Number.isFinite(Date.parse(row.start)) || !Number.isFinite(Date.parse(row.end)) || Date.parse(row.end) <= Date.parse(row.start)) throw new Error('假会议时间不合法');
       return { id: row.id, calendarId, title: typeof row.title === 'string' ? row.title.slice(0, 500) : '构造会议', start: new Date(row.start).toISOString(), end: new Date(row.end).toISOString() };
@@ -61,6 +66,7 @@ async function fakeReader(config: Config, at: string): Promise<ScheduleReader> {
     if (typeof row.text !== 'string' || row.text.length > 32768 || row.todos !== undefined && (!Array.isArray(row.todos) || row.todos.some((todo: unknown) => typeof todo !== 'string' || todo.length > 4000))) throw new Error('假妙记格式不合法');
     return { id: token, title: typeof row.title === 'string' ? row.title.slice(0, 500) : '构造会议纪要', text: row.text, ...(row.todos ? { todos: row.todos.slice(0, 20) } : {}) };
   } };
+  fakeReaders.set(config, { path, signature, reader }); return reader;
 }
 async function saveMinute(config: Config, minute: MinuteMaterial, at: string) {
   if (!minute.text.trim() && !minute.todos?.length) return; // 转写尚未完成，后续继续读。
@@ -70,22 +76,25 @@ async function saveMinute(config: Config, minute: MinuteMaterial, at: string) {
     add({ kind: 'put', table: 'materials', value: { id, source: 'minutes', ref: minute.id, at, title: minute.title, media: 'text', text: minute.text, fingerprint, ...(minute.todos ? { todos: minute.todos } : {}) } });
   });
 }
+// 运行节拍只留在本进程；新配置/进程首次调用立即查，不沿用旧账本里的轮询回执。
+const lastPolls = new WeakMap<Config, Map<string, number>>();
 /** 只有intake碰目录/官方SDK；各来源失败隔离，未配置的来源既不读也不落账。 */
 export async function intakeConfiguredSources(config: Config, at: string, injected?: ScheduleReader) {
   const schedule = config.schedule;
   if (!config.workspace && !schedule?.calendarIds.length && !schedule?.minuteTokens.length && !schedule?.minuteOwnerIds?.length) return;
   await recoverDeadLock(config.dataDir, '.source-intake.lock');
   await withNamedLock(config.dataDir, '.source-intake.lock', async () => {
-    const state = await readLedger(config.dataDir);
-    const due = (id: string, interval: number) => !state.tables.receipts[id] || Date.parse(at) - Date.parse(state.tables.receipts[id]!.at) >= interval;
-    const polled = (id: string) => updateLedger(config.dataDir, at, (_state, add) => add({ kind: 'put', table: 'receipts', value: { id, at, response: '只读接入轮询已尝试' } }));
+    let polls = lastPolls.get(config);
+    if (!polls) { polls = new Map(); lastPolls.set(config, polls); }
+    const due = (id: string, interval: number) => !polls.has(id) || Date.parse(at) < polls.get(id)! || Date.parse(at) - polls.get(id)! >= interval;
+    const polled = (id: string) => polls.set(id, Date.parse(at));
     if (config.workspace && due('poll:workspace', config.workspace.pollEveryMs)) {
-      await polled('poll:workspace');
+      polled('poll:workspace');
       try { await workspaceIntake(config, at); await health(config, 'source:workspace', at, true); }
       catch { await health(config, 'source:workspace', at, false); }
     }
     if (!schedule || !schedule.calendarIds.length && !schedule.minuteTokens.length && !schedule.minuteOwnerIds?.length || !due('poll:schedule', schedule.pollEveryMs)) return;
-    await polled('poll:schedule');
+    polled('poll:schedule');
     let reader: ScheduleReader;
     try { reader = injected ?? (schedule.mode === 'fake' ? await fakeReader(config, at) : await feishuScheduleReader(config)); }
     catch (error) { await health(config, 'source:schedule', at, false, error instanceof ScheduleAuthorizationMissing ? error.message : undefined); return; }
@@ -96,7 +105,12 @@ export async function intakeConfiguredSources(config: Config, at: string, inject
       try {
         const meetings: CalendarMeeting[] = await reader.calendar(calendarId, from, to);
         if (meetings.some(row => row.calendarId !== calendarId || !Number.isFinite(Date.parse(row.start)) || !Number.isFinite(Date.parse(row.end)) || Date.parse(row.end) <= Date.parse(row.start))) throw new Error('日程格式错误');
-        await updateLedger(config.dataDir, at, (_state, add) => add({ kind: 'put', table: 'calendars', value: { id: `calendar:${calendarId}`, calendarId, at, from, to, meetings } }));
+        await updateLedger(config.dataDir, at, (state, add) => {
+          const id = `calendar:${calendarId}`, old = state.tables.calendars[id];
+          // 没有新会议且已知窗口仍覆盖现在，不为“查过了”追加同一份日程。
+          if (old && JSON.stringify(old.meetings) === JSON.stringify(meetings) && Date.parse(old.from) <= Date.parse(at) && Date.parse(at) < Date.parse(old.to)) return;
+          add({ kind: 'put', table: 'calendars', value: { id, calendarId, at, from, to, meetings } });
+        });
         await health(config, id, at, true);
       } catch { await health(config, id, at, false); } // 不以失败清空先前已知的会。
     }

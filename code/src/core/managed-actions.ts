@@ -7,6 +7,7 @@ import { actionScope, choiceFor, downgradeMode, handleModeAction, settleChoice }
 import { handleMemoryAction } from './managed-memory.ts';
 import { chooseMaterial } from './materials.ts';
 import { managedControls } from '../channels/feishu/card.ts';
+import { recordWriteHealth } from './managed-health.ts';
 import type { Config } from './types.ts';
 import type { LedgerChange, LedgerState, LoopWorker, ManagedInput, ManagedWrite, WorkerReceipt } from './managed-types.ts';
 
@@ -192,6 +193,8 @@ export async function recordWorkerReceipt(config: Config, receipt: WorkerReceipt
       }
     }
     settleChoice(state, add, write, at, ['delivered', 'consumed'].includes(receipt.status) && receipt.outcome !== 'blocked');
+    if (['delivered', 'consumed'].includes(receipt.status) || receipt.status === 'failed' || receipt.failure)
+      recordWriteHealth(state, add, write, at, ['delivered', 'consumed'].includes(receipt.status), receipt.reason ?? `worker 回执：${receipt.status}`);
     add({ kind: 'put', table: 'writes', value: { ...write, state: receipt.outcome === 'blocked' ? 'blocked' : receipt.status, reason: receipt.reason,
       outcome: receipt.outcome, commit: receipt.commit, code: receipt.code, failure: receipt.failure } });
     add({ kind: 'observation', observation: { kind: 'write', ticketId: write.ticketId, requestId: write.id, actor: write.actor, detail: `回执：${receipt.status}${receipt.reason ? `；${receipt.reason}` : ''}` } });
@@ -207,8 +210,8 @@ export async function recordWorkerReceipt(config: Config, receipt: WorkerReceipt
 }
 /** adapter 消费待写。sending 先 fsync；进程崩溃后只能变 uncertain，不能自动再投。 */
 export async function dispatchWrites(config: Config, at: string, worker?: LoopWorker) {
-  for (const candidate of Object.values((await readLedger(config.dataDir)).tables.writes)) {
-    if (candidate.dispatch) continue; // 派工由独立adapter消费，不能当成loop送话。
+  const candidates = Object.values((await readLedger(config.dataDir)).tables.writes).filter(write => !write.dispatch && ['pending', 'sending'].includes(write.state));
+  for (const candidate of candidates) {
     if (candidate.state === 'sending') {
       await recordWorkerReceipt(config, { requestId: candidate.id, status: 'uncertain', reason: '上次投递未记到回执，重启不重发' }, at); continue;
     }
@@ -223,8 +226,9 @@ export async function dispatchWrites(config: Config, at: string, worker?: LoopWo
         if (card) add({ kind: 'put', table: 'cards', value: { ...card, revision: card.revision + 1, interrupt: false, deliveryText: `没有执行/发送：${decision.reason}` } });
         return;
       }
-      add({ kind: 'put', table: 'writes', value: { ...write, state: 'sending' } });
-      return { write, assignment: state.tables.assignments[write.assignmentId]! };
+      const sending = { ...write, state: 'sending' as const, attemptSeq: state.seq + 1 };
+      add({ kind: 'put', table: 'writes', value: sending });
+      return { write: sending, assignment: state.tables.assignments[write.assignmentId]! };
     });
     if (!claimed) continue;
     let receipt: WorkerReceipt;

@@ -8,7 +8,8 @@ import { inspectLoopStatuses, intakeLoop } from './loop-intake.ts';
 import { guardCard, validBatchBranch } from './guard.ts';
 import { saveHandoff } from './handoff.ts';
 import { watchManagedFacts } from './watchdog.ts';
-import { hash } from './utils.ts';
+import { healthCards, supersededFaultCards } from './managed-health.ts';
+import { recordRuntimeProgress } from './runtime-state.ts';
 import { planAutonomy } from './autonomy.ts';
 import { offerModes } from './autonomy-policy.ts';
 import { draftMemory, learnRuleCandidates } from './managed-memory.ts';
@@ -110,12 +111,31 @@ function recordCardChannelResult(state: LedgerState, add: (change: LedgerChange)
     reason: `卡片渠道已由实际成功投递核实：${delivery.id}；尝试事务 ${delivery.attemptSeq}`,
     ...(previous?.lastFailureSeq ? { lastFailureSeq: previous.lastFailureSeq } : {}), deliveryId: delivery.id, attemptSeq: delivery.attemptSeq } });
 }
-/** channel 是唯一本人写口；每个批次始终沿用账本里的 messageId。 */
+/** 纯内存预筛；锁内仍重核所有围栏，不能把快照当作发送授权。 */
+function needsCardDelivery(state: LedgerState, card: ManagedCard, channel: ManagedChannel, history: CardDelivery[], config: Config, at: string) {
+  if (!guardCard(state, card) || delayForMeeting(state, card, at, config.schedule?.calendarIds ?? [])) return false;
+  if (channel.name === 'local' && config.sidebar && (card.urgency === 'completion' || state.events[card.eventId]?.state === 'completed')) return false;
+  if (history.some(row => row.state === 'sending')) return true; // 要把遗留sending落成uncertain，绝不重投。
+  if (history.some(row => row.state === 'uncertain' && !row.messageId)) return false;
+  const old = state.tables.deliveries[`${channel.name}:${card.id}:${card.revision}`];
+  if (card.notifyChannels && !card.notifyChannels.includes(channel.name) || old?.state === 'sent' || old?.state === 'uncertain' || (old?.failures ?? 0) >= 5) return false;
+  if (channel.name === 'local' && (card.interrupt === false || history.some(row => row.eventId === card.eventId && row.state === 'sent'))) return false;
+  return true;
+}
+/** channel 是唯一本人写口；每轮一个快照排除历史卡，只有待发/更新/重试才开事务。 */
 async function deliverCards(config: Config, channels: ManagedChannel[], now: () => string) {
-  for (const card of Object.values((await readLedger(config.dataDir)).tables.cards)) for (const channel of channels) {
+  const initial = await readLedger(config.dataDir), histories = new Map<string, CardDelivery[]>(), superseded = supersededFaultCards(initial);
+  for (const row of Object.values(initial.tables.deliveries)) {
+    const key = JSON.stringify([row.channel, row.cardId]);
+    const history = histories.get(key) ?? []; history.push(row); histories.set(key, history);
+  }
+  const candidates = Object.values(initial.tables.cards).filter(card => !superseded.has(card.id)).flatMap(card => channels.filter(channel =>
+    needsCardDelivery(initial, card, channel, histories.get(JSON.stringify([channel.name, card.id])) ?? [], config, now())).map(channel => ({ card, channel })));
+  for (const { card, channel } of candidates) {
     const claimed = await updateLedger(config.dataDir, now(), (state, add) => {
       const at = now(); // 在拿到短锁、读完账本之后再取当前时钟，不能沿用处理轮次开始时间。
       const current = state.tables.cards[card.id]; if (!current || !guardCard(state, current) || delayForMeeting(state, current, at, config.schedule?.calendarIds ?? [])) return;
+      if (current.id.startsWith('health:') && supersededFaultCards(state).has(current.id)) return;
       // 已启用桌面陈列时，完成状态只安静移组，不额外弹本机；飞书仍按会议闸门发。
       if (channel.name === 'local' && config.sidebar && (current.urgency === 'completion' || state.events[current.eventId]?.state === 'completed')) return;
       const id = `${channel.name}:${card.id}:${card.revision}`;
@@ -159,24 +179,8 @@ async function deliverCards(config: Config, channels: ManagedChannel[], now: () 
       add({ kind: 'put', table: 'deliveries', value: { ...old, state: failure ? uncertain ? 'uncertain' : 'failed' : 'sent', failures: old.failures + (failure ? 1 : 0),
         ...(messageId ? { messageId } : {}), ...(failure ? { reason: `${failure.category}：${failure.reason}${uncertain ? '；结果不确定，不新发卡' : '；最多五次尝试'}` } : {}) } });
       recordCardChannelResult(state, add, at, old, failure ? `${failure.category}：${failure.reason}` : undefined);
-      if (failure && !card.id.startsWith('health:') && channel.name !== 'local' && (uncertain || old.failures + 1 >= 5)) {
-        const id = `health:delivery:${channel.name}:${card.id}`;
-        if (!state.tables.cards[id]) add({ kind: 'put', table: 'cards', value: { id, ticketId: '', assignmentId: '', eventId: claimed.id, revision: 1, at,
-          title: 'personal agent · 卡片未确认送达', fact: `${card.title} → ${channel.name}；${failure.category}：${failure.reason}。${uncertain ? '结果不确定，不新发卡' : '已尝试5次，停止重试'}`,
-          question: '', suggestion: '请查看本机账本并核对渠道；不会重复送话', basis: '渠道实际回执与账本尝试次数', options: [], redline: false, actionMode: 'none', notifyChannels: ['local'] } });
-      }
+      healthCards(state, add, at);
     });
-  }
-}
-function healthCards(state: LedgerState, add: (change: LedgerChange) => void, at: string) {
-  for (const health of Object.values(state.tables.health)) {
-    const id = `health:${health.id}:${hash(health.episode).slice(0, 12)}`;
-    // 卡片渠道故障沿用deliverCards的原卡/本机告警路径，不再生成另一张同源告警。
-    if (health.id.startsWith('card-channel:') || health.ok || state.tables.cards[id]) continue;
-    add({ kind: 'put', table: 'cards', value: { id, ticketId: '', assignmentId: '', eventId: health.episode, revision: 1, at,
-      title: `personal agent · ${health.kind === 'delivery' ? '话没送到' : health.kind === 'service' ? 'PA 自身故障' : '来源故障'}`, fact: health.reason, question: '',
-      suggestion: health.kind === 'delivery' ? '请核对原卡和 worker；结果不确定不重发' : '请回电脑检查来源与运行日志',
-      basis: 'watchdog 仅报告接入回执/账本里的机械事实，不作语义判断', options: [], redline: false, actionMode: 'none' } });
   }
 }
 /** 按需处理新事件/核实到期；模型在账本锁外。intake 可在另一调度中持续运行，不等研判。 */
@@ -209,11 +213,11 @@ async function processManagedLoopOnce(config: Config, at: string, components: Ma
     await processMaterials(config.judge ? { ...config, judge: { ...config.judge, cycleTimeoutMs: Math.max(1, remaining), ...(remaining <= 0 ? { dailyLimit: 0 } : {}) } } : config, at);
     await updateLedger(config.dataDir, at, (current, add) => {
       gateAssessments(current, add, at); refreshTicketProgress(current, add); planAutonomy(current, add, at);
-      if (components.inspect) add({ kind: 'put', table: 'receipts', value: { id: 'inspection', at, response: '低频巡检完成' } });
     });
     await dispatchWrites(config, at, worker);
     if (components.dispatch !== false) await dispatchTasks(config, at, worker);
     await deliverManagedHealth(config, now(), components.channels, components.inspect, now);
+    if (components.inspect) await recordRuntimeProgress(config.dataDir, { inspectedAt: now() });
     return readLedger(config.dataDir);
   });
 }

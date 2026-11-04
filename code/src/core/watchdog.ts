@@ -1,5 +1,6 @@
 import type { Config } from './types.ts';
 import { BATCH_STAGE } from './loop-protocol.ts';
+import { recordWriteHealth, writeHealthId } from './managed-health.ts';
 import type { LedgerChange, LedgerState } from './managed-types.ts';
 
 /** 只读机械事实、只写账本。不起模型、不发消息、不读取worker会话文件。 */
@@ -25,12 +26,19 @@ export function watchManagedFacts(state: LedgerState, add: (change: LedgerChange
     add({ kind: 'put', table: 'attentions', value: { id, ticketId: assignment.ticketId, assignmentId: assignment.id, eventId: assignment.lastEventId, status: 'waiting', reason } });
     add({ kind: 'observation', observation: { kind: 'not_called', ticketId: assignment.ticketId, eventId: assignment.lastEventId, detail: reason } });
   }
-  for (const write of Object.values(state.tables.writes)) {
-    if (write.state !== 'failed' && !write.failure) continue;
-    const id = `write:${write.id}`;
-    if (state.tables.health[id]) continue;
-    add({ kind: 'put', table: 'health', value: { id, ok: false, episode: id, at, kind: 'delivery',
-      reason: `${write.execution ? '执行' : '话'}没送到/未确认：请求 ${write.id}；${write.reason ?? 'worker 回执失败'}。不自动重发。` } });
+  const writes = Object.values(state.tables.writes);
+  for (const key of ['write:dispatch', 'write:execution', 'write:message']) {
+    const health = state.tables.health[key];
+    if (health) {
+      const write = state.tables.writes[health.deliveryId ?? ''];
+      if (!health.ok && write && ['delivered', 'consumed'].includes(write.state) && !write.failure)
+        recordWriteHealth(state, add, write, at, true, write.reason ?? '实际回执已核实恢复');
+      continue;
+    }
+    // 旧版只有每个请求的失败记录时，按类别接管最新结果，不为每个请求再生一张卡。
+    const latest = writes.filter(write => writeHealthId(write) === key && (write.state === 'failed' || write.failure || ['delivered', 'consumed'].includes(write.state)))
+      .sort((a, b) => (b.attemptSeq ?? 0) - (a.attemptSeq ?? 0) || (b.dispatchedAt ?? b.at).localeCompare(a.dispatchedAt ?? a.at))[0];
+    if (latest && (latest.state === 'failed' || latest.failure)) recordWriteHealth(state, add, latest, at, false, latest.reason ?? 'worker 回执失败；不自动重发');
   }
   for (const connection of Object.values(state.tables.connections)) {
     const id = `connection:${connection.id}`, old = state.tables.health[id];
