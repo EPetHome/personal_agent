@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { jsonFile, atomicJson, parseJson } from '../util.js';
+import type { MessageCard } from '../channel.js';
 
 async function body(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = []; let size = 0;
@@ -18,7 +19,7 @@ async function listen(handler: (req: IncomingMessage, res: ServerResponse) => Pr
 export async function fakeFeishu(port = 0, statePath?: string) {
   const state = statePath ? await jsonFile<any>(statePath).catch(() => undefined) : undefined;
   const events: { seq: number; event: unknown }[] = state?.events ?? [];
-  const messages: { id: string; key: string; text: string; userId: string; updates?: string[] }[] = state?.messages ?? [];
+  const messages: { id: string; key: string; text: string; userId: string; card?: MessageCard; updates?: string[] }[] = state?.messages ?? [];
   const notifications: any[] = state?.notifications ?? [];
   const assets: Record<string, string> = state?.assets ?? {};
   let connected = true, save = Promise.resolve();
@@ -53,7 +54,7 @@ export async function fakeFeishu(port = 0, statePath?: string) {
     }
     if (path === '/update') {
       const message = messages.find(m => m.id === value.id); if (!message) { send(res, { error: 'unknown message' }, 404); return; }
-      (message.updates ??= []).push(value.text); message.text = value.text; await persist(); send(res, { id: message.id }); return;
+      (message.updates ??= []).push(value.text); message.text = value.text; if (value.card) message.card = value.card; await persist(); send(res, { id: message.id }); return;
     }
     if (path === '/notify') { if (!notifications.some(n => n.key === value.key)) notifications.push(value); await persist(); send(res, { id: value.id }); return; }
     send(res, { error: 'unknown path' }, 404);
@@ -117,8 +118,15 @@ export async function scriptModel(initial: Script = {}, port = 0, statePath?: st
       catch { /* Plain chat and lifted visual materials are not the input envelope. */ }
     }
     let lastTool: any; try { lastTool = JSON.parse(request.messages.filter((m: any) => m.role === 'tool').at(-1)?.content ?? '{}'); } catch { lastTool = undefined; }
+    let matchedTaskId = '';
+    for (const m of request.messages) {
+      try { const v = JSON.parse(m.content); if (v.type === '任务表' && v.matchedCards?.[0]) { matchedTaskId = v.matchedCards[0].id; break; } }
+      catch { continue; } // Non-JSON chat/visual content is not a task envelope.
+    }
     const expand = (value: unknown): any => {
-      if (typeof value === 'string') return value.replaceAll('{{attachment0}}', incoming.attachments?.[0]?.path ?? '').replaceAll('{{text}}', incoming.text ?? '').replaceAll('{{loopCount}}', String(lastTool?.batches?.length ?? 0));
+      if (typeof value === 'string') return value.replaceAll('{{attachment0}}', incoming.attachments?.[0]?.path ?? '')
+        .replaceAll('{{text}}', incoming.text ?? '').replaceAll('{{loopCount}}', String(lastTool?.batches?.length ?? 0))
+        .replaceAll('{{taskId}}', String(lastTool?.card?.id ?? incoming.taskId ?? matchedTaskId));
       if (Array.isArray(value)) return value.map(expand);
       if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, expand(v)]));
       return value;

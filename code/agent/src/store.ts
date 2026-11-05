@@ -64,6 +64,8 @@ export class Store {
   oldest() { return this.db.prepare("SELECT id,created,started FROM inputs WHERE state IN ('pending','processing') ORDER BY created LIMIT 1").get() as { id: string; created: number; started: number | null } | undefined; }
   start(id: string) { this.db.prepare("UPDATE inputs SET state='processing',started=COALESCE(started,?) WHERE id=?").run(Date.now(), id); }
   prepared(id: string, input: Input) { this.db.prepare('UPDATE inputs SET body=?,prepared=1 WHERE id=?').run(JSON.stringify(input), id); }
+  wait(id: string) { this.db.prepare("UPDATE inputs SET state='waiting',started=NULL WHERE id=?").run(id); }
+  ready(id: string) { this.db.prepare("UPDATE inputs SET state='pending',started=? WHERE id=? AND state='waiting'").run(Date.now(), id); }
   finish(id: string, state = 'done') { this.db.prepare('UPDATE inputs SET state=?,finished=? WHERE id=?').run(state, Date.now(), id); }
   putTask(card: TaskCard) {
     const ownsTransaction = !this.db.isTransaction;
@@ -84,19 +86,19 @@ export class Store {
     for (const [kind, value] of sources) for (const r of this.db.prepare('SELECT task FROM subscriptions WHERE kind=? AND value=?').all(kind, value)) ids.add(String(r.task));
     return [...ids].flatMap(id => {
       const card = this.task(id); if (!card) return [];
-      if (input.source === 'loop') {
-        this.db.exec('BEGIN IMMEDIATE');
-        try {
-          if (this.db.prepare('INSERT OR IGNORE INTO task_events VALUES(?,?)').run(id, input.id).changes) {
-            card.status = input.status ?? card.status;
-            card.dispatches.push({ event: input.id, at: input.at, status: input.status, source: input.source });
-            card.updated = input.at; this.putTask(card);
-          }
-          this.db.exec('COMMIT');
-        } catch (e) { this.db.exec('ROLLBACK'); throw e; }
-      }
       return [card];
     });
+  }
+  recordTaskEvent(card: TaskCard, input: Input, status: string) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (this.db.prepare('INSERT OR IGNORE INTO task_events VALUES(?,?)').run(card.id, input.id).changes) {
+        card.status = status;
+        card.dispatches.push({ event: input.id, at: input.at, status, reported: input.status, source: input.source });
+        card.updated = new Date().toISOString(); this.putTask(card);
+      }
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
   }
   addWindow(id: string, seq: number, role: 'user' | 'assistant', text: string) {
     this.db.prepare('INSERT OR IGNORE INTO window VALUES(?,?,?,?,?)').run(id, seq, role, text, tokenBudget(text));

@@ -28,8 +28,9 @@
       "prompt": "../../prompt/提示词-LangGraph重建-乙-派给Loop.md",
       "scope": {
         "allow": [
-          "code/agent/",
-          "docs/batches/LangGraph重建-20261104/结果.md"
+          "code/",
+          "docs/batches/LangGraph重建-20261104/结果.md",
+          "docs/batches/LangGraph重建-20261104/批次.json"
         ],
         "deny": [
           "docs/batches/闭环1-感知与总览-20261025/samples",
@@ -45,8 +46,9 @@
       "prompt": "../../prompt/提示词-LangGraph重建-丙-派给Pi.md",
       "scope": {
         "allow": [
-          "code/agent/",
-          "docs/batches/LangGraph重建-20261104/结果.md"
+          "code/",
+          "docs/batches/LangGraph重建-20261104/结果.md",
+          "docs/batches/LangGraph重建-20261104/批次.json"
         ],
         "deny": [
           "docs/batches/闭环1-感知与总览-20261025/samples",

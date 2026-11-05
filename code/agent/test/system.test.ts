@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
-import { fixture, until } from './helpers.js';
+import { fixture, until, settleLaunchers } from './helpers.js';
 import { Store } from '../src/store.js';
 import { sleep } from '../src/util.js';
 
@@ -41,6 +41,26 @@ test('documented sandbox CLI plus main and launchd generator run entirely in a t
   await promisify(execFile)(process.execPath, [resolve('dist/src/launchd.js'), '--config', ready.config, '--out', join(root, 'plists')]);
   assert.match(await readFile(join(root, 'plists/local.personal-agent-v2.plist'), 'utf8'), /main.js/);
   assert.match(await readFile(join(root, 'plists/local.personal-agent-v2.watchdog.plist'), 'utf8'), /watchdog-main.js/);
+});
+
+test('worker sandbox CLI dispatches only after a real fake-Feishu button callback', { timeout: 20000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pa-v2-worker-cli-'));
+  const sandbox = spawn(process.execPath, [resolve('scripts/sandbox.mjs'), '--workers', '--dir', root], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let main: ChildProcess | undefined;
+  t.after(async () => { await stop(main); await settleLaunchers(join(root, 'data')); await stop(sandbox); await rm(root, { recursive: true, force: true }); });
+  await until(async () => { try { await readFile(join(root, 'ready.json')); return true; } catch { return false; } });
+  const ready = JSON.parse(await readFile(join(root, 'ready.json'), 'utf8'));
+  const post = async (url: string, value: unknown) => { const r = await fetch(url, { method: 'POST', body: JSON.stringify(value) }); assert.ok(r.ok); };
+  await post(`${ready.model}/script`, { flow: [{ tools: [{ name: 'worker_dispatch', arguments: { taskId: 'cli-task', project: 'fixture', title: 'README Hello', goal: 'code/README.md 改 Hello', completion: '门禁过、评审无必修、提交批次分支', boundary: '只改 code/，不合入不推送不碰真实账号', prompt: '改 README 标题为 Hello' } }] }, { text: 'done' }] });
+  main = await launch('dist/src/main.js', ['--config', ready.config]);
+  await post(`${ready.feishu}/inject`, { id: 'request', text: '改 README' });
+  const messages = async () => await (await fetch(`${ready.feishu}/messages`)).json() as any[];
+  await until(async () => (await messages())[0]?.card?.buttons.some((b: any) => b.label === '好'));
+  let calls = await readFile(join(root, 'loop-calls.jsonl'), 'utf8'); assert.equal(calls.includes('开工'), false);
+  const card = (await messages())[0], value = card.card.buttons.find((b: any) => b.label === '好').value;
+  await post(`${ready.feishu}/inject`, { id: 'click', quoteId: card.id, button: { value } });
+  await until(async () => (await readFile(join(root, 'loop-calls.jsonl'), 'utf8')).includes('启动'));
+  calls = await readFile(join(root, 'loop-calls.jsonl'), 'utf8'); assert.equal(calls.split('\n').filter(s => s.includes('"verb":"开工"')).length, 1);
 });
 
 test('SIGKILL recovery resumes SQLite graph after sent reply without repeating it', { timeout: 20000 }, async t => {

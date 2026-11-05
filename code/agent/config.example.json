@@ -2,7 +2,14 @@
   "dataDir": "/tmp/pa-example/data",
   "attachmentDir": "/tmp/pa-example/attachments",
   "inboxDirs": ["/tmp/pa-example/inbox"],
-  "projects": [{"id": "example", "root": "/tmp/pa-example/project", "loopRunDirs": ["/tmp/pa-example/loop-run"]}],
+  "projects": [{
+    "id": "example", "root": "/tmp/pa-example/project", "loopRunDirs": ["/tmp/pa-example/loop-run"],
+    "loop": {
+      "batchDir": "/tmp/pa-example/project/docs/batches",
+      "workspace": "/tmp/pa-example/workspace", "workspaceName": "dev",
+      "allow": ["code/"], "deny": ["code/private/"]
+    }
+  }],
   "readAllow": [],
   "readDeny": [],
   "model": {
@@ -15,7 +22,7 @@
     "dailyTokenLimit": 0
   },
   "feishu": {"mode": "fake", "userId": "owner", "url": "http://127.0.0.1:8766", "envFile": "", "pollMs": 1000, "timeoutMs": 10000},
-  "loop": {"command": "/absolute/path/to/node", "args": ["/absolute/path/to/code/agent/scripts/loop-stub.mjs", "--state", "/tmp/pa-example/loop.json"], "eventDirs": ["/tmp/pa-example/events"], "timeoutMs": 15000},
+  "loop": {"command": "/absolute/path/to/node", "args": ["/absolute/path/to/code/agent/scripts/loop-stub.mjs", "--state", "/tmp/pa-example/loop.json"], "eventDirs": ["/tmp/pa-example/events"], "timeoutMs": 15000, "actionTimeoutMs": 300000},
   "windowTokens": 100000,
   "checkpointKeep": 8,
   "maxToolRounds": 30,

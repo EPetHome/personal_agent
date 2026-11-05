@@ -5,16 +5,16 @@ export type StalledPhase = 'auth' | 'send' | 'update' | 'download-headers' | 'do
 /** Actual official SDK talks only to this loopback REST server with invented credentials. */
 export async function sdkStub() {
   let phase: StalledPhase = null, stalled = 0, closed = 0;
-  const calls: { method: string; path: string }[] = [], messages: string[] = [];
+  const calls: { method: string; path: string; body: string }[] = [], messages: string[] = [];
   const json = (res: ServerResponse, value: unknown) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(value)); };
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
       const path = req.url ?? '/', method = req.method ?? '';
-      calls.push({ method, path });
+      calls.push({ method, path, body: Buffer.concat(chunks).toString('utf8') });
       const auth = path.includes('/auth/'), download = path.includes('/resources/'), send = method === 'POST' && !auth;
-      const hangs = auth && phase === 'auth' || send && phase === 'send' || method === 'PUT' && phase === 'update' || download && (phase === 'download-headers' || phase === 'download-body');
+      const hangs = auth && phase === 'auth' || send && phase === 'send' || (method === 'PUT' || method === 'PATCH') && phase === 'update' || download && (phase === 'download-headers' || phase === 'download-body');
       if (hangs) {
         stalled++; let timer: NodeJS.Timeout | undefined;
         res.on('close', () => { closed++; clearInterval(timer); });
@@ -28,7 +28,7 @@ export async function sdkStub() {
       if (auth) { json(res, { code: 0, tenant_access_token: 'SYNTHETIC_SDK_TOKEN', expire: 7200 }); return; }
       if (download) { res.end('complete synthetic attachment'); return; }
       if (send) {
-        try { const value = JSON.parse(Buffer.concat(chunks).toString('utf8')); messages.push(JSON.parse(value.content).text); }
+        try { const value = JSON.parse(Buffer.concat(chunks).toString('utf8')); const text = JSON.parse(value.content).text; if (typeof text === 'string') messages.push(text); }
         catch { json(res, { code: 1 }); return; }
       }
       json(res, { code: 0, data: { message_id: `om_local_${calls.length}` } });

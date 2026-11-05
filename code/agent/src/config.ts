@@ -13,7 +13,7 @@ export async function loadConfig(path: string): Promise<Config> {
     model: { url: 'https://opencode.ai/inference/go/openai/v1', name: 'deepseek-v4.1-flash', timeoutMs: 60000, maxOutputTokens: 8192, dailyTokenLimit: 0, headers: {}, ...raw.model,
       auth: { type: 'pi', path: `${home}/.pi/agent/auth.json`, provider: 'opencode-go', variable: 'PA_MODEL_KEY', ...raw.model?.auth } },
     feishu: { mode: 'fake', userId: '', url: '', envFile: '', pollMs: 1000, timeoutMs: 10000, ...raw.feishu },
-    loop: { command: '', args: [], eventDirs: [], timeoutMs: 15000, ...raw.loop },
+    loop: { command: '', args: [], eventDirs: [], timeoutMs: 15000, actionTimeoutMs: 300000, ...raw.loop },
     queue: { busyMs: 10000, inputTimeoutMs: 300000, stopMs: 30000, ...raw.queue },
     intake: { watch: true, fallbackMs: 60000, maxFileBytes: 20 * 1024 * 1024, ...raw.intake },
     concurrency: { router: 1, read: 3, skill: 1, writePerDirectory: 1, ...raw.concurrency },
@@ -22,7 +22,7 @@ export async function loadConfig(path: string): Promise<Config> {
       local: { mode: 'native', url: '', ...raw.watchdog?.local } },
   };
   const paths = [c.dataDir, c.attachmentDir, ...c.inboxDirs, ...c.readAllow, ...c.readDeny, ...c.loop.eventDirs,
-    ...c.projects.flatMap(p => [p.root, ...p.loopRunDirs]), c.model.auth.path, c.feishu.envFile].filter(Boolean);
+    ...c.projects.flatMap(p => [p.root, ...p.loopRunDirs, ...(p.loop ? [p.loop.batchDir, p.loop.workspace] : [])]), c.model.auth.path, c.feishu.envFile].filter(Boolean);
   if (paths.some(p => !isAbsolute(p) || p.includes('\0'))) throw new Error('配置中的目录必须使用绝对路径');
   if (!c.feishu.userId || !['fake', 'real'].includes(c.feishu.mode)) throw new Error('必须配置本人飞书 ID 和渠道模式');
   if (c.feishu.mode === 'fake' && !localUrl(c.feishu.url)) throw new Error('假飞书只允许本地 HTTP 地址');
@@ -32,12 +32,22 @@ export async function loadConfig(path: string): Promise<Config> {
   const modelUrl = parseUrl(c.model.url);
   if (modelUrl.username || modelUrl.password) throw new Error('模型地址不能包含凭证');
   const numbers = [c.windowTokens, c.checkpointKeep, c.maxToolRounds, ...Object.values(c.queue), ...Object.values(c.intake).filter((x): x is number => typeof x === 'number'),
-    ...Object.values(c.concurrency), c.model.timeoutMs, c.model.maxOutputTokens, c.feishu.pollMs, c.feishu.timeoutMs, c.loop.timeoutMs,
+    ...Object.values(c.concurrency), c.model.timeoutMs, c.model.maxOutputTokens, c.feishu.pollMs, c.feishu.timeoutMs, c.loop.timeoutMs, c.loop.actionTimeoutMs,
     ...Object.values(c.watchdog).filter((x): x is number => typeof x === 'number')];
   if (numbers.some(n => !Number.isSafeInteger(n) || n <= 0) || c.windowTokens < 32 || c.queue.stopMs > 30000 || c.concurrency.router !== 1) throw new Error('时限/上限须为正整数；Router 并发固定 1，停止最长 30 秒');
   if (!Number.isSafeInteger(c.model.dailyTokenLimit) || c.model.dailyTokenLimit < 0) throw new Error('每日模型用量上限不合法');
   c.dataDir = await canonical(c.dataDir); c.attachmentDir = await canonical(c.attachmentDir);
-  c.projects = await Promise.all(c.projects.map(async p => ({ ...p, root: await canonical(p.root), loopRunDirs: await Promise.all(p.loopRunDirs.map(canonical)) })));
+  c.projects = await Promise.all(c.projects.map(async p => {
+    const project = { ...p, root: await canonical(p.root), loopRunDirs: await Promise.all(p.loopRunDirs.map(canonical)) };
+    if (p.loop) {
+      project.loop = { ...p.loop, batchDir: await canonical(p.loop.batchDir), workspace: await canonical(p.loop.workspace) };
+      if (!inside(project.root, project.loop.batchDir) || project.root === project.loop.batchDir || inside(project.root, project.loop.workspace) || inside(project.loop.workspace, project.root)) throw new Error('Loop 批次目录须在项目内，开发空间须独立');
+      if (!p.loop.workspaceName || !p.loop.allow?.length || !Array.isArray(p.loop.deny) || [...p.loop.allow, ...p.loop.deny].some(x => typeof x !== 'string' || !x || isAbsolute(x) || x.split(/[\\/]/).includes('..')) || p.loop.allow.some(x => !/^code(?:\/|$)/.test(x))) throw new Error('Loop scope 必须由配置限定在 code/，不能含越界路径');
+    }
+    return project;
+  }));
+  if (new Set(c.projects.map(p => p.id)).size !== c.projects.length || new Set(c.projects.map(p => p.root)).size !== c.projects.length) throw new Error('授权项目身份不能重复');
+  for (const value of Object.values(c.approval)) if (typeof value !== 'boolean') throw new Error('点头开关须为布尔值');
   c.inboxDirs = await Promise.all(c.inboxDirs.map(canonical));
   c.loop.eventDirs = await Promise.all(c.loop.eventDirs.map(canonical));
   const configReal = await canonical(c.configPath);

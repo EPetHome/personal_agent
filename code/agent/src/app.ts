@@ -46,7 +46,9 @@ export class App {
     this.store.set('feishuDisconnectedAt', Date.now());
     await this.heartbeat();
     this.heartbeatTimer = setInterval(() => { this.heartbeatWork = this.heartbeatWork.then(() => this.heartbeat()).catch(e => this.fail(e)); }, this.c.watchdog.heartbeatMs);
-    // Resume the durable in-flight checkpoint before accepting new inputs.
+    // Ambiguous worker effects are surfaced once, never replayed after restart.
+    await this.router.workers.recover();
+    // Resume durable in-flight checkpoints; waiting-for-human rows stay suspended.
     this.pump();
     this.busyTimer = setInterval(() => { this.busyWork = this.busyWork.then(() => this.busy()).catch(e => this.fail(e)); }, Math.min(1000, this.c.queue.busyMs));
     await this.channel.start(raw => {
@@ -75,8 +77,8 @@ export class App {
       try {
         row.input = await prepareAttachments(row.input, this.c, this.channel, this.store, this.controller.signal);
         if (!row.prepared) { this.store.prepared(row.id, row.input); row = this.store.row(row.id)!; }
-        await this.router.process(row, this.controller.signal);
-        this.router.remember(row); this.store.finish(row.id);
+        const state = await this.router.process(row, this.controller.signal);
+        this.router.remember(row); if (state === 'done') this.store.finish(row.id);
       } catch {
         if (this.stopping && this.controller.signal.reason instanceof Error && this.controller.signal.reason.message === 'shutdown') break; // Preserve shutdown progress, not an already timed-out input.
         this.store.log('input_failed', { inputId: row.id, outcome: '处理失败或超时，未自动重试' });

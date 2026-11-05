@@ -10,7 +10,20 @@ import { canonical, hash, inside, localUrl, post, safeName } from './util.js';
 import { DeliveryUncertain, SdkRequests, withDeadline } from './channel-http.js';
 import type { Store } from './store.js';
 
+export interface MessageCard {
+  title: string; text: string;
+  buttons: { label: string; value: Record<string, string>; disabled?: boolean }[];
+}
+function interactive(card: MessageCard) {
+  return JSON.stringify({ config: { wide_screen_mode: true, update_multi: true }, header: { title: { tag: 'plain_text', content: card.title } }, elements: [
+    { tag: 'div', text: { tag: 'plain_text', content: card.text } },
+    ...card.buttons.filter(b => b.disabled).map(b => ({ tag: 'div', text: { tag: 'plain_text', content: `${b.label}：当前不可用，请回电脑操作` } })),
+    ...(card.buttons.some(b => !b.disabled) ? [{ tag: 'action', actions: card.buttons.filter(b => !b.disabled).map(b => ({ tag: 'button', text: { tag: 'plain_text', content: b.label }, value: b.value })) }] : []),
+  ] });
+}
 export interface Channel {
+  sendCard?(card: MessageCard, key: string, signal?: AbortSignal): Promise<string>;
+  updateCard?(id: string, card: MessageCard, signal?: AbortSignal): Promise<void>;
   send(text: string, key: string, signal?: AbortSignal): Promise<string>;
   update(id: string, text: string, signal?: AbortSignal): Promise<void>;
   download(input: Input, attachment: Attachment, target: string, signal?: AbortSignal): Promise<void>;
@@ -25,6 +38,11 @@ export async function makeChannel(c: Config, store?: Store, dependencies: { cred
     let timer: NodeJS.Timeout | undefined, stopped = false, running: Promise<void> | undefined;
     let controller: AbortController | undefined;
     return {
+      async sendCard(card, key, signal) {
+        try { return await io.run(signal, async active => (await post(`${c.feishu.url}/send`, { text: card.text, card, key, userId: c.feishu.userId }, c.feishu.timeoutMs, active)).id); }
+        catch { throw new DeliveryUncertain(); }
+      },
+      async updateCard(id, card, signal) { await io.run(signal, async active => { await post(`${c.feishu.url}/update`, { id, text: card.text, card, userId: c.feishu.userId }, c.feishu.timeoutMs, active); }); },
       async send(text, key, signal) {
         try { return await io.run(signal, async active => (await post(`${c.feishu.url}/send`, { text, key, userId: c.feishu.userId }, c.feishu.timeoutMs, active)).id); }
         catch { throw new DeliveryUncertain(); }
@@ -63,6 +81,21 @@ export async function makeChannel(c: Config, store?: Store, dependencies: { cred
   const client = new sdk.Client({ appId, appSecret, logger: quiet, domain: dependencies.domain, httpInstance: io.http });
   let ws: sdk.WSClient | undefined;
   return {
+    async sendCard(card, key, signal) {
+      try {
+        return await io.run(signal, async () => {
+          const r = await client.im.message.create({ params: { receive_id_type: 'open_id' }, data: { receive_id: c.feishu.userId, msg_type: 'interactive', content: interactive(card), uuid: hash(key).slice(0, 32) } });
+          if (r.code !== 0 || !r.data?.message_id) throw new Error('飞书卡片发送失败');
+          return r.data.message_id;
+        });
+      } catch { throw new DeliveryUncertain(); }
+    },
+    async updateCard(id, card, signal) {
+      await io.run(signal, async () => {
+        const r = await client.im.message.patch({ path: { message_id: id }, data: { content: interactive(card) } });
+        if (r.code !== 0) throw new Error('飞书卡片更新失败');
+      });
+    },
     async send(text, key, signal) {
       try {
         return await io.run(signal, async () => {

@@ -130,6 +130,8 @@ test('subscriptions update mechanical fields before context; closed search only,
   const task = card('active'); task.subscriptions = [{ kind: 'loop', value: '/fixture/batch.json' }, { kind: 'message', value: 'message-1' }]; store.putTask(task);
   const closed = { ...card('closed-needle'), status: 'closed' }; store.putTask(closed);
   const event = { ...input('event'), source: 'loop' as const, status: 'paused', batchFile: '/fixture/batch.json' };
+  assert.equal(store.match(event)[0]!.status, 'running', 'matching alone must not trust an unverified worker event');
+  store.recordTaskEvent(task, event, 'paused');
   assert.equal(store.match(event)[0]!.status, 'paused'); assert.equal(store.match(event)[0]!.dispatches.length, 1);
   assert.equal(store.match({ ...input('quote'), quoteId: 'message-1' })[0]!.id, 'active');
   assert.equal(store.taskTable().length, 1); assert.equal(store.searchClosed('needle')[0]!.id, 'closed-needle');
@@ -148,6 +150,7 @@ test('Loop evidence exact registration and project run directory, blacklisted ev
 test('Loop event ingestion is incremental, deduplicated, and source subscription is attached', async t => {
   const f = await fixture({ flow: [{ text: 'quiet event' }] }); t.after(() => f.close()); const app = await f.start();
   const batchFile = join(f.project, 'batch.json'), c = card('sub'); c.subscriptions = [{ kind: 'loop', value: batchFile }]; app.store.putTask(c);
+  await writeFile(join(f.root, 'loop.json'), JSON.stringify({ v: 1, at: new Date().toISOString(), batches: [{ project: f.project, batch: { file: batchFile, name: 'b', recipe: 'develop' }, state: 'paused', stages: [{ stage: '甲', state: 'paused' }], evidence: {} }] }));
   const event = { v: 1, id: 'evt1', seq: 1, at: new Date().toISOString(), project: f.project, batch: { file: batchFile, name: 'b', recipe: 'develop' }, stage: '甲', status: 'paused', evidence: {}, detail: {}, reason: { text: 'synthetic paused' } };
   const path = join(f.events, 'stream.jsonl'); await writeFile(path, JSON.stringify(event).slice(0, 20)); await sleep(180); assert.equal(f.model.requests.length, 0);
   await writeFile(path, JSON.stringify(event) + '\n'); await until(() => app.store.row('loop:evt1')?.state === 'done');

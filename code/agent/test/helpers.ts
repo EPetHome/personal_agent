@@ -1,16 +1,24 @@
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 import { App } from '../src/app.js';
 import { fakeFeishu, scriptModel, type Script } from '../src/stubs/servers.js';
-import { sleep } from '../src/util.js';
+import { sleep, parseJson } from '../src/util.js';
 
 export async function until(test: () => boolean | Promise<boolean>, timeout = 8000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { if (await test()) return; await sleep(20); }
   assert.fail(`condition did not become true within ${timeout}ms`);
+}
+export async function settleLaunchers(dataDir: string) {
+  const dir = join(dataDir, 'worker-launches');
+  const files = await readdir(dir).catch((e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return []; throw e; });
+  for (const file of files.filter(f => /^[a-f0-9]{48}\.launch\.json$/.test(f))) {
+    const receipt = join(dir, file.replace('.launch.json', '.receipt.json'));
+    await until(async () => { try { return parseJson<{ state?: string }>(await readFile(receipt, 'utf8')).state === 'exited'; } catch { return false; } }, 8000);
+  }
 }
 export const replyScript: Script = { requireReasoning: true, flow: [{ tools: [{ name: 'reply', arguments: { text: '收到：{{text}}' } }] }, { text: 'done' }] };
 export async function fixture(script: Script = replyScript, override: Record<string, unknown> = {}) {
@@ -32,6 +40,11 @@ export async function fixture(script: Script = replyScript, override: Record<str
   return { root, project, inbox, events, run, configPath, config, raw, feishu, model, inject,
     async start() { app = await App.create(config); await app.start(); return app; },
     async stop() { await app?.stop(); app = undefined; },
-    async close() { await app?.stop(); await Promise.all([feishu.close(), model.close()]); await rm(root, { recursive: true, force: true }); },
+    async close() {
+      await app?.stop();
+      try { await settleLaunchers(config.dataDir); }
+      finally { await Promise.all([feishu.close(), model.close()]); }
+      await rm(root, { recursive: true, force: true });
+    },
   };
 }
