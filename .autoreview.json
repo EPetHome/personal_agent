@@ -1,7 +1,7 @@
 {
-  "release": "main",
+  "release": "dev",
   "workspaces": {
-    "dev分支": "../personal agent-dev分支"
+    "dev分支": "/Users/Admin/Desktop/personal agent-dev分支"
   },
   "localFiles": [],
   "methods": {
