@@ -3,22 +3,23 @@ import { open, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, resolve } from 'node:path';
 import type { Config, Material } from './types.js';
-import { canonical, hash, inside } from './util.js';
+import { canonical, hash, inside, parseJson } from './util.js';
 import type { Store } from './store.js';
-
-export class ReadDenied extends Error { constructor() { super('拒绝读取：不在授权范围内，或命中不许读名单。'); } }
+import { nameDenied, ReadDenied, type FilePolicy } from './file-policy.js';
+export { ReadDenied } from './file-policy.js';
 export class Files {
   constructor(readonly config: Config, readonly store: Store) {}
-  private nameDenied(path: string) {
-    const parts = path.replaceAll('\\', '/').toLowerCase().split('/');
-    return parts.some((part, i) => {
-      if (/^\.env/i.test(part) && !/\.(example|sample|template)$/.test(part)) return true;
-      if (['.ssh', '.aws', '.gnupg', '.npmrc', '.pypirc', '.netrc', '.git-credentials', 'keychains', 'keychain', '1password', '.1password', 'bitwarden', '.bitwarden', '私人聊天', 'private-chats', 'chats', '备份', '备份目录', 'backup', 'backups', '.backup', '.backups'].includes(part)) return true;
-      if (part.includes('备份') || /(?:^|[._-])backups?(?:$|[._-])/.test(part) || /\.(?:pem|key|crt|cer|der|p12|pfx|p8|ppk|jks|keystore|kdbx|bak|backup)$/.test(part) || /^id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?:$|\.)/.test(part)) return true;
-      if (/(?:auth|session|cookie)/.test(part) && /\.(?:json|jsonl|db|sqlite|sqlite3)(?:-(?:wal|shm))?$/.test(part)) return true;
-      if (part === '.git' && parts[i + 1] === 'config') return true;
-      return part === 'eval' && ['cases', 'runs', '待标注'].includes(parts[i + 1] ?? '');
-    });
+  private readonly nameDenied = nameDenied;
+  async policy(cwd: string, write: string[] = [], narrow: string[] = []): Promise<FilePolicy> {
+    const c = this.config, evidence: string[] = [], origins: Record<string, string> = {};
+    for (const row of this.store.db.prepare('SELECT path FROM evidence').all()) {
+      try { evidence.push(await this.check(String(row.path), true)); } catch (e) { if (!(e instanceof ReadDenied)) throw e; }
+    }
+    for (const row of this.store.db.prepare("SELECT key,value FROM kv WHERE key GLOB 'attachment-origin:*'").all()) origins[String(row.key).slice('attachment-origin:'.length)] = parseJson<{ name: string }>(String(row.value)).name;
+    return { cwd, write, evidence, origins, attachmentDir: await canonical(c.attachmentDir),
+      roots: await Promise.all([...c.projects.map(p => p.root), ...c.inboxDirs, c.attachmentDir].map(canonical)),
+      narrow: await Promise.all(c.readAllow.map(canonical)), scope: await Promise.all(narrow.map(canonical)),
+      deny: await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny].filter(Boolean).map(canonical)) };
   }
   async check(path: string, registeredEvidence = false, protocolReceipt = false) {
     const requested = resolve(path);

@@ -8,7 +8,8 @@
       "batchDir": "/tmp/pa-example/project/docs/batches",
       "workspace": "/tmp/pa-example/workspace", "workspaceName": "dev",
       "allow": ["code/"], "deny": ["code/private/"]
-    }
+    },
+    "pi": { "writeDirs": ["/tmp/pa-example/project/docs"], "skills": {} }
   }],
   "readAllow": [],
   "readDeny": [],
@@ -23,6 +24,7 @@
   },
   "feishu": {"mode": "fake", "userId": "owner", "url": "http://127.0.0.1:8766", "envFile": "", "pollMs": 1000, "timeoutMs": 10000},
   "loop": {"command": "/absolute/path/to/node", "args": ["/absolute/path/to/code/agent/scripts/loop-stub.mjs", "--state", "/tmp/pa-example/loop.json"], "eventDirs": ["/tmp/pa-example/events"], "timeoutMs": 15000, "actionTimeoutMs": 300000},
+  "pi": {"command": "pi", "args": [], "timeoutMs": 1200000, "pollMs": 1000, "startupMs": 10000, "maxTurns": 30},
   "windowTokens": 100000,
   "checkpointKeep": 8,
   "maxToolRounds": 30,

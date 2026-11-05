@@ -15,6 +15,8 @@ export class App {
   private stopping = false;
   private heartbeatTimer?: NodeJS.Timeout;
   private busyTimer?: NodeJS.Timeout;
+  private piTimer?: NodeJS.Timeout;
+  private piWork: Promise<void> = Promise.resolve();
   private heartbeatWork: Promise<void> = Promise.resolve();
   private busyWork: Promise<void> = Promise.resolve();
   private running?: Promise<void>;
@@ -62,6 +64,13 @@ export class App {
       if (!connected && since === null) this.store.set('feishuDisconnectedAt', Date.now());
     });
     await this.intake.start();
+    const pollPi = () => this.router.workers.pi.poll(input => {
+      // An observation already in flight during stop must still reach the durable
+      // queue before the worker marks it emitted. Stopping only prevents pumping.
+      if (this.store.enqueue(input) && !this.stopping) this.pump();
+    });
+    await pollPi();
+    this.piTimer = setInterval(() => { this.piWork = this.piWork.then(pollPi).catch(error => this.fail(error)); }, this.c.pi.pollMs);
   }
   receive(input: Input) { if (!this.stopping && this.store.enqueue(input)) this.pump(); }
   private pump() {
@@ -101,12 +110,13 @@ export class App {
   async stop() {
     if (this.stopping) return;
     this.stopping = true;
-    clearInterval(this.busyTimer); clearInterval(this.heartbeatTimer);
+    clearInterval(this.busyTimer); clearInterval(this.heartbeatTimer); clearInterval(this.piTimer);
     // Stop intake first; no newly acknowledged messages disappear during drain.
     const stoppingIntake = Promise.all([this.channel.stop(), this.intake.stop()]);
     const grace = setTimeout(() => this.controller?.abort(new Error('shutdown')), Math.max(1, this.c.queue.stopMs - 2000));
     try {
-      await Promise.all([stoppingIntake, this.running, this.busyWork, this.heartbeatWork]);
+      await Promise.all([stoppingIntake, this.running, this.busyWork, this.heartbeatWork, this.piWork]);
+      await this.router.workers.pi.idle(); // Detach monitoring only; never kill running Pi.
       this.release();
     } finally { clearTimeout(grace); this.router.close(); this.store.close(); }
   }

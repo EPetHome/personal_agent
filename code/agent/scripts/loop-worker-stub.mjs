@@ -4,6 +4,14 @@ import { dirname, join, relative } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`用法：node scripts/loop-worker-stub.mjs --state <构造快照JSON> --calls <调用JSONL> <查询|开工|启动|送话|续跑|停止> [批次文件] --json [--all] [--id <编号>] [--stage <原段>]
+参数：--state/--calls 仅限临时夹具；送话从 stdin 读原文到 EOF；快照 test 支持 delay、unknown、hang、afterStartMs、livePauseReady/livePauseExit；--help/-h 只显示帮助。
+常驻：通常执行一次后退出；test.hang 会挂起，启动的 livePause 模式会等待标记/构造会话结束。会操作构造 Git 仓库，但不调用真实 Loop。
+停止：前台 Ctrl-C / SIGTERM；livePause 会话按夹具记录停止，或创建 livePauseExit 标记让它自然结束，不按进程名批杀。
+帮助立即以退出码 0 结束，不读取快照/stdin，不建目录、不起子进程、不写文件。`);
+  process.exit(0);
+}
 const statePath = args[args.indexOf('--state') + 1], calls = args[args.indexOf('--calls') + 1];
 const verbs = ['查询', '开工', '启动', '送话', '续跑', '停止'];
 const index = args.findIndex(a => verbs.includes(a)), verb = args[index], rest = args.slice(index + 1);

@@ -6,7 +6,7 @@ import { hash } from './util.js';
 import { WorkerJournal, operationIdentity, DISPATCH_MANUAL_ACK } from './worker-journal.js';
 
 export interface ApprovalView { id: string; token: string; description: string; redLine: boolean; again: boolean }
-const labels: Record<string, string> = { 'waiting-approval': '等你点头', running: '进行中', paused: '卡住', 'needs-decision': '需要你决定', 'repair-limit': '没全过', done: '做完', incomplete: '没全过', cancelled: '已取消', closed: '已关闭', uncertain: '不确定', failed: '卡住', stopped: '已停止', reconciled: '已人工核销（非业务通过）' };
+const labels: Record<string, string> = { 'waiting-approval': '等你点头', running: '进行中', queued: '排队中', stopping: '正在停止', 'timed-out': '已超时', interrupted: '已中断', paused: '卡住', 'needs-decision': '需要你决定', 'repair-limit': '没全过', done: '做完', incomplete: '没全过', cancelled: '已取消', closed: '已关闭', uncertain: '不确定', failed: '卡住', stopped: '已停止', reconciled: '已人工核销（非业务通过）' };
 export class TaskMessages {
   constructor(readonly store: Store, readonly channel: Channel) {}
   view(card: TaskCard, approval?: ApprovalView): MessageCard {
@@ -18,7 +18,7 @@ export class TaskMessages {
     const identity = unknown ? `原派工编号：${unknown.id}\n原批次：${unknown.request.batchFile || '尚未取得'}\n原分支：${unknown.request.launch?.branch ?? `feat/pa-${unknown.id}`}\n原资源：${JSON.stringify(unknown.resources ?? [])}\n原启动器：${unknown.request.launch?.launcher ? `PID ${unknown.request.launch.launcher.pid}，启动时间 ${unknown.request.launch.launcher.started ?? '未能确认'}` : '未记录，须按原批次和运行记录在电脑核对'}\n原结束回执：${unknown.request.launch?.receiptFile ?? '未取得'}\n请同时核对批次、PID 与启动时间，不按进程名或仅凭 PID 猜测结束。` : '';
     const text = [`${card.title} · ${state}`, `目标：${card.goal}`, `完成标准：${card.completion}`, `边界：${card.boundary}`,
       card.worker ? `派给 ${card.worker.kind === 'loop' ? 'Loop' : card.worker.kind}：${card.worker.batchFile || '确认后开工'}` : '',
-      verified ? `分支：${verified.branch ?? '未知'}\n提交：${verified.commit ?? '未知'}\n核实结果（${verified.event}）：状态 ${verified.state} 已核对${verified.commit ? '、分支含此提交' : ''}\n各层：${JSON.stringify(verified.layers)}\n要人工验收的项：${JSON.stringify(verified.manual ?? [])}\n证据路径：${JSON.stringify(verified.evidence)}` : '',
+      verified && card.worker?.kind === 'pi' ? `Pi 原派工：${card.worker.batchFile}\n核实结果：${state}，已核对原身份与结果文件；不代表业务验收通过\n证据路径：${JSON.stringify(verified.evidence)}` : verified ? `分支：${verified.branch ?? '未知'}\n提交：${verified.commit ?? '未知'}\n核实结果（${verified.event}）：状态 ${verified.state} 已核对${verified.commit ? '、分支含此提交' : ''}\n各层：${JSON.stringify(verified.layers)}\n要人工验收的项：${JSON.stringify(verified.manual ?? [])}\n证据路径：${JSON.stringify(verified.evidence)}` : '',
       card.presentation ? `原因：${card.presentation.cause}\n真问题还是误判：${card.presentation.assessment}\n建议：${card.presentation.suggestion}` : '',
       approval ? `打算怎么做：${approval.description}\n你确认的是：本次这项操作及卡上所列状态/分支/提交；变化后不再照旧执行。` : '',
       card.waiting ? `在等：${card.waiting}` : '', card.notice ?? '', card.conclusion,

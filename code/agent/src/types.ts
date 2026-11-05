@@ -1,6 +1,7 @@
 export interface Project {
   id: string; root: string; loopRunDirs: string[];
   loop?: { batchDir: string; workspace: string; workspaceName: string; allow: string[]; deny: string[] };
+  pi?: { writeDirs: string[]; skills: Record<string, string> };
 }
 export interface Config {
   dataDir: string; attachmentDir: string; inboxDirs: string[]; projects: Project[];
@@ -8,6 +9,7 @@ export interface Config {
   model: { url: string; name: string; auth: { type: 'pi' | 'env' | 'none'; path: string; provider: string; variable: string }; headers: Record<string, string>; timeoutMs: number; maxOutputTokens: number; dailyTokenLimit: number };
   feishu: { mode: 'fake' | 'real'; userId: string; url: string; envFile: string; pollMs: number; timeoutMs: number };
   loop: { command: string; args: string[]; eventDirs: string[]; timeoutMs: number; actionTimeoutMs: number };
+  pi: { command: string; args: string[]; timeoutMs: number; pollMs: number; startupMs: number; maxTurns: number; model?: { url: string; name: string } };
   windowTokens: number; checkpointKeep: number; maxToolRounds: number;
   queue: { busyMs: number; inputTimeoutMs: number; stopMs: number };
   intake: { watch: boolean; fallbackMs: number; maxFileBytes: number };
@@ -17,7 +19,7 @@ export interface Config {
 }
 export interface Attachment { name: string; kind: 'image' | 'file'; key?: string; path?: string; mime?: string }
 export interface Input {
-  id: string; source: 'feishu' | 'inbox' | 'loop'; who: string; at: string; text: string;
+  id: string; source: 'feishu' | 'inbox' | 'loop' | 'pi'; who: string; at: string; text: string;
   messageId?: string; chatType?: string; quoteId?: string; button?: unknown;
   attachments: Attachment[]; project?: string; batchFile?: string; workerId?: string;
   status?: string; evidence?: Record<string, string>; raw?: unknown;

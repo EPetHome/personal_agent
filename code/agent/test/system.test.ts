@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join, resolve } from 'node:path';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 import { fixture, until, settleLaunchers } from './helpers.js';
@@ -26,6 +26,30 @@ async function cpu(pid: number) {
   const { stdout } = await promisify(execFile)('/bin/ps', ['-p', String(pid), '-o', 'time=']);
   const units = stdout.trim().split(':').reverse().map(Number); return units.reduce((sum, v, i) => sum + v * 60 ** i, 0);
 }
+
+test('all script --help/-h invocations exit immediately without sandbox directories, services or file writes', { timeout: 30000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'pa-v2-script-help-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const name of ['home', 'tmp', 'work', 'unbuilt']) await mkdir(join(root, name));
+  const scriptsDir = resolve('scripts'), unbuilt = join(root, 'unbuilt/sandbox.mjs');
+  await copyFile(join(scriptsDir, 'sandbox.mjs'), unbuilt); // No dist/ exists beside this copy.
+  const baseline = (await readdir(root, { recursive: true })).sort();
+  const scripts = (await readdir(scriptsDir)).filter(name => name.endsWith('.mjs')).sort((a, b) => a === 'sandbox.mjs' ? -1 : b === 'sandbox.mjs' ? 1 : a.localeCompare(b));
+  assert.ok(scripts.length >= 6, 'exercise every .mjs entry, not a manually shortened list');
+  const env = { PATH: process.env.PATH, HOME: join(root, 'home'), TMPDIR: join(root, 'tmp'), PI_CODING_AGENT_DIR: join(root, 'unused-agent'), PA_PROBE_URL: 'http://127.0.0.1:1' };
+  const run = async (file: string, args: string[]) => {
+    const running = promisify(execFile)(process.execPath, [file, ...args], { cwd: join(root, 'work'), env, timeout: 2000, killSignal: 'SIGTERM', maxBuffer: 64000 });
+    const { stdout, stderr } = await running;
+    assert.equal(running.child.killed, false, 'help must exit on its own, not return 0 only after the timeout sent SIGTERM');
+    assert.match(stdout, /用法/); assert.match(stdout, /参数/); assert.match(stdout, /常驻/); assert.match(stdout, /停止/);
+    assert.equal(stderr, ''); assert.deepEqual((await readdir(root, { recursive: true })).sort(), baseline, `${file} ${args.join(' ')} must have no filesystem effects`);
+  };
+  for (const name of scripts) for (const flag of ['--help', '-h']) await run(join(scriptsDir, name), [flag]);
+  for (const flag of ['--help', '-h']) {
+    await run(join(scriptsDir, 'sandbox.mjs'), ['--workers', '--dir', join(root, 'must-not-exist'), flag]);
+    await run(unbuilt, [flag]);
+  }
+});
 
 test('documented sandbox CLI plus main and launchd generator run entirely in a temporary directory', { timeout: 20000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'pa-v2-cli-'));

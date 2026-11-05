@@ -4,6 +4,14 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+if (process.argv.slice(2).some(arg => arg === '--help' || arg === '-h')) {
+  console.log(`用法：node scripts/probe-model.mjs [--help|-h]
+参数：PA_PROBE_URL 可覆盖模型地址；模型固定 deepseek-v4.1-flash。普通运行会读取 ~/.pi/agent/auth.json 的 opencode-go 凭据，必须另获真实调用授权。
+常驻：否，最多4次真实 API 请求，三轮工具兼容探测后退出；每次请求上限60秒，会产生费用，不能为看帮助而普通运行。
+停止：Ctrl-C / SIGTERM。
+帮助立即以退出码 0 结束，不读凭据、不联网、不建目录、不写文件。`);
+  process.exit(0);
+}
 const endpoint = process.env.PA_PROBE_URL ?? 'https://opencode.ai/inference/go/openai/v1';
 const model = 'deepseek-v4.1-flash';
 const auth = JSON.parse(await readFile(join(homedir(), '.pi/agent/auth.json'), 'utf8'));

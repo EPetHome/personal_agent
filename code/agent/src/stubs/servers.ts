@@ -132,7 +132,14 @@ export async function scriptModel(initial: Script = {}, port = 0, statePath?: st
       return value;
     };
     const tools = step.tools?.map((t, i) => ({ id: `call_${run!.turn}_${round}_${i}`, type: 'function', function: { name: t.name, arguments: JSON.stringify({ reason: '构造脚本的判断依据', plan: '按测试脚本执行', ...expand(t.arguments ?? {}) }) } }));
-    send(res, { id: `chat_${requests.length}`, object: 'chat.completion', model: request.model, choices: [{ index: 0, finish_reason: tools?.length ? 'tool_calls' : 'stop', message: { role: 'assistant', content: expand(step.text ?? ''), reasoning_content: step.reasoning_content ?? 'synthetic reasoning', ...(tools?.length ? { tool_calls: tools } : {}) } }], usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 } });
+    const usage = { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 };
+    if (request.stream === true) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const delta = { role: 'assistant', content: expand(step.text ?? ''), ...(tools?.length ? { tool_calls: tools.map((t, index) => ({ index, ...t })) } : {}) };
+      for (const chunk of [{ choices: [{ index: 0, delta, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: tools?.length ? 'tool_calls' : 'stop' }], usage }]) res.write(`data: ${JSON.stringify({ id: `chat_${requests.length}`, object: 'chat.completion.chunk', model: request.model, ...chunk })}\n\n`);
+      res.end('data: [DONE]\n\n'); return;
+    }
+    send(res, { id: `chat_${requests.length}`, object: 'chat.completion', model: request.model, choices: [{ index: 0, finish_reason: tools?.length ? 'tool_calls' : 'stop', message: { role: 'assistant', content: expand(step.text ?? ''), reasoning_content: step.reasoning_content ?? 'synthetic reasoning', ...(tools?.length ? { tool_calls: tools } : {}) } }], usage });
   }, port);
   return { ...api, requests, async close() { for (const t of timers) clearTimeout(t); await api.close(); } };
 }

@@ -8,18 +8,21 @@ import { WorkerJournal, operationIdentity, DISPATCH_MANUAL_ACK, type DispatchRev
 import { observeLaunch, type DispatchLaunch, type LaunchObservation, type OwnedLauncher } from './loop-launch.js';
 import { TaskMessages, type ApprovalView } from './cards.js';
 import { canonical, hash, parseJson } from './util.js';
+import { PiAdapter, piOptions } from './pi.js';
 
 export type WorkerAction = 'dispatch' | 'reply' | 'stop';
 export interface WorkerRequest {
   id: string; taskId: string; worker: string; action: WorkerAction; project: string; batchFile: string; stage: string | null;
   title: string; goal: string; completion: string; boundary: string; prompt: string; text: string; mode: 'send' | 'resume'; redLine: boolean; options: Record<string, unknown>;
   launch?: DispatchLaunch;
+  /** Program-only approval binding; never accepted from Router/model arguments. */
+  expectedFingerprint?: string;
 }
 export interface DispatchAcceptance { stage: string; host: string; sessionId: string; source: 'spawn-event' | 'legacy-running'; wrapper: OwnedLauncher; child?: OwnedLauncher }
 export interface DispatchProof { operation: string; bindingHash: string; evidence: { path: string; sha256: string }; state: string; phase: 'accepted' | 'exited'; acceptance?: DispatchAcceptance; terminal: boolean }
 export interface WorkerSnapshot { state: string; fingerprint: string; next?: string; executable?: boolean; resources?: string[]; resourceReleased?: boolean; active?: boolean; dispatchProof?: DispatchProof; launchObservation?: LaunchObservation; data: unknown }
 export interface WorkerEvent { project: string; batchFile: string; stage: string | null; status: string; detail: Record<string, unknown> }
-export interface WorkerReceipt { status: 'sent' | 'blocked' | 'uncertain'; reason: string }
+export interface WorkerReceipt { status: 'sent' | 'blocked' | 'uncertain'; reason: string; workerId?: string }
 /** Every adapter implements exactly these seven actions; Router never invokes CLI details. */
 export interface WorkerAdapter {
   readonly kind: string;
@@ -66,9 +69,11 @@ export class Workers {
   readonly adapters = new Map<string, WorkerAdapter>();
   readonly messages: TaskMessages;
   readonly journal: WorkerJournal;
+  readonly pi: PiAdapter;
   private readonly inFlight = new Map<string, Promise<unknown>>();
   constructor(readonly config: Config, readonly store: Store, readonly channel: Channel, readonly files: Files) {
     this.adapters.set('loop', new LoopAdapter(config, files));
+    this.pi = new PiAdapter(config, store, files); this.adapters.set('pi', this.pi);
     this.messages = new TaskMessages(store, channel);
     this.journal = new WorkerJournal(store);
   }
@@ -78,7 +83,16 @@ export class Workers {
   private id(thread: string, name: string, args: Record<string, unknown>) { return hash(JSON.stringify([thread, name, args])).slice(0, 48); }
   needsApproval(name: string, args: Record<string, unknown>) {
     const action = actionFor(name);
-    return args.redLine === true || this.config.approval[action === 'reply' ? 'send' : action];
+    if (args.redLine === true) return true;
+    const card = this.store.task(str(args, 'taskId')), kind = card?.worker?.kind ?? str(args, 'worker');
+    if (kind === 'pi' && action !== 'stop') {
+      try {
+        const options = action === 'dispatch' ? piOptions(str(args, 'options') ? parseJson(str(args, 'options')) : {}) : this.pi.job(card?.worker?.batchFile ?? '')?.plan.options;
+        if (!options || options.commands || options.network || options.editFiles.length) return true; // Capability grants cannot be auto-approved.
+        if (action === 'dispatch' && options.type === 'read') return this.config.approval.readPi;
+      } catch { return true; }
+    }
+    return this.config.approval[action === 'reply' ? 'send' : action];
   }
   async status(id: string, signal?: AbortSignal) {
     const card = this.store.task(id);
@@ -102,7 +116,7 @@ export class Workers {
     return { id: this.id(thread, name, args), taskId, worker: card?.worker?.kind ?? (str(args, 'worker') || 'loop'), action,
       project: card?.worker?.project ?? str(args, 'project'), batchFile: card?.worker?.batchFile ?? '', stage: str(args, 'stage') || null,
       title: str(args, 'title'), goal: str(args, 'goal'), completion: str(args, 'completion'), boundary: str(args, 'boundary'), prompt: str(args, 'prompt'), text: str(args, 'text'),
-      mode: str(args, 'mode') === 'send' ? 'send' : 'resume', redLine: args.redLine === true, options };
+      mode: str(args, 'mode') === 'send' ? 'send' : 'resume', redLine: args.redLine === true || (card?.worker?.kind ?? str(args, 'worker')) === 'pi' && (options.commands === true || options.network === true || Array.isArray(options.editFiles) && options.editFiles.length > 0 || action === 'reply' && !!card?.worker && !!(this.pi.job(card.worker.batchFile)?.plan.options.commands || this.pi.job(card.worker.batchFile)?.plan.options.network || this.pi.job(card.worker.batchFile)?.plan.options.editFiles.length)), options };
   }
   async prepare(thread: string, name: string, args: Record<string, unknown>, signal?: AbortSignal) {
     const request = this.request(thread, name, args), old = this.operation(request.id);
@@ -141,6 +155,15 @@ export class Workers {
   }
   view(op: WorkerOperation): ApprovalView {
     const r = op.request;
+    if (r.worker === 'pi') {
+      const options = r.action === 'dispatch' ? r.options : this.pi.job(r.batchFile)?.plan.options;
+      // SAFETY: this worker's basis data is produced by PiAdapter.status; missing
+      // proposal on old approvals is conservative (the new fingerprint expires it).
+      const proposal = (op.basis.data as { proposal?: { editVersions?: Record<string, string> } }).proposal;
+      const versions = proposal?.editVersions ? `；待确认文件版本：${JSON.stringify(proposal.editVersions)}` : '';
+      return { id: op.id, token: op.token, description: `${r.action === 'reply' ? '带本人答案新派一次 Pi（同一件活）' : r.action === 'stop' ? '按原身份停止 Pi' : `派给 Pi：${r.title}；${r.goal}；完成：${r.completion}；边界：${r.boundary}`}；权限：${JSON.stringify(options)}${versions}${r.redLine ? '；本次红线权限须明确点头；命令内部读写无法逐条保证，不携带宿主账号；改已有文件仅限所列文件及已核对版本' : ''}`,
+        redLine: r.redLine, again: false };
+    }
     return { id: op.id, token: op.token, description: r.action === 'dispatch' ? `派给 ${r.worker === 'loop' ? 'Loop' : r.worker}：${r.title}；${r.goal}；完成：${r.completion}；边界：${r.boundary}` : r.action === 'stop' ? `停止原批次 ${r.batchFile}，保留成果` : `${r.mode === 'resume' ? '续跑' : `送话到原段 ${r.stage}`}：${r.text || '再给它一轮'}；原状态 ${op.basis.state}`,
       redLine: r.redLine, again: r.action === 'reply' && r.mode === 'resume' };
   }
@@ -351,21 +374,28 @@ export class Workers {
     let receipt: WorkerReceipt;
     try {
       const adapter = this.adapter(op.request.worker);
-      if (op.request.action === 'dispatch') receipt = await adapter.dispatch(op.request, (file, launch) => {
+      const request = op.request.worker === 'pi' ? { ...op.request, expectedFingerprint: op.basis.fingerprint } : op.request;
+      if (op.request.action === 'dispatch') receipt = await adapter.dispatch(request, (file, launch) => {
         const current = this.store.task(card.id)!;
         current.worker = { kind: op.request.worker, project: op.request.project, batchFile: file };
         const subscription = op.request.worker === 'loop' ? { kind: 'loop' as const, value: file } : { kind: 'pi' as const, value: op.id };
         if (!current.subscriptions.some(s => s.kind === subscription.kind && s.value === subscription.value)) current.subscriptions.push(subscription);
         this.store.putTask(current); op.request.batchFile = file; if (launch) op.request.launch = launch; this.save(op);
       }, signal);
-      else receipt = await adapter[op.request.action](op.request, signal);
+      else receipt = await adapter[op.request.action](request, signal);
     } catch { return this.uncertain(op, '调用结果不确定，不重发；请回电脑核对原批次', signal); }
+    if (op.request.worker === 'pi' && receipt.workerId) {
+      const current = this.store.task(card.id)!;
+      current.worker = { kind: 'pi', project: op.request.project, batchFile: receipt.workerId };
+      if (!current.subscriptions.some(s => s.kind === 'pi' && s.value === receipt.workerId)) current.subscriptions.push({ kind: 'pi', value: receipt.workerId });
+      this.store.putTask(current); op.request.batchFile = receipt.workerId;
+    }
     op.state = receipt.status; op.reason = receipt.reason; this.save(op);
     const current = this.store.task(card.id)!;
     current.dispatches.push({ id: op.id, action: op.request.action, outcome: op.state, by: op.by ?? 'config', at: new Date().toISOString() });
     current.waiting = ''; current.notice = `${!op.needsApproval && receipt.status === 'sent' ? '已直接处理。' : ''}${receipt.reason}`;
     if (op.state === 'uncertain') current.status = 'uncertain';
-    else if (op.state === 'sent') current.status = op.request.action === 'stop' ? 'stopped' : 'running';
+    else if (op.state === 'sent') current.status = op.request.worker === 'pi' ? op.request.action === 'stop' ? 'stopping' : this.pi.job(op.request.batchFile)?.state === 'queued' ? 'queued' : 'running' : op.request.action === 'stop' ? 'stopped' : 'running';
     current.updated = new Date().toISOString(); this.store.putTask(current);
     this.store.log('worker_result', { operation: op.id, task: card.id, receipt });
     await this.messages.publish(card.id, op.thread, undefined, signal);
@@ -397,7 +427,13 @@ export class Workers {
         const resources = op.resources ?? op.basis.resources ?? (op.request.worker === 'loop' ? await loopResources(this.config, op.request) : []);
         if (resources.length) this.journal.retain(op, resources);
       } else if (op.resourceState === 'held' && !['executing', 'uncertain', 'sent'].includes(op.state)) this.journal.release(op.id);
-      if (op.state === 'executing') await this.uncertain(this.operation(op.id)!, '上次 PA 中断时调用未定案，不确定、不重发；请回电脑核对');
+      if (op.state === 'executing' && op.request.worker === 'pi' && this.pi.job(op.id)) {
+        const job = this.pi.job(op.id)!;
+        op.state = 'sent'; op.reason = 'Pi 原派工已持久化，继续跟踪原编号，不重派'; op.resolution = { event: `recovery:${op.id}`, reason: op.reason };
+        op.request.batchFile = job.id; this.save(op);
+        const card = this.store.task(op.request.taskId);
+        if (card) { card.worker = { kind: 'pi', project: op.request.project, batchFile: job.id }; if (!card.subscriptions.some(s => s.kind === 'pi' && s.value === job.id)) card.subscriptions.push({ kind: 'pi', value: job.id }); this.store.putTask(card); }
+      } else if (op.state === 'executing') await this.uncertain(this.operation(op.id)!, '上次 PA 中断时调用未定案，不确定、不重发；请回电脑核对');
       else if (op.state === 'uncertain') this.save(op); // Rebuild legacy per-task unresolved indexes, never from display status.
       const pending = this.operation(op.id)!;
       if (pending.state === 'uncertain' && pending.request.action === 'dispatch' && pending.request.launch) {
@@ -412,7 +448,7 @@ export class Workers {
   async cancel(id: string, input: Input, signal?: AbortSignal) {
     if (input.source !== 'feishu' || input.who !== this.config.feishu.userId) return { ok: false, reason: '只有本人来话能取消任务，worker 材料不算指令' };
     const card = this.store.task(id); if (!card) return { ok: false, reason: '未找到这件活' };
-    card.status = 'cancelled'; card.waiting = ''; card.notice = '已取消；尚未执行的点头全部作废。已在运行的 Loop 不冒充已停止，请回电脑核对或停止。'; this.store.putTask(card);
+    card.status = 'cancelled'; card.waiting = ''; card.notice = '已取消；尚未执行的点头全部作废。已在运行的 worker 不冒充已停止，请回电脑核对或另行停止。'; this.store.putTask(card);
     for (const row of this.store.db.prepare("SELECT value FROM kv WHERE key GLOB 'worker:op:*'").all()) {
       const op = parseJson<WorkerOperation>(String(row.value));
       if (op.request.taskId === id && ['planned', 'approved'].includes(op.state)) {
@@ -446,7 +482,24 @@ export class Workers {
     card.notice = op.reason; this.store.log('worker_resolution', { operation: op.id, resolution: op.resolution });
     return op.id;
   }
+  private async ingestPi(input: Input, signal?: AbortSignal) {
+    const job = input.workerId ? this.pi.job(input.workerId) : null;
+    const raw = input.raw as { fingerprint?: string } | undefined;
+    if (!job?.outcome || input.id !== `pi:${job.id}:result` || input.status !== job.state || raw?.fingerprint !== hash(JSON.stringify(job.outcome))) return false;
+    const card = this.store.task(job.task);
+    if (!card || card.worker?.batchFile !== job.id || terminal(card)) return false;
+    const op = this.operation(job.id);
+    card.waiting = job.state === 'needs-decision' ? job.outcome.answer.question ?? '需要你决定' : '';
+    card.conclusion = job.outcome.answer.summary;
+    card.notice = `${op && !op.needsApproval ? '已直接处理。' : ''}${input.text}${!job.outcome.cleaned ? '（未确认无残留，保留并发占用，请回电脑核对）' : ''}`;
+    card.presentation = job.state === 'needs-decision' ? { cause: input.text, assessment: 'Pi 已结束，不能原地等答复', suggestion: '请回答这项取舍；带本人答案在同一件活下新派一次，不自动重派' } : { cause: input.text, assessment: '按本次身份及结果文件核实，不代表业务验收通过', suggestion: job.state === 'done' ? '查看结果及证据；不合入、不推送' : '请核对本次派工日志；没有自动重派' };
+    card.verified = { event: input.id, state: job.state, stage: null, layers: null, manual: [], evidence: input.evidence ?? {}, snapshot: { operation: job.id, cleaned: job.outcome.cleaned, fingerprint: raw.fingerprint } };
+    this.store.recordTaskEvent(card, input, job.state);
+    if (!card.deferred) await this.messages.publish(card.id, input.id, this.currentApproval(card.id), signal);
+    return !card.deferred;
+  }
   async ingest(input: Input, signal?: AbortSignal) {
+    if (input.source === 'pi') return this.ingestPi(input, signal);
     if (input.source !== 'loop' || !input.project || !input.batchFile || !input.status) return true;
     const raw = input.raw as { stage?: unknown; seq?: unknown; detail?: Record<string, unknown> } | undefined;
     const event: WorkerEvent = { project: await canonical(input.project), batchFile: input.batchFile, stage: typeof raw?.stage === 'string' ? raw.stage : null, status: input.status, detail: raw?.detail ?? {} };

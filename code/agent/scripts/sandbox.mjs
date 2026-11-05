@@ -4,8 +4,17 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fakeFeishu, scriptModel } from '../dist/src/stubs/servers.js';
-const args = process.argv.slice(2), i = args.indexOf('--dir');
+const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`用法：node scripts/sandbox.mjs [--dir <空目录>] [--workers]
+参数：--dir 指定空沙盒目录，省略则在系统临时目录创建；--workers 准备构造 Git 项目和开发空间；--help/-h 只显示帮助。
+常驻：会启动本地假飞书和脚本模型，直到 Ctrl-C / SIGTERM；不会启动 PA、Pi 或真实 Loop。
+停止：向本次进程发送 SIGTERM，或在前台 Ctrl-C。不要接管道等它结束；后台运行后读 <沙盒目录>/ready.json。
+帮助立即以退出码 0 结束，不建目录、不起服务、不读写文件；无需先构建 dist。`);
+  process.exit(0);
+}
+const { fakeFeishu, scriptModel } = await import('../dist/src/stubs/servers.js');
+const i = args.indexOf('--dir');
 const root = i < 0 ? await mkdtemp(join(tmpdir(), 'pa-v2-sandbox-')) : resolve(args[i + 1]);
 await mkdir(root, { recursive: true, mode: 0o700 });
 if ((await readdir(root)).length) throw new Error('沙盒目录必须为空，拒绝覆盖已有文件');

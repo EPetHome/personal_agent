@@ -64,7 +64,7 @@ export function toWireMessages(messages: BaseMessage[]): Record<string, unknown>
   if (pending.size) throw new Error('Missing tool response');
   return wire;
 }
-async function credential(c: Config) {
+export async function credential(c: Config) {
   if (c.model.auth.type === 'none') return '';
   if (c.model.auth.type === 'env') {
     const key = process.env[c.model.auth.variable]; if (!key) throw new Error('模型凭证不可用'); return key;

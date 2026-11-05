@@ -14,6 +14,7 @@ export async function loadConfig(path: string): Promise<Config> {
       auth: { type: 'pi', path: `${home}/.pi/agent/auth.json`, provider: 'opencode-go', variable: 'PA_MODEL_KEY', ...raw.model?.auth } },
     feishu: { mode: 'fake', userId: '', url: '', envFile: '', pollMs: 1000, timeoutMs: 10000, ...raw.feishu },
     loop: { command: '', args: [], eventDirs: [], timeoutMs: 15000, actionTimeoutMs: 300000, ...raw.loop },
+    pi: { command: 'pi', args: [], timeoutMs: 1200000, pollMs: 1000, startupMs: 10000, maxTurns: 30, ...raw.pi },
     queue: { busyMs: 10000, inputTimeoutMs: 300000, stopMs: 30000, ...raw.queue },
     intake: { watch: true, fallbackMs: 60000, maxFileBytes: 20 * 1024 * 1024, ...raw.intake },
     concurrency: { router: 1, read: 3, skill: 1, writePerDirectory: 1, ...raw.concurrency },
@@ -33,6 +34,7 @@ export async function loadConfig(path: string): Promise<Config> {
   if (modelUrl.username || modelUrl.password) throw new Error('模型地址不能包含凭证');
   const numbers = [c.windowTokens, c.checkpointKeep, c.maxToolRounds, ...Object.values(c.queue), ...Object.values(c.intake).filter((x): x is number => typeof x === 'number'),
     ...Object.values(c.concurrency), c.model.timeoutMs, c.model.maxOutputTokens, c.feishu.pollMs, c.feishu.timeoutMs, c.loop.timeoutMs, c.loop.actionTimeoutMs,
+    c.pi.timeoutMs, c.pi.pollMs, c.pi.startupMs, c.pi.maxTurns,
     ...Object.values(c.watchdog).filter((x): x is number => typeof x === 'number')];
   if (numbers.some(n => !Number.isSafeInteger(n) || n <= 0) || c.windowTokens < 32 || c.queue.stopMs > 30000 || c.concurrency.router !== 1) throw new Error('时限/上限须为正整数；Router 并发固定 1，停止最长 30 秒');
   if (!Number.isSafeInteger(c.model.dailyTokenLimit) || c.model.dailyTokenLimit < 0) throw new Error('每日模型用量上限不合法');
@@ -44,12 +46,19 @@ export async function loadConfig(path: string): Promise<Config> {
       if (!inside(project.root, project.loop.batchDir) || project.root === project.loop.batchDir || inside(project.root, project.loop.workspace) || inside(project.loop.workspace, project.root)) throw new Error('Loop 批次目录须在项目内，开发空间须独立');
       if (!p.loop.workspaceName || !p.loop.allow?.length || !Array.isArray(p.loop.deny) || [...p.loop.allow, ...p.loop.deny].some(x => typeof x !== 'string' || !x || isAbsolute(x) || x.split(/[\\/]/).includes('..')) || p.loop.allow.some(x => !/^code(?:\/|$)/.test(x))) throw new Error('Loop scope 必须由配置限定在 code/，不能含越界路径');
     }
+    if (p.pi) {
+      if (!Array.isArray(p.pi.writeDirs) || !p.pi.skills || typeof p.pi.skills !== 'object' || [...p.pi.writeDirs, ...Object.values(p.pi.skills)].some(path => typeof path !== 'string' || !isAbsolute(path))) throw new Error('Pi 写目录和技能路径须由配置明确指定绝对路径');
+      project.pi = { writeDirs: await Promise.all(p.pi.writeDirs.map(canonical)), skills: Object.fromEntries(await Promise.all(Object.entries(p.pi.skills).map(async ([key, path]) => [key, await canonical(path)]))) };
+      if (project.pi.writeDirs.some(path => !inside(project.root, path) || path === project.root) || Object.values(project.pi.skills).some(path => !inside(project.root, path))) throw new Error('Pi 写目录和技能只能位于授权项目内');
+    }
     return project;
   }));
   if (new Set(c.projects.map(p => p.id)).size !== c.projects.length || new Set(c.projects.map(p => p.root)).size !== c.projects.length) throw new Error('授权项目身份不能重复');
   for (const value of Object.values(c.approval)) if (typeof value !== 'boolean') throw new Error('点头开关须为布尔值');
   c.inboxDirs = await Promise.all(c.inboxDirs.map(canonical));
   c.loop.eventDirs = await Promise.all(c.loop.eventDirs.map(canonical));
+  if (!c.pi.command || !Array.isArray(c.pi.args) || c.pi.args.some(a => typeof a !== 'string')) throw new Error('Pi 命令配置无效');
+  if (c.pi.model && (!c.pi.model.name || c.model.auth.type === 'none' && !localUrl(c.pi.model.url))) throw new Error('无凭证 Pi 只允许本地模型替身');
   const configReal = await canonical(c.configPath);
   if (inside(c.dataDir, c.attachmentDir) || inside(c.attachmentDir, c.dataDir)) throw new Error('附件目录必须独立于数据目录');
   const incoming = await Promise.all([...c.inboxDirs, ...c.loop.eventDirs].map(canonical));
