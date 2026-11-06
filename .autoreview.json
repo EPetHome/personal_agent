@@ -35,7 +35,7 @@
       },
       {
         "id": "design",
-        "path": "docs/prompt/方案-LangGraph重建.md",
+        "path": "docs/prompt/提示词-PA可靠性修复.md",
         "role": "design",
         "dependsOn": [
           "need"

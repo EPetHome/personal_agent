@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { fixture } from './helpers.js';
+import { scriptModel } from '../src/stubs/servers.js';
+import { parseJson } from '../src/util.js';
+
+test('Pi preflight: REAL Pi loads fail-closed extension, refuses direct secret read and has no shell', async t => {
+  const f = await fixture(); t.after(() => f.close());
+  const secret = join(f.project, '.ssh/id_rsa'), job = join(f.root, 'job'), agent = join(job, 'agent');
+  await mkdir(join(f.project, '.ssh')); await writeFile(secret, 'SYNTHETIC_PRIVATE_KEY_DO_NOT_READ'); await mkdir(agent, { recursive: true });
+  const model = await scriptModel({ flow: [{ tools: [{ name: 'pa_read', arguments: { path: secret } }] }, { tools: [{ name: 'bash', arguments: { command: `cat '${secret}'` } }] }, { text: '{"status":"done","summary":"没有读到秘密"}' }] }); t.after(() => model.close());
+  const app = await f.start(); const policy = await app.router.files.policy(f.config.projects[0]!.root);
+  await writeFile(join(job, 'policy.json'), JSON.stringify({ ...policy, operation: 'preflight', token: 'synthetic', commands: false, network: false, maxTurns: 10 }));
+  await writeFile(join(agent, 'settings.json'), JSON.stringify({ retry: { enabled: false }, compaction: { enabled: false }, enableInstallTelemetry: false, cacheWarming: 'off' }));
+  await writeFile(join(agent, 'models.json'), JSON.stringify({ providers: { script: { baseUrl: `${model.url}/v1`, api: 'openai-completions', apiKey: 'synthetic', models: [{ id: 'script-model', reasoning: false, input: ['text'], contextWindow: 128000, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsStore: false } }] } } }));
+  const child = spawn('pi', ['--offline', '--no-approve', '--no-context-files', '--no-extensions', '-e', resolve('dist/src/pi-permissions.js'), '--no-skills', '--no-prompt-templates', '--no-themes', '--no-mcp', '--no-session', '--tools', 'pa_read,pa_ls,pa_grep,pa_find', '--mode', 'json', '--model', 'script/script-model', '--thinking', 'off', '--', '按脚本检查'], { cwd: f.project, env: { PATH: process.env.PATH, HOME: join(job, 'home'), PI_CODING_AGENT_DIR: agent, PI_OFFLINE: '1', PI_SKIP_VERSION_CHECK: '1', PI_TELEMETRY: '0', PA_PI_JOB_DIR: job }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = ''; child.stdout.on('data', d => { stdout += d; }); child.stderr.on('data', d => { stderr += d; });
+  const timer = setTimeout(() => child.kill('SIGKILL'), 20000);
+  const code = await new Promise((accept, reject) => { child.once('error', reject); child.once('close', accept); }); clearTimeout(timer);
+  assert.equal(code, 0, stderr + stdout.slice(-5000));
+  assert.equal(stdout.includes('SYNTHETIC_PRIVATE_KEY_DO_NOT_READ'), false);
+  assert.equal(JSON.stringify(model.requests).includes('SYNTHETIC_PRIVATE_KEY_DO_NOT_READ'), false);
+  const ready = parseJson<{ tools: string[] }>(await readFile(join(job, 'ready.json'), 'utf8'));
+  assert.deepEqual(ready.tools.sort(), ['pa_read', 'pa_ls', 'pa_grep', 'pa_find'].sort());
+  assert.ok(model.requests.length >= 3); assert.ok(model.requests.every(r => !r.body.tools?.some((tool: { function: { name: string } }) => ['bash', 'pa_bash'].includes(tool.function.name))));
+  assert.match(await readFile(join(job, 'permissions.jsonl'), 'utf8'), /"kind":"denied"/);
+});

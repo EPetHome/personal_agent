@@ -1,0 +1,45 @@
+{
+  "dataDir": "/tmp/pa-example/data",
+  "attachmentDir": "/tmp/pa-example/attachments",
+  "inboxDirs": ["/tmp/pa-example/inbox"],
+  "projects": [{
+    "id": "example", "root": "/tmp/pa-example/project", "loopRunDirs": ["/tmp/pa-example/loop-run"],
+    "loop": {
+      "batchDir": "/tmp/pa-example/project/docs/batches",
+      "workspace": "/tmp/pa-example/workspace", "workspaceName": "dev",
+      "allow": ["code/"], "deny": ["code/private/"]
+    },
+    "pi": { "writeDirs": ["/tmp/pa-example/project/docs"], "skills": {} }
+  }],
+  "readAllow": [],
+  "readDeny": [],
+  "model": {
+    "url": "http://127.0.0.1:8765/v1",
+    "name": "script-model",
+    "auth": {"type": "none", "path": "/tmp/pa-example/fake-auth.json", "provider": "opencode-go", "variable": "PA_MODEL_KEY"},
+    "headers": {},
+    "timeoutMs": 60000,
+    "maxOutputTokens": 8192,
+    "dailyTokenLimit": 0
+  },
+  "feishu": {"mode": "fake", "userId": "owner", "url": "http://127.0.0.1:8766", "envFile": "", "pollMs": 1000, "timeoutMs": 10000},
+  "loop": {"command": "/absolute/path/to/node", "args": ["/absolute/path/to/code/agent/scripts/loop-stub.mjs", "--state", "/tmp/pa-example/loop.json"], "eventDirs": ["/tmp/pa-example/events"], "timeoutMs": 15000, "actionTimeoutMs": 300000},
+  "pi": {"command": "pi", "args": [], "timeoutMs": 1200000, "pollMs": 1000, "startupMs": 10000, "maxTurns": 30},
+  "windowTokens": 100000,
+  "checkpointKeep": 8,
+  "maxToolRounds": 30,
+  "queue": {"busyMs": 10000, "inputTimeoutMs": 300000, "stopMs": 30000},
+  "intake": {"watch": true, "fallbackMs": 60000, "maxFileBytes": 20971520},
+  "concurrency": {"router": 1, "read": 3, "skill": 1, "writePerDirectory": 1},
+  "approval": {"readPi": true, "send": true, "dispatch": true, "stop": true, "redLine": true},
+  "watchdog": {
+    "pollMs": 10000,
+    "heartbeatMs": 60000,
+    "heartbeatStaleMs": 120000,
+    "inputStaleMs": 300000,
+    "modelFailures": 3,
+    "feishuStaleMs": 300000,
+    "minDiskBytes": 1073741824,
+    "local": {"mode": "fake", "url": "http://127.0.0.1:8766"}
+  }
+}
