@@ -1,0 +1,54 @@
+{
+  "name": "PA可靠性修复-20261105",
+  "recipe": "develop",
+  "branch": "fix/agent-reliability",
+  "issues": [
+    "../../../issues/【bug】图文混排消息漏掉图片附件.md",
+    "../../../issues/【bug】PA缺少真实边界并给出无效配置建议.md",
+    "../../../issues/【bug】DOCX和PDF未提取正文.md",
+    "../../../issues/【bug】明确任务仍重复确认和催办.md",
+    "../../../issues/【bug】PA生成的Loop批次范围排除了结果文件.md",
+    "../../../issues/【bug】Loop恢复卡保留旧暂停建议.md"
+  ],
+  "pi": {
+    "model": "openai-codex/gpt-6.1-sol",
+    "thinking": "max",
+    "tools": "read,edit,write,bash"
+  },
+  "stages": {
+    "修复": {
+      "prompt": "../../prompt/提示词-PA可靠性修复.md",
+      "workspace": "dev分支",
+      "workflow": "with-acceptance",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/PA可靠性修复-20261105/结果.md",
+          "docs/batches/PA可靠性修复-20261105/批次.json"
+        ],
+        "deny": [
+          "AGENTS.md",
+          "CLAUDE.md",
+          ".autoreview/methods/",
+          "docs/requirements/",
+          "docs/prompt/",
+          "wiki/",
+          "eval/",
+          "docs/batches/闭环1-感知与总览-20261025/samples/",
+          "docs/batches/真实格式兼容-20261025/samples/"
+        ]
+      },
+      "acceptance": {
+        "guide": "../../prompt/提示词-PA可靠性修复.md",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "timeoutMin": 40,
+        "idleTimeoutSec": 600
+      }
+    }
+  },
+  "steps": [
+    [
+      "修复"
+    ]
+  ]
+}

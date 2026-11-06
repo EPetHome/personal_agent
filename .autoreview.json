@@ -5,14 +5,16 @@
   },
   "localFiles": [],
   "methods": {
-    "paths": [".autoreview/methods"],
+    "paths": [
+      ".autoreview/methods"
+    ],
     "selfCheck": "sh .autoreview/methods/self-check.sh",
     "probe": "node -v"
   },
-  "reviewTimeoutMin": 90,
+  "reviewTimeoutMin": 120,
   "gate": {
     "cmd": "sh .autoreview/methods/gate.sh check",
-    "timeoutMin": 10
+    "timeoutMin": 20
   },
   "acceptance": {
     "guide": "code/使用说明.md",
@@ -21,11 +23,40 @@
   "context": {
     "root": ".",
     "sources": [
-      { "id": "rules", "path": "AGENTS.md", "role": "rules" },
-      { "id": "need", "path": "docs/requirements/需求书-personal-agent.md", "role": "requirement" },
-      { "id": "design", "path": "docs/prompt/方案-闭环1-AI工作盯防.md", "role": "design", "dependsOn": ["need"] },
-      { "id": "samples", "path": "docs/batches", "role": "guide", "dependsOn": ["design"] },
-      { "id": "methods", "path": ".autoreview/methods", "role": "guide", "dependsOn": ["design"] }
+      {
+        "id": "rules",
+        "path": "AGENTS.md",
+        "role": "rules"
+      },
+      {
+        "id": "need",
+        "path": "docs/requirements/需求书-PA-LangGraph重建.md",
+        "role": "requirement"
+      },
+      {
+        "id": "design",
+        "path": "docs/prompt/提示词-PA可靠性修复.md",
+        "role": "design",
+        "dependsOn": [
+          "need"
+        ]
+      },
+      {
+        "id": "samples",
+        "path": "docs/batches",
+        "role": "guide",
+        "dependsOn": [
+          "design"
+        ]
+      },
+      {
+        "id": "methods",
+        "path": ".autoreview/methods",
+        "role": "guide",
+        "dependsOn": [
+          "design"
+        ]
+      }
     ],
     "intervalSec": 0
   }

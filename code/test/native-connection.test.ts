@@ -243,16 +243,24 @@ for (const projectName of ['构造项目', 'My Project', 'My_Project']) test(`�
   const f = await fixture(t); f.config.dispatch!.projects[0]!.name = projectName;
   const git = (...args: string[]) => { const result = spawnSync('git', args, { cwd: f.project, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' }, encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr); return result.stdout.trim(); };
   await rm(f.workspace, { recursive: true });
-  await writeFile(join(f.project, '.autoreview.json'), JSON.stringify({ workspaces: { 'dev分支': f.workspace } }));
+  // 构造项目同样提供真实可执行的门禁及默认带验收配置，不绕过安装版 Loop 的开工预检。
+  const gateScript = 'import assert from "node:assert/strict"; import { component } from "./component.ts"; assert.equal(component, 1);';
+  const gateCommand = [process.execPath, '--input-type=module', '-e', gateScript].map(arg => `'${arg.replaceAll("'", "'\\''")}'`).join(' ');
+  await writeFile(join(f.project, '.autoreview.json'), JSON.stringify({
+    workspaces: { 'dev分支': f.workspace },
+    gate: { cmd: gateCommand, timeoutMin: 1 },
+    acceptance: {},
+  }));
   git('init', '-qb', 'main'); git('config', 'user.name', 'Synthetic'); git('config', 'user.email', 'test@example.invalid'); git('add', '.'); git('commit', '-qm', 'synthetic base'); const baseline = git('rev-parse', 'main');
   const host = join(f.root, 'host.mjs'), capture = join(f.root, 'host.json');
-  await writeFile(host, `#!/usr/bin/env node\nimport {readFileSync,writeFileSync} from 'node:fs';\nconst args=process.argv.slice(2); const file=args.find(arg=>arg.startsWith('@')).slice(1);writeFileSync(${JSON.stringify(capture)},JSON.stringify({args,prompt:readFileSync(file,'utf8'),branch:process.env.AUTOREVIEW_BATCH_FILE,stage:process.env.AUTOREVIEW_STAGE}));\n`); await chmod(host, 0o700);
+  await writeFile(host, `#!/usr/bin/env node\nimport {readFileSync,writeFileSync} from 'node:fs';\nconst args=process.argv.slice(2); const file=args.find(arg=>arg.startsWith('@'))?.slice(1); const prompt=file?readFileSync(file,'utf8'):''; if(!file||prompt.startsWith('# 开工前空跑')){process.stdout.write('## 结论：通过\\n\\n## 必修\\n无\\n');process.exit(0);} writeFileSync(${JSON.stringify(capture)},JSON.stringify({args,prompt,branch:process.env.AUTOREVIEW_BATCH_FILE,stage:process.env.AUTOREVIEW_STAGE}));\n`); await chmod(host, 0o700);
   const keys = { PI_BIN: host, PERMISSION_EXTENSION: join(f.root, 'permission.ts'), PONYTAIL_EXTENSION: join(f.root, 'ponytail.ts') };
   const old = Object.fromEntries(Object.keys(keys).map(key => [key, process.env[key]])); Object.assign(process.env, keys);
   t.after(() => { for (const [key, value] of Object.entries(old)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
   await writeFile(keys.PERMISSION_EXTENSION, 'export default function(){}'); await writeFile(keys.PONYTAIL_EXTENSION, 'export default function(){}');
   const permissions = join(process.env.PI_CODING_AGENT_DIR!, 'extensions', 'pi-permission-system'); await mkdir(permissions, { recursive: true }); await writeFile(join(permissions, 'config.json'), '{"yoloMode":true}');
   // 原项目配置/权限不被生产adapter改写。只在构造home准备已授权自动权限。
+  // Loop 8e61b29 起开工会先用同一个 Pi 入口空跑评审（提示词以「# 开工前空跑」开头）；替身对空跑回一段可解析的评审结果，只记录真正派给开发段的那次。
   await recordManagedText(f.config, { id: 'task-develop', actor: 'ou_test', at: f.now(), messageId: 'task-develop', text: `${projectName}修改 \`component.ts\` 并补测试，不修改配置文件，门禁过就算完` });
   await f.tick(); await f.click((await f.latest()).redline ? 'dispatch_confirm' : 'dispatch'); await f.tick();
   for (let i = 0; i < 100 && !await lstat(capture).then(() => true, () => false); i++) await delay(30);

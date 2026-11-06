@@ -19,4 +19,12 @@ for pair in $SAMPLES; do
   export "${pair%%=*}=$ROOT/$dir"
 done
 
-exec bash code/deploy/check.sh
+bash code/deploy/check.sh
+
+# 新版 PA（LangGraph 重建，2026-11-04）：独立 package 在 code/agent/，由它自己的 check.sh 装依赖、类型检查、跑测试。
+# 甲段建立它之前不存在，此时明确打印跳过；建立之后必须通过。
+if [ -f code/agent/check.sh ]; then
+  bash code/agent/check.sh
+else
+  echo '未发现 code/agent/check.sh：新版 PA 尚未建立，本次只检查旧版。'
+fi

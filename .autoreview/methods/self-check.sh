@@ -7,6 +7,7 @@ for file in .autoreview/methods/gate.sh code/deploy/check.sh; do
 done
 sh -n .autoreview/methods/gate.sh || { echo "AUTOREVIEW_FAILURE=method 门禁脚本语法错误" >&2; exit 78; }
 bash -n code/deploy/check.sh || { echo "AUTOREVIEW_FAILURE=method check.sh 语法错误" >&2; exit 78; }
+if [ -f code/agent/check.sh ]; then bash -n code/agent/check.sh || { echo "AUTOREVIEW_FAILURE=method code/agent/check.sh 语法错误" >&2; exit 78; }; fi
 
 for dir in docs/batches/闭环1-感知与总览-20261025/samples docs/batches/真实格式兼容-20261025/samples; do
   [ -f "$dir/README.md" ] || { echo "AUTOREVIEW_FAILURE=method 场景样本不存在：$dir" >&2; exit 78; }
