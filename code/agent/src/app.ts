@@ -29,7 +29,7 @@ export class App {
       this.router = new Router(c, this.store, channel);
       this.intake = new Intake(c, this.store, this.router.files, input => {
         // A scan already accepted before stop may finish persisting, but cannot start work.
-        if (this.store.enqueue(input)) this.pump();
+        if (this.store.enqueue(input) || this.store.retryLoopSource(input)) this.pump();
       });
     } catch (error) { this.release(); this.store.close(); throw error; }
   }
@@ -72,7 +72,7 @@ export class App {
     await pollPi();
     this.piTimer = setInterval(() => { this.piWork = this.piWork.then(pollPi).catch(error => this.fail(error)); }, this.c.pi.pollMs);
   }
-  receive(input: Input) { if (!this.stopping && this.store.enqueue(input)) this.pump(); }
+  receive(input: Input) { if (!this.stopping && (this.store.enqueue(input) || this.store.retryLoopSource(input))) this.pump(); }
   private pump() {
     if (this.running || this.stopping) return;
     this.running = this.drain().catch(e => this.fail(e)).finally(() => { this.running = undefined; if (!this.stopping && this.store.pending()) this.pump(); });

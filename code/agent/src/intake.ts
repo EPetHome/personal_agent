@@ -1,6 +1,7 @@
 import { watch, type FSWatcher } from 'node:fs';
 import { lstat, open, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { readBytes } from './file-policy.js';
 import type { Config, Input } from './types.js';
 import type { Store } from './store.js';
 import type { Files } from './files.js';
@@ -8,6 +9,7 @@ import { canonical, hash } from './util.js';
 
 export class Intake {
   private watchers: FSWatcher[] = [];
+  private boundWatches = new Set<string>();
   private fallback?: NodeJS.Timeout;
   private debounce?: NodeJS.Timeout;
   private stopped = false;
@@ -30,8 +32,39 @@ export class Intake {
       if (this.stopped) return;
       for (const root of this.c.inboxDirs) await this.walk(root, false);
       for (const root of this.c.loop.eventDirs) await this.walk(root, true);
+      await this.boundLoops();
     }).catch(() => { if (!this.stopped) this.store.log('intake_failure', { outcome: '来源暂不可读；保留游标，下次兜底再收' }); });
     return this.scanPromise;
+  }
+  /** Existing bindings only. Never enumerate the kernel root or expose a raw ledger as input. */
+  private async boundLoops() {
+    for (const card of this.store.boundLoops()) {
+      const binding = card.worker!.loop!, project = this.c.projects.find(p => p.id === card.worker!.project || p.root === card.worker!.project);
+      if (!project) continue;
+      try {
+        const check = () => this.files.protocolPath(project.root, binding.ledger);
+        await check();
+        if (this.c.intake.watch && !this.boundWatches.has(binding.ledger)) {
+          const watcher = watch(dirname(binding.ledger), (_kind, file) => {
+            if (file === 'ledger.json') { clearTimeout(this.debounce); this.debounce = setTimeout(() => this.scan(), 60); }
+          });
+          watcher.on('error', () => { this.boundWatches.delete(binding.ledger); watcher.close(); });
+          this.boundWatches.add(binding.ledger); this.watchers.push(watcher);
+        }
+        const info = await lstat(binding.ledger), signature = `${info.dev}:${info.ino}:${info.mtimeMs}:${info.size}`;
+        const key = `kernel-source:${card.id}`, previous = this.store.get<string | { signature: string; revision: number }>(key, '');
+        let revision: number;
+        if (typeof previous === 'object' && previous.signature === signature) revision = previous.revision;
+        else {
+          const { data } = await readBytes(binding.ledger, check, this.c.intake.maxFileBytes);
+          const raw = JSON.parse(data.toString('utf8'));
+          if (raw.id !== binding.runId || raw.common !== binding.repository || raw.file !== binding.cardFile || !Number.isSafeInteger(raw.revision)) continue;
+          revision = raw.revision;
+          this.store.set(key, { signature, revision }); // Observed cursor only; card.sourceRevision is the verified cursor.
+        }
+        if (revision > (card.sourceRevision ?? -1)) this.receive({ id: `kernel:${hash(JSON.stringify([binding, revision]))}`, source: 'loop', who: 'loop', at: new Date().toISOString(), text: '已绑定 Loop 原执行的记录修订变化，请沿原身份核实。', project: project.root, batchFile: binding.cardFile, workerId: card.id, status: 'revision', attachments: [], raw: { kernel: 1, runId: binding.runId, revision, ledger: binding.ledger } });
+      } catch { /* Keep previous verified facts; no-event detection is a later task. */ }
+    }
   }
   private async walk(path: string, loop: boolean) {
     if (this.stopped) return;

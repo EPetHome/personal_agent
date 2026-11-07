@@ -12,16 +12,18 @@ export interface OwnedLauncher { pid: number; started?: string }
 export interface DispatchLaunch {
   operation: string; project: string; workspace: string; batchFile: string; name: string; branch: string;
   specFile: string; receiptFile: string; token: string; specHash: string; launcher?: OwnedLauncher;
+  protocol?: 'kernel:1'; repository?: string;
 }
 interface LaunchSpec {
   v: 1; operation: string; project: string; workspace: string; batchFile: string; name: string; branch: string;
-  receiptFile: string; token: string; command: string; args: string[]; log: string;
+  receiptFile: string; token: string; command: string; args: string[]; log: string; protocol?: 'kernel:1'; repository?: string;
 }
 interface LaunchReceipt {
   v: 1; operation: string; token: string; specHash: string; project: string; workspace: string; batchFile: string; name: string; branch: string;
+  kernelReceipt?: { id: string; card: string; dispatched: boolean };
   state: 'starting' | 'running' | 'exited'; wrapper: OwnedLauncher; child?: OwnedLauncher; at: string; exitCode?: number | null; signal?: string | null;
 }
-export interface LaunchObservation { ended: boolean; live: boolean; invoked?: boolean; invocationSource?: 'spawn-event' | 'legacy-running'; processes?: { wrapper: OwnedLauncher; child?: OwnedLauncher }; fingerprint: string; evidence?: { path: string; sha256: string }; description: string }
+export interface LaunchObservation { kernelReceipt?: LaunchReceipt['kernelReceipt']; ended: boolean; live: boolean; invoked?: boolean; invocationSource?: 'spawn-event' | 'legacy-running'; processes?: { wrapper: OwnedLauncher; child?: OwnedLauncher }; fingerprint: string; evidence?: { path: string; sha256: string }; description: string }
 const exec = promisify(execFile);
 export async function processStarted(pid: number) {
   try { const { stdout } = await exec('/bin/ps', ['-p', String(pid), '-o', 'lstart='], { timeout: 1000, env: { LC_ALL: 'C' } }); return stdout.trim() || undefined; }
@@ -43,7 +45,7 @@ async function privateJson<T>(path: string) {
     } finally { await fd.close(); }
   } catch { return undefined; } // An absent, corrupt or linked receipt never grants permission.
 }
-export async function prepareLaunch(c: Config, operation: string, identity: Pick<DispatchLaunch, 'project' | 'workspace' | 'batchFile' | 'name' | 'branch'>): Promise<DispatchLaunch> {
+export async function prepareLaunch(c: Config, operation: string, identity: Pick<DispatchLaunch, 'project' | 'workspace' | 'batchFile' | 'name' | 'branch' | 'protocol' | 'repository'>): Promise<DispatchLaunch> {
   const dir = join(c.dataDir, 'worker-launches');
   if (await canonical(dir) !== dir) throw new Error('启动记录目录已变化');
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -74,7 +76,7 @@ export async function observeLaunch(c: Config, binding: DispatchLaunch): Promise
   // this legacy evidence nor spawn-event evidence alone proves worker receipt.
   const legacy = !!matched && r.state === 'running' && r.child === undefined && live;
   const invoked = spawned || legacy, invocationSource = spawned ? 'spawn-event' as const : legacy ? 'legacy-running' as const : undefined;
-  return { ended, live, invoked, invocationSource, ...(invoked ? { processes: { wrapper: r!.wrapper, ...(spawned ? { child: r!.child! } : {}) } } : {}), fingerprint: hash(JSON.stringify({ spec: spec?.sha256, receipt: receipt?.sha256, ended, live, invoked, invocationSource })),
+  return { ended, live, invoked, invocationSource, ...(matched && r.kernelReceipt ? { kernelReceipt: r.kernelReceipt } : {}), ...(invoked ? { processes: { wrapper: r!.wrapper, ...(spawned ? { child: r!.child! } : {}) } } : {}), fingerprint: hash(JSON.stringify({ spec: spec?.sha256, receipt: receipt?.sha256, ended, live, invoked, invocationSource })),
     ...(ended || invoked ? { evidence: { path: binding.receiptFile, sha256: receipt!.sha256 } } : {}),
     description: ended ? `原启动调用已结束（退出码 ${r!.exitCode}），有原编号及身份绑定的结束回执；不代表业务成功` : invoked ? '原启动命令已实际创建；须再核对原批次和存活会话才能确认接收，不能据此释放占用' : live ? '原启动器仍在运行，不能人工释放占用' : '原启动结束证据不足；只能保留占用或由本人在电脑核对后人工核销' };
 }
@@ -90,7 +92,9 @@ async function runLaunch(path: string) {
     const info = await log.stat(); if (!info.isFile() || info.nlink !== 1) throw new Error('启动日志不是独立普通文件');
     // One invocation only. This detached supervisor outlives PA, and writes an
     // exit receipt only AFTER the original CLI has closed. It never relaunches.
-    const child = spawn(s.command, s.args, { cwd: s.project, env: process.env, stdio: ['ignore', log.fd, log.fd], shell: false });
+    const child = spawn(s.command, s.args, { cwd: s.project, env: process.env, stdio: ['ignore', 'pipe', log.fd], shell: false });
+    let output = '';
+    child.stdout!.on('data', (chunk: Buffer) => { if (Buffer.byteLength(output) + chunk.length <= 2 * 1024 * 1024) output += chunk.toString('utf8'); });
     const spawned = new Promise<boolean>(resolve => { child.once('spawn', () => resolve(true)); child.once('error', () => resolve(false)); });
     const done = new Promise<{ exitCode: number | null; signal: string | null }>(resolve => {
       child.once('error', () => resolve({ exitCode: null, signal: 'spawn-error' }));
@@ -103,7 +107,13 @@ async function runLaunch(path: string) {
       // Loop worker accepted it. Acceptance also requires the bound live session.
       await receipt('running', { child: invocation });
     }
-    const result = await done; await receipt('exited', { ...result, ...(invocation ? { child: invocation } : {}) });
+    const result = await done;
+    let kernelReceipt: LaunchReceipt['kernelReceipt'];
+    try {
+      const r = JSON.parse(output);
+      if (s.protocol === 'kernel:1' && r.kernel === 1 && r.ok === true && typeof r.id === 'string' && r.card === s.batchFile) kernelReceipt = { id: r.id, card: r.card, dispatched: !!r.dispatched };
+    } catch { /* Unknown receipt is not retried or invented. */ }
+    await receipt('exited', { ...result, ...(kernelReceipt ? { kernelReceipt } : {}), ...(invocation ? { child: invocation } : {}) });
   } finally { await log.close(); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

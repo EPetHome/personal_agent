@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "name": "PA基础适配与排版-20261107",
+  "nature": "开发",
+  "target": "dev",
+  "base": "chore/PA首批准备-20261107",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试",
+    "验收"
+  ],
+  "tasks": [
+    {
+      "name": "任务基础",
+      "prompt": "../../prompt/提示词-PA基础适配与排版-任务基础.md",
+      "scope": {
+        "allow": [
+          "code/",
+          "docs/batches/PA基础适配与排版-20261107/结果.md"
+        ],
+        "deny": [
+          "code/agent/src/channel.ts",
+          "code/agent/src/feishu-format.ts",
+          "code/agent/test/feishu-format.test.ts"
+        ]
+      },
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/loop-kernel.test.js dist/test/core.test.js dist/test/worker.test.js dist/test/pi.test.js dist/test/reliability.test.js"
+    },
+    {
+      "name": "飞书排版",
+      "prompt": "../../prompt/提示词-PA基础适配与排版-飞书排版.md",
+      "scope": [
+        "code/agent/src/channel.ts",
+        "code/agent/src/feishu-format.ts",
+        "code/agent/test/feishu-format.test.ts",
+        "docs/batches/PA基础适配与排版-20261107/结果.md"
+      ],
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/feishu-format.test.js dist/test/repair.test.js"
+    }
+  ],
+  "acceptance": "整批验收标准.md",
+  "limits": {
+    "开发评审": {
+      "maxRepairs": 4,
+      "timeoutMin": 120
+    },
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20,
+      "maxRecoveries": 1
+    },
+    "验收": {
+      "maxRepairs": 3,
+      "timeoutMin": 40,
+      "maxRecoveries": 1
+    }
+  }
+}

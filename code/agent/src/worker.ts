@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import type { Config, Input, TaskCard } from './types.js';
+import { isAbsolute } from 'node:path';
+import type { Config, Input, TaskCard, LoopBinding } from './types.js';
 import type { Store } from './store.js';
 import type { Channel } from './channel.js';
 import type { Files } from './files.js';
-import { LoopAdapter, LoopLookupError, currentLoopEvent, loopResources, type LoopBatch } from './loop.js';
+import { LoopAdapter, LoopLookupError, currentLoopEvent, loopResources, LOOP_UNVERIFIED_RESOURCE, type LoopBatch } from './loop.js';
 import { WorkerJournal, operationIdentity, DISPATCH_MANUAL_ACK, type DispatchReview } from './worker-journal.js';
 import { observeLaunch, type DispatchLaunch, type LaunchObservation, type OwnedLauncher } from './loop-launch.js';
 import { TaskMessages, type ApprovalView } from './cards.js';
@@ -11,21 +12,22 @@ import { canonical, hash, parseJson } from './util.js';
 import { PiAdapter, piOptions } from './pi.js';
 import { SafeError, failure } from './errors.js';
 import { turns } from './context.js';
+import { kernelFingerprint, repository, selectKernel, type KernelFacts } from './loop-kernel.js';
 import { ownerInstruction, redLineText, requestHash, type InstructionConfirmation } from './confirmation.js';
 
 export type WorkerAction = 'dispatch' | 'reply' | 'stop';
 export interface WorkerRequest {
   id: string; taskId: string; worker: string; action: WorkerAction; project: string; batchFile: string; stage: string | null;
   title: string; goal: string; completion: string; boundary: string; prompt: string; text: string; mode: 'send' | 'resume'; redLine: boolean; options: Record<string, unknown>;
-  launch?: DispatchLaunch;
+  launch?: DispatchLaunch; loopBinding?: LoopBinding; sourceTaskId?: string; lookupKernel?: boolean;
   /** Program-only approval binding; never accepted from Router/model arguments. */
   expectedFingerprint?: string;
 }
 export interface DispatchAcceptance { stage: string; host: string; sessionId: string; source: 'spawn-event' | 'legacy-running'; wrapper: OwnedLauncher; child?: OwnedLauncher }
 export interface DispatchProof { operation: string; bindingHash: string; evidence: { path: string; sha256: string }; state: string; phase: 'accepted' | 'exited'; acceptance?: DispatchAcceptance; terminal: boolean }
-export interface WorkerSnapshot { state: string; fingerprint: string; next?: string; executable?: boolean; resources?: string[]; resourceReleased?: boolean; active?: boolean; dispatchProof?: DispatchProof; launchObservation?: LaunchObservation; data: unknown }
+export interface WorkerSnapshot { loopBinding?: LoopBinding; unavailableReason?: string; state: string; fingerprint: string; next?: string; executable?: boolean; resources?: string[]; resourceReleased?: boolean; active?: boolean; dispatchProof?: DispatchProof; launchObservation?: LaunchObservation; data: unknown }
 export interface WorkerEvent { project: string; batchFile: string; stage: string | null; status: string; detail: Record<string, unknown> }
-export interface WorkerReceipt { status: 'sent' | 'blocked' | 'uncertain'; reason: string; workerId?: string }
+export interface WorkerReceipt { status: 'sent' | 'blocked' | 'uncertain'; reason: string; workerId?: string; snapshot?: WorkerSnapshot }
 /** Every adapter implements exactly these seven actions; Router never invokes CLI details. */
 export interface WorkerAdapter {
   readonly kind: string;
@@ -131,11 +133,19 @@ export class Workers {
     const pending = this.journal.unresolved(id).map(op => this.operation(op)).find(op => op?.state === 'uncertain' && op.request.action === 'dispatch');
     if (pending) {
       const probe = await this.probeDispatch(pending, signal);
-      if (probe.snapshot) await this.reconcileDispatch(pending, probe.snapshot, `status:${id}`, signal);
+      if (probe.snapshot) {
+        if (probe.snapshot.loopBinding) this.refreshKernelCard(card, probe.snapshot, `status:${id}`);
+        await this.reconcileDispatch(pending, probe.snapshot, `status:${id}`, signal);
+      }
       return { ok: !!probe.snapshot, snapshot: probe.snapshot, reason: probe.description, card: this.store.task(id) };
     }
     const request = this.request(`status:${id}`, 'worker_reply', { taskId: id, mode: 'send' });
-    return { ok: true, snapshot: await this.adapter(request.worker).status(request, signal) };
+    const snapshot = await this.adapter(request.worker).status(request, signal);
+    if (snapshot.loopBinding) {
+      if (((snapshot.data as LoopBatch).kernel?.revision ?? -1) < (card.sourceRevision ?? -1)) return { ok: false, reason: '来源返回旧修订，保留最后核实事实；未作当前状态使用', card };
+      this.refreshKernelCard(card, snapshot, `status:${id}`);
+    }
+    return { ok: true, snapshot, card: this.store.task(id) };
   }
   private request(thread: string, name: string, args: Record<string, unknown>): WorkerRequest {
     const action = actionFor(name), taskId = str(args, 'taskId');
@@ -151,7 +161,9 @@ export class Workers {
     const request: WorkerRequest = { id: this.id(thread, name, args), taskId, worker, action,
       project: card?.worker?.project ?? str(args, 'project'), batchFile: card?.worker?.batchFile ?? '', stage: str(args, 'stage') || null,
       title: str(args, 'title'), goal: str(args, 'goal'), completion: str(args, 'completion'), boundary: str(args, 'boundary'), prompt: str(args, 'prompt'), text: str(args, 'text'),
-      mode: str(args, 'mode') === 'send' ? 'send' : 'resume', redLine: args.redLine === true, options: worker === 'pi' && action === 'dispatch' ? { ...piOptions(options) } : options };
+      mode: str(args, 'mode') === 'send' ? 'send' : 'resume', redLine: args.redLine === true, options: worker === 'pi' && action === 'dispatch' ? { ...piOptions(options) } : options,
+      ...(card?.worker?.loop ? { loopBinding: card.worker.loop } : {}),
+      ...(card?.worker?.operation && this.operation(card.worker.operation)?.request.launch ? { launch: this.operation(card.worker.operation)!.request.launch } : {}), ...(str(args, 'sourceTaskId') ? { sourceTaskId: str(args, 'sourceTaskId') } : {}) };
     request.redLine = this.requiresExplicitApproval(request);
     return request;
   }
@@ -187,7 +199,13 @@ export class Workers {
     }
     const basis = await this.adapter(request.worker).status(request, signal);
     if (request.action === 'dispatch' && basis.state !== 'idle') throw new SafeError('resource_busy', '项目已有运行的批次，未并行开工');
-    if (basis.executable === false) throw new SafeError('not_executable', 'worker 当前不能接受这项操作；授权或手工事项请回电脑处理');
+    if (basis.executable === false) throw new SafeError('not_executable', basis.unavailableReason ?? 'worker 当前不能接受这项操作；授权或手工事项请回电脑处理');
+    if (basis.loopBinding) {
+      if (((basis.data as LoopBatch).kernel?.revision ?? -1) < (card?.sourceRevision ?? -1)) throw new SafeError('stale_source', '来源修订倒退，控制不可用；保留最后核实事实');
+      request.loopBinding = basis.loopBinding;
+      if (this.journal.unresolvedExecution(basis.loopBinding).length) throw new SafeError('uncertain', '同一原执行有未核实操作，不重复控制');
+      if (card && !card.worker!.loop) { card.worker!.loop = basis.loopBinding; this.store.putTask(card); }
+    }
     if (!card) {
       card = { id: request.taskId, title: request.title, goal: request.goal, completion: request.completion, boundary: request.boundary, status: 'waiting-approval', waiting: '', dispatches: [], conclusion: '', updated: new Date().toISOString(), subscriptions: [], worker: { kind: request.worker, project: request.project, batchFile: '' } };
       this.store.putTask(card);
@@ -213,7 +231,8 @@ export class Workers {
       return { id: op.id, token: op.token, description: `${r.action === 'reply' ? '带本人答案新派一次 Pi（同一件活）' : r.action === 'stop' ? '按原身份停止 Pi' : `派给 Pi：${r.title}；${r.goal}；完成：${r.completion}；边界：${r.boundary}`}；权限：${JSON.stringify(options)}${versions}${r.redLine ? '；本次红线权限须明确点头；命令内部读写无法逐条保证，不携带宿主账号；改已有文件仅限所列文件及已核对版本' : ''}`,
         redLine: r.redLine, again: false };
     }
-    return { id: op.id, token: op.token, description: r.action === 'dispatch' ? `派给 ${r.worker === 'loop' ? 'Loop' : r.worker}：${r.title}；${r.goal}；完成：${r.completion}；边界：${r.boundary}` : r.action === 'stop' ? `停止原批次 ${r.batchFile}，保留成果` : `${r.mode === 'resume' ? '续跑' : `送话到原段 ${r.stage}`}：${r.text || '再给它一轮'}；原状态 ${op.basis.state}`,
+    const target = r.loopBinding?.taskId ? `任务 ${r.loopBinding.taskId}` : '整批';
+    return { id: op.id, token: op.token, description: r.action === 'dispatch' ? `派给 ${r.worker === 'loop' ? 'Loop' : r.worker}：${r.title}；${r.goal}；完成：${r.completion}；边界：${r.boundary}` : r.action === 'stop' ? `停止原${target} ${r.batchFile}，保留成果` : `${r.mode === 'resume' ? '续跑' : `送话到原段 ${r.stage}`}：${r.text || '再给它一轮'}；原状态 ${op.basis.state}`,
       redLine: r.redLine, again: r.action === 'reply' && r.mode === 'resume' };
   }
   private currentApproval(taskId: string) {
@@ -350,16 +369,40 @@ export class Workers {
     }
     if (definition(card) !== op.definition) return this.stale(op, '任务定义或派工身份已变化，旧点头作废', signal);
     if (this.journal.unresolved(card.id).some(id => id !== op.id)) return this.stale(op, '原操作结果不确定、尚未按编号核销，不重发', signal);
+    if (op.request.worker === 'loop' && op.request.action === 'dispatch') await this.compatibleLoopLeases();
     const resources = op.request.action === 'dispatch' ? op.basis.resources ?? (op.request.worker === 'loop' ? await loopResources(this.config, op.request) : []) : [];
     if (!resources.length) return this.executeGuarded(op, signal);
     // Hold ALL actual project/workspace resources across recheck AND dispatch.
     // A launch whose outcome is unknown keeps its durable lease across restart.
     await this.reconcileResources(resources, signal);
-    if (!this.journal.reserve(op.id, resources)) return this.stale(op, '项目或开发空间仍被原派工占用或启动未核销，未开工；请先核对原批次', signal);
+    if (!this.journal.reserve(op.id, resources, op.request.worker === 'loop' ? [LOOP_UNVERIFIED_RESOURCE] : [])) return this.stale(op, '项目或开发空间仍被原派工占用或启动未核销，未开工；请先核对原批次', signal);
     try { return await this.executeGuarded(this.operation(op.id)!, signal); }
     finally {
       const latest = this.operation(op.id)!;
       if (!['executing', 'sent', 'uncertain'].includes(latest.state)) this.journal.release(op.id);
+    }
+  }
+  private async loopLeaseResources(op: WorkerOperation) {
+    const saved = [...new Set([...(op.resources ?? []), ...(op.basis.resources ?? [])])];
+    const origins = [...new Set([...saved.filter(key => key.startsWith('loop:project:')).map(key => key.slice('loop:project:'.length)),
+      ...(op.request.launch?.project ? [op.request.launch.project] : []), ...(typeof op.request.project === 'string' && isAbsolute(op.request.project) ? [op.request.project] : [])])];
+    const aliases: string[] = []; let unverified = !origins.length;
+    for (const origin of origins) {
+      try {
+        if (await canonical(origin) !== origin) throw new Error('原项目路径变化');
+        const identity = await repository(this.config, origin);
+        if (identity.top !== origin) throw new Error('原仓库根身份不可核对');
+        aliases.push(`loop:project:${origin}`, `loop:repository:${identity.common}`);
+      } catch { unverified = true; }
+    }
+    // Never replace the old keys or guess from a current project display ID.
+    // Unknown historical ownership blocks new Loop claims, not ordinary Pi work.
+    return [...new Set([...saved, ...aliases, ...(unverified ? [LOOP_UNVERIFIED_RESOURCE] : [])])];
+  }
+  private async compatibleLoopLeases() {
+    for (const row of this.store.db.prepare("SELECT value FROM kv WHERE key GLOB 'worker:op:*' AND json_extract(value,'$.request.worker')='loop' AND json_extract(value,'$.request.action')='dispatch' AND json_extract(value,'$.state') IN ('executing','uncertain','sent')").all()) {
+      const op = parseJson<WorkerOperation>(String(row.value));
+      if (op.resourceState !== 'released') this.journal.retain(op, await this.loopLeaseResources(op));
     }
   }
   private async reconcileResources(resources: string[], signal?: AbortSignal) {
@@ -370,7 +413,7 @@ export class Workers {
       if (owner.state === 'uncertain') { if (snapshot) await this.reconcileDispatch(owner, snapshot, `resource-check:${id}`, signal); }
       else if (snapshot?.resourceReleased === true && (!owner.request.launch || snapshot.dispatchProof?.phase === 'exited' && snapshot.dispatchProof.terminal)) {
         const proof = snapshot.dispatchProof;
-        const resolution: WorkerResolution | undefined = proof ? { event: `resource-release:${id}`, reason: '原调用已退出且原批次为终态、无存活段，释放占用', by: 'program', at: new Date().toISOString(), dispatchPhase: 'exited', bindingHash: proof.bindingHash, evidence: proof.evidence } : undefined;
+        const resolution: WorkerResolution | undefined = proof ? { event: `resource-release:${id}`, reason: snapshot.loopBinding ? '原启动调用已退出，原执行消费者结束已核实；释放 PA 执行占用，保留成果目录，不代表业务验收' : '原调用已退出且原批次为终态、无存活段，释放占用', by: 'program', at: new Date().toISOString(), dispatchPhase: 'exited', bindingHash: proof.bindingHash, evidence: proof.evidence } : undefined;
         if (this.journal.release(id, true, resolution)) this.store.log('worker_resource_release', { operation: id, resolution });
       }
       else if (owner.request.launch && !probe.active && !probe.observation?.ended) await this.uncertain(owner, '原批次已不活动，但原启动结束证据不足，占用保留；请在原卡核对后人工核销，不重发', signal);
@@ -380,6 +423,10 @@ export class Workers {
     let snapshot: WorkerSnapshot | undefined, lookupActive = false, lookupFingerprint = 'unavailable';
     try { snapshot = await this.adapter(op.request.worker).status({ ...op.request, action: 'reply' }, signal); }
     catch (error) { if (error instanceof LoopLookupError) { lookupActive = error.active; lookupFingerprint = error.fingerprint; } }
+    const facts = (snapshot?.data as LoopBatch | undefined)?.kernel;
+    if (facts && facts.revision < (this.store.task(op.request.taskId)?.sourceRevision ?? -1)) {
+      lookupActive = snapshot?.active === true; lookupFingerprint = 'stale-source-revision'; snapshot = undefined;
+    }
     const observation = snapshot?.launchObservation ?? (op.request.launch ? await observeLaunch(this.config, op.request.launch) : undefined);
     const active = lookupActive || snapshot?.active === true || ['running', 'started', 'resumed'].includes(snapshot?.state ?? '') || observation?.live === true;
     const description = `${snapshot ? `原批次查询状态：${snapshot.state}` : '原批次仍无法核实'}；${observation?.description ?? '旧派工没有完整启动结束回执'}`;
@@ -391,6 +438,7 @@ export class Workers {
       if (manual) card.status = 'reconciled';
       else if (snapshot?.state === 'done') card.status = card.verified?.state === 'done' ? card.status : 'incomplete';
       else if (snapshot) card.status = snapshot.state;
+      if (snapshot?.loopBinding) this.refreshKernelCard(card, snapshot, `dispatch:${op.id}`);
     }
     card.waiting = ''; card.notice = op.reason;
     card.dispatches.push({ id: op.id, outcome: manual ? 'manual-reconciliation' : 'dispatch-reconciliation', resolution: op.resolution });
@@ -408,7 +456,7 @@ export class Workers {
     const proof = snapshot.dispatchProof;
     if (owner.state !== 'uncertain' || owner.request.worker !== 'loop' || !owner.request.launch || !proof || proof.operation !== owner.id || proof.bindingHash !== hash(JSON.stringify(owner.request.launch))) return false;
     const reason = proof.phase === 'accepted'
-      ? `原派工 ${owner.id} 已用原启动记录及当前存活会话核实已接收，不以原调用退出为前提；当前 ${proof.state}，不重发原开工/启动，继续保留开发空间占用；不代表业务验收通过`
+      ? `原派工 ${owner.id} 已用原启动记录及当前存活会话核实已接收，不以原调用退出为前提；当前 ${proof.state}，不重发原开工/启动，继续保留 PA 执行占用；不代表工作区已清理或业务验收通过`
       : `原派工 ${owner.id} 已按原启动结束回执及原批次身份核销；当前 ${proof.state}，不重发原开工/启动${proof.terminal ? '，已释放占用' : '，仍保留运行中资源占用'}；不代表业务验收通过`;
     const resolved = this.journal.resolveDispatch(owner.id, operationIdentity(owner), { event: source, reason, by: 'program', at: new Date().toISOString(), dispatchPhase: proof.phase, acceptance: proof.acceptance, bindingHash: proof.bindingHash, evidence: proof.evidence }, proof.terminal, op => this.resolutionCard(op, snapshot));
     if (!resolved) return false;
@@ -438,10 +486,10 @@ export class Workers {
     let receipt: WorkerReceipt;
     try {
       const adapter = this.adapter(op.request.worker);
-      const request = op.request.worker === 'pi' ? { ...op.request, expectedFingerprint: op.basis.fingerprint } : op.request;
+      const request = { ...op.request, expectedFingerprint: op.basis.fingerprint };
       if (op.request.action === 'dispatch') receipt = await adapter.dispatch(request, (file, launch) => {
         const current = this.store.task(card.id)!;
-        current.worker = { kind: op.request.worker, project: op.request.project, batchFile: file };
+        current.worker = { kind: op.request.worker, project: op.request.project, batchFile: file, operation: op.id, origin: 'pa' };
         const subscription = op.request.worker === 'loop' ? { kind: 'loop' as const, value: file } : { kind: 'pi' as const, value: op.id };
         if (!current.subscriptions.some(s => s.kind === subscription.kind && s.value === subscription.value)) current.subscriptions.push(subscription);
         this.store.putTask(current); op.request.batchFile = file; if (launch) op.request.launch = launch; this.save(op);
@@ -454,13 +502,18 @@ export class Workers {
       if (!current.subscriptions.some(s => s.kind === 'pi' && s.value === receipt.workerId)) current.subscriptions.push({ kind: 'pi', value: receipt.workerId });
       this.store.putTask(current); op.request.batchFile = receipt.workerId;
     }
+    if (receipt.snapshot?.loopBinding) op.request.loopBinding = receipt.snapshot.loopBinding;
     op.state = receipt.status; op.reason = receipt.reason; this.save(op);
     const current = this.store.task(card.id)!;
     current.dispatches.push({ id: op.id, action: op.request.action, outcome: op.state, by: op.by ?? 'config', at: new Date().toISOString() });
     current.waiting = ''; current.notice = `${!op.needsApproval && receipt.status === 'sent' ? '已直接处理。' : ''}${receipt.reason}`;
     if (op.state === 'uncertain') current.status = 'uncertain';
-    else if (op.state === 'sent') current.status = op.request.worker === 'pi' ? op.request.action === 'stop' ? 'stopping' : this.pi.job(op.request.batchFile)?.state === 'queued' ? 'queued' : 'running' : op.request.action === 'stop' ? 'stopped' : 'running';
+    else if (op.state === 'sent') {
+      if (op.request.loopBinding) current.status = op.request.action === 'stop' ? op.request.loopBinding.taskId ? current.status : 'stopped' : 'resume-requested';
+      else current.status = op.request.worker === 'pi' ? op.request.action === 'stop' ? 'stopping' : this.pi.job(op.request.batchFile)?.state === 'queued' ? 'queued' : 'running' : op.request.action === 'stop' ? 'stopped' : 'running';
+    }
     current.updated = new Date().toISOString(); this.store.putTask(current);
+    if (receipt.snapshot?.loopBinding) this.refreshKernelCard(current, receipt.snapshot, `receipt:${op.id}`);
     this.store.log('worker_result', { operation: op.id, task: card.id, receipt });
     await this.messages.publish(card.id, op.thread, undefined, signal);
     return { ok: op.state === 'sent', status: op.state, reason: op.reason, card: current };
@@ -488,7 +541,7 @@ export class Workers {
     for (const row of this.store.db.prepare("SELECT value FROM kv WHERE key GLOB 'worker:op:*'").all()) {
       const op = parseJson<WorkerOperation>(String(row.value));
       if (op.request.action === 'dispatch' && op.resourceState !== 'released' && ['executing', 'uncertain', 'sent'].includes(op.state)) {
-        const resources = op.resources ?? op.basis.resources ?? (op.request.worker === 'loop' ? await loopResources(this.config, op.request) : []);
+        const resources = op.request.worker === 'loop' ? await this.loopLeaseResources(op) : op.resources ?? op.basis.resources ?? [];
         if (resources.length) this.journal.retain(op, resources);
       } else if (op.resourceState === 'held' && !['executing', 'uncertain', 'sent'].includes(op.state)) this.journal.release(op.id);
       if (op.state === 'executing' && op.request.worker === 'pi' && this.pi.job(op.id)) {
@@ -579,7 +632,57 @@ export class Workers {
     if (!card.deferred) await this.messages.publish(card.id, input.id, this.currentApproval(card.id), signal);
     return !card.deferred;
   }
+  async trackLoop(project: string, batchFile: string, sourceTaskId?: string, signal?: AbortSignal) {
+    const request: WorkerRequest = { id: '', taskId: '', worker: 'loop', action: 'reply', lookupKernel: true, project, batchFile, sourceTaskId, stage: null, title: '', goal: '', completion: '', boundary: '', prompt: '', text: '', mode: 'resume', redLine: false, options: {} };
+    const snapshot = await this.adapter('loop').status(request, signal), binding = snapshot.loopBinding;
+    if (!binding) throw new SafeError('unverified', '旧记录没有新版执行身份；保留原记录，控制不可用');
+    const facts = (snapshot.data as LoopBatch).kernel!;
+    if (!sourceTaskId && facts.tasks.length > 1) throw new SafeError('ambiguous_target', '多任务须指定来源任务 ID，不将整批当一件任务');
+    const actual = binding.taskId ?? facts.tasks[0]!.id, selected = { ...binding, taskId: actual };
+    const id = `loop-${hash(JSON.stringify(selected)).slice(0, 24)}`;
+    const old = this.store.task(id) ?? this.store.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.loop.runId')=? AND json_extract(body,'$.worker.loop.repository')=?").all(binding.runId, binding.repository).map(r => parseJson<TaskCard>(String(r.body))).find(t => t.worker?.loop?.cardFile === binding.cardFile && (t.worker.loop.taskId === actual || t.worker.loop.taskId === null && facts.tasks.length === 1));
+    if (old) return old;
+    const p = this.config.projects.find(p => p.id === project || p.root === project)!;
+    const task = facts.tasks.find(t => t.id === actual)!;
+    const card: TaskCard = { id, title: task.name, goal: '跟踪本人在获准仓库启动的原 Loop 任务', completion: '分别核对执行、技术检查、发布和业务验收，不以可合入冒充业务完成', boundary: '原项目授权内；不合入、不推送、不部署', status: task.state, waiting: '', dispatches: [], conclusion: '', updated: facts.verifiedAt,
+      subscriptions: [{ kind: 'loop', value: batchFile }], worker: { kind: 'loop', project: p.root, batchFile: binding.cardFile, loop: selected, origin: 'owner-loop' } };
+    this.store.putTask(card); this.refreshKernelCard(card, { ...snapshot, loopBinding: selected }, `bind:${id}`); return this.store.task(id)!;
+  }
+  private refreshKernelCard(card: TaskCard, snapshot: WorkerSnapshot, event: string) {
+    const facts = (snapshot.data as LoopBatch).kernel, binding = snapshot.loopBinding;
+    if (!facts || !binding || terminal(card)) return false;
+    const selected = selectKernel(facts, binding).task;
+    card.worker!.loop = binding;
+    return this.store.applyLoopSnapshot(card, facts.revision, kernelFingerprint(facts, binding.taskId), () => {
+      card.status = selected?.state ?? facts.state; card.lastVerifiedAt = facts.verifiedAt; card.control = `查询、按原对象停止；${facts.resumeBlocked ? `普通续跑不可用：${facts.resumeBlocked}` : '仅无新增要求且无发布后果的续跑'}；送话/合入/推送/部署不可用`;
+      card.verified = { event, state: card.status, stage: null, layers: { execution: selected ?? facts.tasks, checks: facts.checks, results: facts.results, missing: facts.missing, publication: facts.publication, businessAcceptance: '未验证' }, manual: facts.acceptanceItems, evidence: facts.evidence, snapshot: facts };
+      card.dispatches.push({ event, revision: facts.revision, runId: binding.runId, sourceTaskId: binding.taskId, at: facts.verifiedAt });
+      card.updated = facts.verifiedAt;
+    });
+  }
+  private async ingestKernel(input: Input, signal?: AbortSignal) {
+    const raw = input.raw as { runId?: string; revision?: number; ledger?: string };
+    const card = input.workerId ? this.store.task(input.workerId) : undefined, binding = card?.worker?.loop;
+    if (!card || !binding || raw.runId !== binding.runId || raw.ledger !== binding.ledger || !Number.isSafeInteger(raw.revision)) return false;
+    if (raw.revision! <= (card.sourceRevision ?? -1)) { this.store.loopVerification(input, false); return false; }
+    this.store.loopVerification(input, true); // Durable observation is not yet successful verification.
+    const request = this.request(`kernel:${input.id}`, 'worker_reply', { taskId: card.id, mode: 'resume' });
+    const snapshot = await this.adapter('loop').status(request, signal), facts = (snapshot.data as LoopBatch).kernel;
+    if (!facts || facts.revision < raw.revision!) throw new SafeError('unverified', '原修订尚不能核实，保留只读重核');
+    const changed = this.refreshKernelCard(card, snapshot, input.id);
+    this.store.loopVerification(input, false); // Clear BEFORE any Router turn/control/notification can start.
+    if (!changed) return false;
+    const pendingId = this.store.get<string | null>(`worker:pending:${card.id}`, null), pending = pendingId ? this.operation(pendingId) : null;
+    if (pending?.state === 'planned' && pending.basis.fingerprint !== snapshot.fingerprint) {
+      pending.state = 'stale'; pending.reason = '原执行版本变化，旧点头作废'; this.save(pending); this.resumeReadyGroup(pending.thread);
+    }
+    await this.reconcileTaskDispatches(card.id, input.id, signal, false);
+    return !card.deferred;
+  }
   async ingest(input: Input, signal?: AbortSignal) {
+    if (input.source === 'loop' && (input.raw as { kernel?: number } | undefined)?.kernel === 1) {
+      try { return await this.ingestKernel(input, signal); } catch (error) { signal?.throwIfAborted(); this.store.log('worker_unverified', { inputId: input.id, failure: failure(error) }); return false; }
+    }
     if (input.source === 'pi') return this.ingestPi(input, signal);
     if (input.source !== 'loop' || !input.project || !input.batchFile || !input.status) return true;
     const raw = input.raw as { stage?: unknown; seq?: unknown; detail?: Record<string, unknown> } | undefined;
@@ -590,6 +693,7 @@ export class Workers {
     const report = ['paused', 'needs-decision', 'repair-limit', 'done', 'failed'].includes(event.status);
     try {
       snapshot = await adapter.status(request, signal);
+      if ((snapshot.data as LoopBatch).kernel) throw new SafeError('invalid_event', '旧事件不控制新版卡；只接已绑定 ledger 修订');
       const expected = event.status === 'queue' || (activeStates.includes(event.status) ? activeStates.includes(snapshot.state) : snapshot.state === event.status);
       const lastSeq = (snapshot.data as LoopBatch).events?.lastSeq;
       if (raw?.stage !== undefined && raw.stage !== null && (typeof raw.stage !== 'string' || !raw.stage.trim())) throw new SafeError('invalid_event', '事件中的段标识无效');

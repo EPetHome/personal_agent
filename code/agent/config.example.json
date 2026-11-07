@@ -6,7 +6,7 @@
     "id": "example", "root": "/tmp/pa-example/project", "loopRunDirs": ["/tmp/pa-example/loop-run"],
     "loop": {
       "batchDir": "/tmp/pa-example/project/docs/batches",
-      "workspace": "/tmp/pa-example/workspace", "workspaceName": "dev",
+      "base": "dev",
       "allow": ["code/"], "deny": ["code/private/"]
     },
     "pi": { "writeDirs": ["/tmp/pa-example/project/docs"], "skills": {} }

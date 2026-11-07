@@ -57,6 +57,18 @@ export class Store {
     if (result.changes) this.log('input', input);
     return !!result.changes;
   }
+  loopVerification(input: Input, pending: boolean) { this.set(`kernel:verification:${input.id}`, pending); }
+  /** Retry ONLY the read-only pre-Router verification stage. Its marker is
+   * cleared before any model/tool turn, so done actions/notifications never replay. */
+  retryLoopSource(input: Input) {
+    const row = this.row(input.id), previous = row?.input;
+    if (!row || !['done', 'failed'].includes(row.state) || input.source !== 'loop' || previous?.source !== 'loop'
+      || !this.get<boolean>(`kernel:verification:${input.id}`, false)) return false;
+    const identity = (i: Input) => { const raw = i.raw as { kernel?: number; runId?: string; revision?: number; ledger?: string } | undefined;
+      return raw?.kernel === 1 ? JSON.stringify([i.workerId, i.batchFile, raw.runId, raw.revision, raw.ledger]) : undefined; };
+    if (!identity(input) || identity(input) !== identity(previous)) return false;
+    return !!this.db.prepare("UPDATE inputs SET state='pending',started=NULL,finished=NULL WHERE id=? AND state IN ('done','failed')").run(input.id).changes;
+  }
   decode(row: Row | undefined): QueueRow | undefined { return row && { id: String(row.id), seq: Number(row.seq), state: String(row.state), input: parseJson<Input>(String(row.body)), prepared: Boolean(row.prepared), started: row.started === null ? null : Number(row.started) }; }
   row(id: string) { return this.decode(this.db.prepare('SELECT * FROM inputs WHERE id=?').get(id)); }
   next() { return this.decode(this.db.prepare("SELECT * FROM inputs WHERE state IN ('pending','processing') ORDER BY CASE WHEN state='processing' THEN 0 ELSE 1 END,priority,seq LIMIT 1").get()); }
@@ -88,6 +100,20 @@ export class Store {
       const card = this.task(id); if (!card) return [];
       return [card];
     });
+  }
+  /** JSON-only additive enrichment; no schema rewrite or second task ledger. */
+  applyLoopSnapshot(card: TaskCard, revision: number, fingerprint: string, update: () => void) {
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.task(card.id);
+      if (!current || revision <= (current.sourceRevision ?? -1)) { if (own) this.db.exec('COMMIT'); return false; }
+      update(); card.sourceRevision = revision; card.sourceFingerprint = fingerprint;
+      this.putTask(card); if (own) this.db.exec('COMMIT'); return true;
+    } catch (error) { if (own) this.db.exec('ROLLBACK'); throw error; }
+  }
+  boundLoops() {
+    return this.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.loop.protocol')='kernel:1' AND status NOT IN ('closed','cancelled','reconciled')").all().map(r => parseJson<TaskCard>(String(r.body)));
   }
   recordTaskEvent(card: TaskCard, input: Input, status: string) {
     this.db.exec('BEGIN IMMEDIATE');

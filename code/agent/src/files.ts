@@ -51,6 +51,16 @@ export class Files {
     if (c.readAllow.length && !c.readAllow.some(root => inside(root, actual))) throw new ReadDenied();
     return actual;
   }
+  /** Protocol-only read gate. Does not grant the model access to a ledger/root. */
+  async protocolPath(projectRoot: string, path: string) {
+    const project = this.config.projects.find(p => p.root === projectRoot);
+    const actual = await canonical(path), policy = await this.policy(projectRoot);
+    if (!project || actual !== resolve(path) || nameDenied(path) || nameDenied(actual)
+      || policy.deny.some(root => inside(root, actual))
+      || this.config.readAllow.length && !this.config.readAllow.some(root => inside(root, actual))
+      || ![project.root, ...project.loopRunDirs].some(root => inside(root, actual))) throw new ReadDenied();
+    return actual;
+  }
   async registerEvidence(projectRoot: string, paths: Record<string, string>) {
     const root = await canonical(projectRoot);
     const project = this.config.projects.find(p => resolve(p.root) === root);

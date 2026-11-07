@@ -12,6 +12,7 @@ import type { Store } from './store.js';
 import { imageType } from './image.js';
 import { nameDenied, readBytes } from './file-policy.js';
 import { failure } from './errors.js';
+import { feishuText } from './feishu-format.js';
 
 export interface MessageCard {
   title: string; text: string;
@@ -47,10 +48,10 @@ export async function makeChannel(c: Pick<Config, 'feishu' | 'intake'>, store?: 
       },
       async updateCard(id, card, signal) { await io.run(signal, async active => { await post(`${c.feishu.url}/update`, { id, text: card.text, card, userId: c.feishu.userId }, c.feishu.timeoutMs, active); }); },
       async send(text, key, signal) {
-        try { return await io.run(signal, async active => (await post(`${c.feishu.url}/send`, { text, key, userId: c.feishu.userId }, c.feishu.timeoutMs, active)).id); }
+        try { return await io.run(signal, async active => (await post(`${c.feishu.url}/send`, { text: feishuText(text), key, userId: c.feishu.userId }, c.feishu.timeoutMs, active)).id); }
         catch { throw new DeliveryUncertain(); }
       },
-      async update(id, text, signal) { await io.run(signal, async active => { await post(`${c.feishu.url}/update`, { id, text, userId: c.feishu.userId }, c.feishu.timeoutMs, active); }); },
+      async update(id, text, signal) { await io.run(signal, async active => { await post(`${c.feishu.url}/update`, { id, text: feishuText(text), userId: c.feishu.userId }, c.feishu.timeoutMs, active); }); },
       async download(_input, attachment, target, signal) {
         await io.run(signal, async active => {
           const response = await fetch(`${c.feishu.url}/assets/${encodeURIComponent(attachment.key ?? '')}`, { signal: active });
@@ -102,7 +103,7 @@ export async function makeChannel(c: Pick<Config, 'feishu' | 'intake'>, store?: 
     async send(text, key, signal) {
       try {
         return await io.run(signal, async () => {
-          const r = await client.im.message.create({ params: { receive_id_type: 'open_id' }, data: { receive_id: c.feishu.userId, msg_type: 'text', content: JSON.stringify({ text }), uuid: hash(key).slice(0, 32) } });
+          const r = await client.im.message.create({ params: { receive_id_type: 'open_id' }, data: { receive_id: c.feishu.userId, msg_type: 'text', content: JSON.stringify({ text: feishuText(text) }), uuid: hash(key).slice(0, 32) } });
           if (r.code !== 0 || !r.data?.message_id) throw new Error('飞书发送失败（原始响应不记录）');
           return r.data.message_id;
         });
@@ -110,7 +111,7 @@ export async function makeChannel(c: Pick<Config, 'feishu' | 'intake'>, store?: 
     },
     async update(id, text, signal) {
       await io.run(signal, async () => {
-        const r = await client.im.message.update({ path: { message_id: id }, data: { msg_type: 'text', content: JSON.stringify({ text }) } });
+        const r = await client.im.message.update({ path: { message_id: id }, data: { msg_type: 'text', content: JSON.stringify({ text: feishuText(text) }) } });
         if (r.code !== 0) throw new Error('飞书更新失败（原始响应不记录）');
       });
     },

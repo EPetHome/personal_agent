@@ -11,7 +11,7 @@ export const CONFIG_FIELDS: Record<string, string[]> = Object.fromEntries(Object
   pi: 'command args timeoutMs pollMs startupMs maxTurns model', 'pi.model': 'url name',
   queue: 'busyMs inputTimeoutMs stopMs', intake: 'watch fallbackMs maxFileBytes', concurrency: 'router read skill writePerDirectory',
   approval: 'readPi send dispatch stop redLine', watchdog: 'pollMs heartbeatMs heartbeatStaleMs inputStaleMs modelFailures feishuStaleMs minDiskBytes local',
-  'watchdog.local': 'mode url', project: 'id root loopRunDirs loop pi', 'project.loop': 'batchDir workspace workspaceName allow deny', 'project.pi': 'writeDirs skills',
+  'watchdog.local': 'mode url', project: 'id root loopRunDirs loop pi', 'project.loop': 'batchDir workspace workspaceName base allow deny', 'project.pi': 'writeDirs skills',
 }).map(([key, value]) => [key, value.split(' ')]));
 export class ConfigError extends SafeError { constructor(message: string) { super('invalid_config', message); } }
 function fields(value: unknown, label: string) {
@@ -66,7 +66,7 @@ async function businessConfig(path: string): Promise<Config> {
     approval: { readPi: true, send: true, dispatch: true, stop: true, ...raw.approval, redLine: true },
   };
   const paths = [c.dataDir, c.attachmentDir, ...c.inboxDirs, ...c.readAllow, ...c.readDeny, ...c.loop.eventDirs,
-    ...c.projects.flatMap(p => [p.root, ...p.loopRunDirs, ...(p.loop ? [p.loop.batchDir, p.loop.workspace] : [])]), c.model.auth.path, c.feishu.envFile].filter(Boolean);
+    ...c.projects.flatMap(p => [p.root, ...p.loopRunDirs, ...(p.loop ? [p.loop.batchDir, ...(p.loop.workspace ? [p.loop.workspace] : [])] : [])]), c.model.auth.path, c.feishu.envFile].filter(Boolean);
   if (paths.some(p => typeof p !== 'string' || !isAbsolute(p) || p.includes('\0'))) throw new ConfigError('配置中的目录必须使用绝对路径');
   if (!['pi', 'env', 'none'].includes(c.model.auth.type)) throw new ConfigError('模型凭证来源不支持');
   if (c.model.auth.type === 'none' && !localUrl(c.model.url)) throw new ConfigError('无凭证模式只允许本地模型替身');
@@ -80,9 +80,10 @@ async function businessConfig(path: string): Promise<Config> {
   c.projects = await Promise.all(c.projects.map(async p => {
     const project = { ...p, root: await canonical(p.root), loopRunDirs: await Promise.all(p.loopRunDirs.map(canonical)) };
     if (p.loop) {
-      project.loop = { ...p.loop, batchDir: await canonical(p.loop.batchDir), workspace: await canonical(p.loop.workspace) };
-      if (!inside(project.root, project.loop.batchDir) || project.root === project.loop.batchDir || inside(project.root, project.loop.workspace) || inside(project.loop.workspace, project.root)) throw new ConfigError('Loop 批次目录须在项目内，开发空间须独立');
-      if (!p.loop.workspaceName || !p.loop.allow?.length || !Array.isArray(p.loop.deny) || [...p.loop.allow, ...p.loop.deny].some(x => typeof x !== 'string' || !x || isAbsolute(x) || x.split(/[\\/]/).includes('..')) || p.loop.allow.some(x => !/^code(?:\/|$)/.test(x))) throw new ConfigError('Loop scope 必须由配置限定在 code/，不能含越界路径');
+      project.loop = { ...p.loop, batchDir: await canonical(p.loop.batchDir), ...(p.loop.workspace ? { workspace: await canonical(p.loop.workspace) } : {}) };
+      if (!inside(project.root, project.loop.batchDir) || project.root === project.loop.batchDir || project.loop.workspace && (inside(project.root, project.loop.workspace) || inside(project.loop.workspace, project.root))) throw new ConfigError('Loop 批次目录须在项目内，旧开发空间须独立');
+      if (p.loop.base && (!/^[\w\p{L}./-]+$/u.test(p.loop.base) || p.loop.base.includes('..') || p.loop.base.startsWith('-') || /^(?:refs\/heads\/)?main$/.test(p.loop.base))) throw new ConfigError('Loop base 必须是合法的非 main 分支');
+      if (!p.loop.allow?.length || !Array.isArray(p.loop.deny) || [...p.loop.allow, ...p.loop.deny].some(x => typeof x !== 'string' || !x || isAbsolute(x) || x.split(/[\\/]/).includes('..')) || p.loop.allow.some(x => !/^code(?:\/|$)/.test(x))) throw new ConfigError('Loop scope 必须由配置限定在 code/，不能含越界路径');
     }
     if (p.pi) {
       if (!Array.isArray(p.pi.writeDirs) || !p.pi.skills || typeof p.pi.skills !== 'object' || [...p.pi.writeDirs, ...Object.values(p.pi.skills)].some(path => typeof path !== 'string' || !isAbsolute(path))) throw new ConfigError('Pi 写目录和技能路径须由配置明确指定绝对路径');

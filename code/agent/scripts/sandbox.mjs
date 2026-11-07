@@ -26,13 +26,14 @@ const workers = args.includes('--workers'), workspace = join(await realpath(root
 if (workers) {
   const git = (...a) => execFileSync('git', ['-C', project, '-c', 'core.hooksPath=/dev/null', '-c', 'user.name=PA Stub', '-c', 'user.email=stub@example.invalid', ...a], { stdio: 'pipe' });
   await mkdir(join(project, 'code')); await writeFile(join(project, 'code/README.md'), '# Synthetic project\n');
-  await writeFile(join(project, '.autoreview.json'), JSON.stringify({ workspaces: { dev: workspace }, gate: { cmd: 'true' } }));
-  git('init', '-b', 'main'); git('add', '.'); git('commit', '-m', 'synthetic sandbox'); git('worktree', 'add', '--detach', workspace);
+  await writeFile(join(project, '.gitignore'), '.autoreview.json\n');
+  await writeFile(join(project, '.autoreview.json'), JSON.stringify({ acceptance: {} }));
+  git('init', '-b', 'dev'); git('add', '.'); git('commit', '-m', 'synthetic sandbox'); git('worktree', 'add', '--detach', workspace);
 }
-await writeFile(snapshot, JSON.stringify({ v: 1, at: new Date().toISOString(), batches: workers ? [] : [1, 2, 3].map(n => ({ project, batch: { name: `fixture-${n}`, file: join(project, `batch-${n}.json`), recipe: 'develop' }, state: 'running', stages: [], evidence: {} })), ...(workers ? { test: { root, project, workspace } } : {}) }, null, 2));
+await writeFile(snapshot, JSON.stringify({ v: 1, at: new Date().toISOString(), batches: workers ? [] : [1, 2, 3].map(n => ({ project, batch: { name: `fixture-${n}`, file: join(project, `batch-${n}.json`), recipe: 'develop' }, state: 'running', stages: [], evidence: {} })), ...(workers ? { test: { root, project, workspace, run: await realpath(join(root, 'loop-run')) } } : {}) }, null, 2));
 const config = {
   dataDir: join(root, 'data'), attachmentDir: join(root, 'attachments'), inboxDirs: [join(root, 'inbox')],
-  projects: [{ id: 'fixture', root: project, loopRunDirs: [join(root, 'loop-run')], ...(workers ? { loop: { batchDir: join(project, 'docs/batches'), workspace, workspaceName: 'dev', allow: ['code/'], deny: ['code/private/'] } } : {}) }], readAllow: [], readDeny: [],
+  projects: [{ id: 'fixture', root: project, loopRunDirs: [join(root, 'loop-run')], ...(workers ? { loop: { batchDir: join(project, 'docs/batches'), base: 'dev', allow: ['code/'], deny: ['code/private/'] } } : {}) }], readAllow: [], readDeny: [],
   model: { url: `${model.url}/v1`, name: 'script-model', auth: { type: 'none' }, timeoutMs: 60000, maxOutputTokens: 8192, dailyTokenLimit: 0 },
   feishu: { mode: 'fake', userId: 'owner', url: feishu.url, pollMs: 250, timeoutMs: 10000 },
   loop: { command: process.execPath, args: [fileURLToPath(new URL(workers ? './loop-worker-stub.mjs' : './loop-stub.mjs', import.meta.url)), '--state', snapshot, '--calls', join(root, 'loop-calls.jsonl')], eventDirs: [join(root, 'events')], timeoutMs: 15000 },

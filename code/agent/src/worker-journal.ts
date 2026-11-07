@@ -1,4 +1,5 @@
 import type { Store } from './store.js';
+import type { LoopBinding } from './types.js';
 import type { WorkerOperation, WorkerResolution } from './worker.js';
 import { hash } from './util.js';
 
@@ -22,11 +23,20 @@ export class WorkerJournal {
     try { const result = run(); if (own) this.store.db.exec('COMMIT'); return result; }
     catch (error) { if (own) this.store.db.exec('ROLLBACK'); throw error; }
   }
+  private executionKey(binding: LoopBinding) { return `worker:execution-unresolved:${hash(JSON.stringify([binding.repository, binding.runId, binding.cardFile]))}`; }
+  unresolvedExecution(binding: LoopBinding) {
+    return this.store.get<string[]>(this.executionKey(binding), []).filter(id => {
+      const op = this.operation(id), target = op?.request.loopBinding;
+      return !op || unresolvedState(op) && (!target || binding.taskId === null || target.taskId === null || target.taskId === binding.taskId);
+    });
+  }
   private index(op: WorkerOperation) {
-    const key = unresolvedKey(op.request.taskId), old = this.store.get<string[]>(key, []);
-    const ids = new Set(old);
-    if (unresolvedState(op)) ids.add(op.id); else ids.delete(op.id);
-    if (JSON.stringify([...ids]) !== JSON.stringify(old)) this.store.set(key, [...ids]);
+    const keys = [unresolvedKey(op.request.taskId), ...(op.request.loopBinding ? [this.executionKey(op.request.loopBinding)] : [])];
+    for (const key of keys) {
+      const old = this.store.get<string[]>(key, []), ids = new Set(old);
+      if (unresolvedState(op)) ids.add(op.id); else ids.delete(op.id);
+      if (JSON.stringify([...ids]) !== JSON.stringify(old)) this.store.set(key, [...ids]);
+    }
   }
   write(op: WorkerOperation) {
     this.transaction(() => {
@@ -44,20 +54,24 @@ export class WorkerJournal {
   claim(op: WorkerOperation, expected: WorkerOperation['state']) {
     return this.transaction(() => {
       if (this.unresolved(op.request.taskId).some(id => id !== op.id)) return false;
+      const execution = op.request.loopBinding;
+      if (execution && this.unresolvedExecution(execution).some(id => id !== op.id)) return false;
+      const controlKey = execution ? `worker:execution-use:${hash(JSON.stringify([op.thread, op.request.action, execution]))}` : undefined;
+      if (controlKey && this.store.get<string>(controlKey, op.id) !== op.id) return false;
       const confirmationKey = op.confirmation ? `worker:instruction-use:${hash(JSON.stringify([op.confirmation.inputId, op.confirmation.sourceHash]))}` : undefined;
       if (confirmationKey && this.store.get<string>(confirmationKey, op.id) !== op.id) return false;
       const changed = this.store.db.prepare("UPDATE kv SET value=? WHERE key=? AND json_extract(value,'$.state')=?").run(JSON.stringify(op), operationKey(op.id), expected);
-      if (changed.changes) { this.index(op); if (confirmationKey) this.store.set(confirmationKey, op.id); }
+      if (changed.changes) { this.index(op); if (confirmationKey) this.store.set(confirmationKey, op.id); if (controlKey) this.store.set(controlKey, op.id); }
       return !!changed.changes;
     });
   }
   owners(resources: string[]) {
     return [...new Set(resources.flatMap(key => this.store.get<string[]>(leaseKey(key), [])))];
   }
-  reserve(id: string, resources: string[]) {
+  reserve(id: string, resources: string[], blockers: string[] = []) {
     return this.transaction(() => {
       const op = this.operation(id);
-      if (!op || !['planned', 'approved'].includes(op.state) || this.owners(resources).some(owner => owner !== id)) return false;
+      if (!op || !['planned', 'approved'].includes(op.state) || this.owners([...resources, ...blockers]).some(owner => owner !== id)) return false;
       op.resources = resources; op.resourceState = 'held'; this.write(op);
       for (const key of resources) this.store.set(leaseKey(key), [id]);
       return true;

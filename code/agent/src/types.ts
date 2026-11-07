@@ -1,6 +1,6 @@
 export interface Project {
   id: string; root: string; loopRunDirs: string[];
-  loop?: { batchDir: string; workspace: string; workspaceName: string; allow: string[]; deny: string[] };
+  loop?: { batchDir: string; workspace?: string; workspaceName?: string; base?: string; allow: string[]; deny: string[] };
   pi?: { writeDirs: string[]; skills: Record<string, string> };
 }
 export interface Config {
@@ -25,11 +25,15 @@ export interface Input {
   status?: string; evidence?: Record<string, string>; raw?: unknown;
 }
 export interface QueueRow { id: string; seq: number; state: string; input: Input; prepared: boolean; started: number | null }
+export interface LoopBinding {
+  protocol: 'kernel:1'; repository: string; runId: string; cardFile: string; ledger: string; taskId: string | null;
+}
 export interface TaskCard {
   id: string; title: string; goal: string; completion: string; boundary: string; status: string;
   waiting: string; dispatches: unknown[]; conclusion: string; updated: string;
   subscriptions: { kind: 'loop' | 'pi' | 'message'; value: string }[];
-  worker?: { kind: string; project: string; batchFile: string };
+  worker?: { kind: string; project: string; batchFile: string; loop?: LoopBinding; operation?: string; origin?: 'pa' | 'owner-loop' };
+  sourceRevision?: number; sourceFingerprint?: string; lastVerifiedAt?: string; control?: string;
   verified?: { event: string; state: string; stage: string | null; branch?: string; commit?: string; layers: unknown; manual: unknown; evidence: Record<string, string>; snapshot: unknown };
   presentation?: { cause: string; assessment: string; suggestion: string };
   notice?: string; deferred?: boolean;

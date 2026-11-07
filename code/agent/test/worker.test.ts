@@ -11,7 +11,9 @@ import { loadConfig } from '../src/config.js';
 import { makeChannel, type MessageCard } from '../src/channel.js';
 import { sdkStub } from './sdk-stub.js';
 import type { WorkerAdapter, WorkerRequest } from '../src/worker.js';
-import { observeLaunch } from '../src/loop-launch.js';
+import { observeLaunch, prepareLaunch, spawnLaunch } from '../src/loop-launch.js';
+import { command, loopEnvironment, loopScope, loopResources } from '../src/loop.js';
+import { hash } from '../src/util.js';
 import { DISPATCH_MANUAL_ACK } from '../src/worker-journal.js';
 import type { TaskCard } from '../src/types.js';
 
@@ -45,7 +47,34 @@ async function workerFixture(script: Script = dispatchFlow) {
   const click = async (id: string, value: Record<string, string>, messageId?: string) => f.inject({ id, quoteId: messageId ?? f.feishu.messages[0]!.id, button: { value } });
   const waitApproval = async (app: App) => until(() => !!app.store.db.prepare("SELECT 1 FROM inputs WHERE state='waiting'").get() && !!f.feishu.messages[0]?.card?.buttons.some(b => b.label === '好'));
   const approveValue = () => f.feishu.messages[0]!.card!.buttons.find(b => b.label === '好')!.value;
-  return { ...f, project, workspace, state, snapshot, save, calls, readState, writeState, event, seed, click, waitApproval, approveValue };
+  // Frozen pre-upgrade producer for LEGACY record regressions below. It is a local
+  // execution substitute, not the product dispatcher. New dispatch/CLI/identity
+  // behavior is exercised through the real adapter in loop-kernel.test.ts.
+  const start = async () => {
+    const app = await f.start(), adapter = app.router.workers.adapters.get('loop')!;
+    app.router.workers.adapters.set('loop', { ...adapter, kind: 'loop',
+      status: async (r, signal) => {
+        if (r.action !== 'dispatch') return adapter.status(r, signal);
+        const active = (await readState()).batches.filter((b: any) => b.state === 'running' || b.stages.some((s: any) => s.session?.alive));
+        return { state: active.length ? 'busy' : 'idle', fingerprint: hash(JSON.stringify(active)), resources: await loopResources(f.config, r), data: active };
+      },
+      progress: adapter.progress.bind(adapter), ask: adapter.ask.bind(adapter), result: adapter.result.bind(adapter), reply: adapter.reply.bind(adapter), stop: adapter.stop.bind(adapter),
+      dispatch: async (r, bind, signal) => {
+        const key = `pa-${r.id}`, dir = join(batchDir, key), file = join(dir, '批次.json'), paths = loopScope(f.config.projects[0]!, r.id), branch = `feat/${key}`;
+        await mkdir(dir, { recursive: true }); await writeFile(join(dir, '提示词.md'), r.prompt);
+        await writeFile(file, JSON.stringify({ name: key, recipe: 'develop', branch, stages: { 开发: { workspace: 'dev', scope: paths.scope } }, steps: [['开发']] })); bind(file);
+        const opened = JSON.parse(await command(f.config.loop.command, [...f.config.loop.args, '开工', file, '--json'], f.config.loop.actionTimeoutMs, project, undefined, signal));
+        if (!opened.ok) return { status: 'uncertain', reason: '构造旧开工回执未知，不重发' };
+        const target = join(workspace, 'docs/batches', key, '批次.json'); bind(target);
+        let launch = await prepareLaunch(f.config, r.id, { project, workspace, batchFile: target, name: key, branch }); bind(target, launch);
+        launch = await spawnLaunch(launch, loopEnvironment()); bind(target, launch);
+        try { if ((await adapter.status({ ...r, action: 'reply', batchFile: target, launch }, signal)).dispatchProof) return { status: 'sent', reason: '构造旧执行已接收' }; } catch {}
+        return { status: 'uncertain', reason: '构造旧启动接收未知，不重发' };
+      },
+    });
+    return app;
+  };
+  return { ...f, start, project, workspace, state, snapshot, save, calls, readState, writeState, event, seed, click, waitApproval, approveValue };
 }
 
 async function pairedTasks(f: Awaited<ReturnType<typeof workerFixture>>) {

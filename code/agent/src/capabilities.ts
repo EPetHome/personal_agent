@@ -21,7 +21,8 @@ export function capabilities(c: Config, tools: string[]) {
         try { return { id: p.id, dispatch: true, ...loopScope(p, '<原操作编号>'), rule: '仅配置的 code/ 范围及原批次结果/元数据；其余 docs/ 不在 allow，不能开放整个 docs/；deny 优先' }; }
         catch (error) { return { id: p.id, dispatch: false, configuredAllow: p.loop.allow, deny: [...p.loop.deny, ...LOOP_DENY], ...failure(error) }; }
       }),
-      sensing: ['有有效事件时可核实暂停、失败、恢复和完成；事件与查询状态不一致时只记日志，不主动通知', '无有效事件时，尚无独立发现外部 Loop 进程消失或长期无进展的检测'] },
+      protocol: { dispatch: 'version:1 单任务卡；开发评审/验收；不提交、不推送、不部署', query: 'kernel:1 + 原 ledger 最小字段核对；旧 v1 历史保留', control: '新版按原对象停止；仅冻结流程无发布节点/发布事务/待改卡时可安全续跑；send/合入/推送/部署不可用', verification: 'get_task/worker_status 可查原身份、sourceRevision、lastVerifiedAt、各层欠项；技术状态不是业务验收' },
+      sensing: ['有有效事件时可核实旧记录；新版只监听 track_loop/PA 自派已绑定 ledger 的普通修订，事件与查询不一致时不主动通知', '全来源新任务自动发现、长期关注尚未实现；无有效事件时，尚无独立异常检测/无进展检测'] },
     configuration: { fields: Object.fromEntries(Object.entries(CONFIG_FIELDS).map(([key, fields]) => [key, fields.join(' ')])), rules: ['未知/不生效字段拒绝加载', 'projects[].pi.writeDirs 仅项目内部子目录，不能是项目根或项目外目录', 'approval 不改变目录/工具权限；redLine 永远问', 'Loop 不依赖普通 Pi 的写目录', '证据范围只沿用现有登记，不从事件自动扩权'] },
     approval: c.approval,
   };

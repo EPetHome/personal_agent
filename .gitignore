@@ -16,3 +16,6 @@ issues/
 /eval/cases/
 /eval/runs/
 /eval/待标注/
+
+# Loop 本机配置（新版开发卡）
+/.autoreview.json
