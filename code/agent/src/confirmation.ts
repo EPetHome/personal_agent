@@ -2,6 +2,8 @@ import type { Config, Input } from './types.js';
 import type { WorkerRequest } from './worker.js';
 import { hash } from './util.js';
 
+/** Issued only by the authenticated original-card callback, never model arguments. */
+export interface CardStopConfirmation { dispatch: string; token: string; messageId: string; targetHash: string; inputId: string }
 export interface InstructionConfirmation {
   kind: 'owner-instruction'; inputId: string; messageId: string; who: string; quote: string; sourceHash: string;
   taskId: string; requestHash: string; scopeFingerprint: string;

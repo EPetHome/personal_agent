@@ -12,4 +12,5 @@ const i = args.indexOf('--state'), log = args.indexOf('--calls');
 if (i < 0 || args.at(-3) !== '查询' || !args.at(-2) || args.at(-1) !== '--json') { console.error('Loop 替身只允许只读 查询 <--all|原卡路径> --json'); process.exit(2); }
 if (log >= 0) await appendFile(args[log + 1], JSON.stringify({ args: args.slice(-3), at: new Date().toISOString() }) + '\n');
 const value = JSON.parse(await readFile(args[i + 1], 'utf8'));
-console.log(JSON.stringify(args.at(-2) === '--all' ? value : value.batches?.find(row => row.kernel === 1 && row.card === args.at(-2)) ?? { ok: false, kernel: 1 }));
+const target = args.at(-2), modern = value.batches?.find(row => row.kernel === 1 && row.card === target);
+console.log(JSON.stringify(target === '--all' ? value : modern ?? { v: 1, batches: value.batches?.filter(row => !row.kernel && row.batch?.file === target) ?? [] }));

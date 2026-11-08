@@ -1,12 +1,13 @@
+import { kernelIndexes, kernelSource } from './loop-kernel.js';
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, opendir, lstat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type { Config, Input, Material, Project } from './types.js';
 import type { Files } from './files.js';
 import { canonical, hash, inside, parseJson } from './util.js';
 import { prepareLaunch, spawnLaunch, observeLaunch, type DispatchLaunch } from './loop-launch.js';
 import type { WorkerAdapter, WorkerRequest, WorkerSnapshot, WorkerEvent, WorkerReceipt } from './worker.js';
-import { SafeError } from './errors.js';
+import { SafeError, failure } from './errors.js';
 import { kernelFacts, kernelFingerprint, repository, selectKernel, type KernelFacts } from './loop-kernel.js';
 
 export interface LoopStage { stage: string; state: string; round?: number; repairs?: number; session?: { host?: string; id?: string; alive?: boolean } | null; next?: string; pause?: { since?: string } | null; paRelays?: { id: string; at: string }[]; evidence?: Record<string, string> }
@@ -42,44 +43,163 @@ async function invoke(c: Config, args: string[], project?: string, text?: string
   if (!c.loop.command) throw new SafeError('unavailable', '尚未配置 Loop 命令');
   return parseJson<Record<string, unknown>>(await command(c.loop.command, [...c.loop.args, ...args, '--json'], args[0] === '查询' ? c.loop.timeoutMs : c.loop.actionTimeoutMs, project, text, signal));
 }
-export async function queryLoop(c: Config, files: Files, materials: Material[], signal?: AbortSignal) {
-  const result = await invoke(c, ['查询', '--all'], undefined, undefined, signal);
-  if (result.v !== 1 && result.kernel !== 1 || !Array.isArray(result.batches)) throw new SafeError('invalid_receipt', 'Loop 查询返回的不是 v1/kernel:1 格式');
-  const roots = c.projects.map(p => p.root);
-  const batches: LoopBatch[] = []; let excluded = 0;
-  for (const row of result.batches) {
-    if (row?.kernel === 1) {
-      try {
-        const facts = await kernelFacts(c, files, row, (card, project) => invoke(c, ['查询', card], project, undefined, signal), signal);
-        const p = c.projects.find(p => p.root === facts.project);
-        if (p) batches.push({ project: p.root, batch: { file: facts.binding.cardFile, name: facts.name }, state: facts.state, stages: [], evidence: facts.evidence, kernel: facts });
-      } catch { signal?.throwIfAborted(); excluded++; /* Rejected raw records never reach the model. */ }
+export async function queryKernelSource(c: Config, files: Files, project: Project, ledger: string, signal?: AbortSignal) {
+  const source = await kernelSource(c, files, project, ledger, signal);
+  return kernelFacts(c, files, source.initial, (card, root) => invoke(c, ['查询', card], root, undefined, signal), signal);
+}
+export interface LoopReference { protocol: 'kernel:1' | 'v1'; project: string; ledger?: string; file?: string }
+const kernelBatch = (facts: KernelFacts): LoopBatch => ({ project: facts.project, batch: { file: facts.binding.cardFile, name: facts.name }, state: facts.state, stages: [], evidence: facts.evidence, kernel: facts });
+const fileSignature = (s: { dev: number; ino: number; mtimeMs: number; size: number }) => `${s.dev}:${s.ino}:${s.mtimeMs}:${s.size}`;
+/** Stream one authorized repository only. 24 is a yield/chunk size, NOT a
+ * completeness limit; callers either reach EOF or retain an explicit failure. */
+async function* projectLedgers(c: Config, files: Files, project: Project, signal?: AbortSignal, file?: string) {
+  const { indexes, directLedgers, coverage } = await kernelIndexes(c, files, project, signal), seen = new Set<string>();
+  let unavailable = !coverage.ok;
+  const key = file ? hash(await canonical(file)) : undefined;
+  for (const ledger of directLedgers) if (!key || ledger.endsWith(`/${key}/ledger.json`)) { seen.add(ledger); yield ledger; }
+  for (const index of indexes) {
+    signal?.throwIfAborted();
+    if (key) {
+      const path = join(index, key, 'ledger.json');
+      if (!seen.has(path)) {
+        try {
+          await files.protocolPath(project.root, path);
+          const info = await lstat(path).catch((e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return; throw e; });
+          if (info) { seen.add(path); yield path; }
+        } catch { signal?.throwIfAborted(); unavailable = true; }
+      }
       continue;
     }
-    if (!row || typeof row.project !== 'string' || !roots.includes(await canonical(row.project)) || typeof row.batch?.file !== 'string' || typeof row.state !== 'string' || !Array.isArray(row.stages)) continue;
-    const projectRoot = await canonical(row.project), project = c.projects.find(p => p.root === projectRoot);
+    const before = await lstat(index).catch((e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return; throw e; });
+    if (!before) continue;
+    await files.protocolPath(project.root, index);
+    if (!before.isDirectory() || before.isSymbolicLink()) throw new SafeError('unverified', '运行索引不是普通目录');
+    let visited = 0;
+    for await (const entry of await opendir(index)) {
+      signal?.throwIfAborted();
+      if (entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)) {
+        const path = join(index, entry.name, 'ledger.json');
+        if (!seen.has(path)) {
+          try { await files.protocolPath(project.root, path); }
+          catch { signal?.throwIfAborted(); unavailable = true; continue; }
+          seen.add(path); yield path;
+        }
+      }
+      if (++visited % 24 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    if (fileSignature(before) !== fileSignature(await lstat(index))) throw new SafeError('file_changed', '枚举期间来源索引变化，完整覆盖尚未核实');
+  }
+  if (unavailable) throw new SafeError('unverified', '新版 Loop 运行索引未接通或当前无法核对；不能判断来源为空');
+}
+async function legacyBatches(c: Config, files: Files, projects: Project[], signal?: AbortSignal, file?: string, receipt?: Record<string, unknown>) {
+  const result = receipt ?? await invoke(c, file ? ['查询', file] : ['查询', '--all'], projects.length === 1 ? projects[0]!.root : undefined, undefined, signal);
+  if (result.v !== 1 && result.kernel !== 1 || !Array.isArray(result.batches)) throw new SafeError('invalid_receipt', '旧 Loop 查询清单格式无效');
+  const batches: LoopBatch[] = [];
+  for (const row of result.batches) {
+    if (row?.kernel === 1) continue; // Never discover new runs from a global self-claimed row.
+    if (!row || typeof row.project !== 'string') throw new SafeError('invalid_receipt', '旧来源缺少项目身份，覆盖尚未核实');
+    const root = await canonical(row.project), project = projects.find(p => p.root === root);
     if (!project) continue;
-    const file = await canonical(row.batch.file);
-    if (![project.root, ...(project.loop?.workspace ? [project.loop.workspace] : [])].some(root => inside(root, file))) continue;
+    if (typeof row.batch?.file !== 'string' || typeof row.state !== 'string' || !Array.isArray(row.stages)) throw new SafeError('invalid_receipt', '获准旧来源的记录不完整，不能视为没有任务');
+    await files.protocolPath(root, root);
+    const path = await canonical(row.batch.file);
+    if (file && path !== await canonical(file) || ![root, ...(project.loop?.workspace ? [project.loop.workspace] : [])].some(r => inside(r, path))) continue;
+    await files.protocolPath(root, path, true);
     const evidence = async (value: Record<string, string> = {}) => {
       const safe: Record<string, string> = {};
-      for (const [key, path] of Object.entries(value)) if (typeof path === 'string') {
-        try { safe[key] = await files.protocolPath(project.root, path); } catch { /* Not a grant. */ }
+      for (const [key, p] of Object.entries(value)) if (typeof p === 'string') {
+        try { safe[key] = await files.protocolPath(root, p); } catch { /* Not a grant. */ }
       }
-      await files.registerEvidence(project.root, safe); return safe;
+      await files.registerEvidence(root, safe); return safe;
     };
     const stages: LoopStage[] = [];
     for (const stage of row.stages) if (stage && typeof stage.stage === 'string' && typeof stage.state === 'string') stages.push({ stage: stage.stage, state: stage.state,
       round: stage.round, repairs: stage.repairs, next: stage.next, pause: stage.pause ? { since: stage.pause.since } : stage.pause,
       session: stage.session ? { host: stage.session.host, id: stage.session.id, alive: stage.session.alive } : stage.session,
-      paRelays: Array.isArray(stage.paRelays) ? stage.paRelays.map((r: any) => ({ id: r.id, at: r.at })) : undefined, evidence: await evidence(stage.evidence) });
-    batches.push({ project: project.root, batch: { name: row.batch.name, file }, state: row.state, branch: row.branch, commit: row.commit, next: row.next,
+      paRelays: Array.isArray(stage.paRelays) ? stage.paRelays.map((r: { id?: string; at?: string }) => ({ id: r.id!, at: r.at! })) : undefined, evidence: await evidence(stage.evidence) });
+    batches.push({ project: root, batch: { name: row.batch.name, file: path }, state: row.state, branch: row.branch, commit: row.commit, next: row.next,
       pause: row.pause ? { since: row.pause.since } : row.pause, stages, events: row.events ? { lastSeq: row.events.lastSeq } : undefined,
       queue: row.queue ? { status: row.queue.status, position: row.queue.position, reason: row.queue.reason } : row.queue, evidence: await evidence(row.evidence) });
   }
-  const filtered = { v: 1, at: new Date().toISOString(), batches, coverage: { scope: '获准项目的可核对记录；不是全来源自动发现', excludedUnverifiedOrUnauthorized: excluded } };
-  materials.push({ path: 'loop://查询/authorized-projects', sha256: hash(JSON.stringify(filtered)) });
-  return filtered;
+  return batches;
+}
+/** A transient source index: metadata only, no task/attention registration. */
+export async function loopReferences(c: Config, files: Files, projects: Project[], signal?: AbortSignal) {
+  const references: LoopReference[] = [], errors: string[] = [];
+  if (!projects.length) return { references, errors };
+  for (const project of projects) {
+    try { for await (const ledger of projectLedgers(c, files, project, signal)) references.push({ protocol: 'kernel:1', project: project.root, ledger }); }
+    catch {
+      signal?.throwIfAborted();
+      // A missing repository identity/permission/connection is unknown coverage,
+      // not an empty modern source; the independent v1 path stays reachable.
+      errors.push('新版来源未接通或索引当前无法核对，覆盖不完整');
+    }
+  }
+  // Always reachable, even when the database contains modern/historical cards.
+  try { for (const b of await legacyBatches(c, files, projects, signal)) references.push({ protocol: 'v1', project: b.project, file: b.batch.file }); }
+  catch { signal?.throwIfAborted(); errors.push('旧 v1 来源查询失败；不能以空列表判断没有任务'); }
+  const unique = [...new Map(references.map(r => [JSON.stringify(r), r])).values()];
+  return { references: unique, errors };
+}
+export async function readLoopReference(c: Config, files: Files, reference: LoopReference, signal?: AbortSignal, currentOnly = false) {
+  const project = c.projects.find(p => p.root === reference.project);
+  if (!project) throw new SafeError('outside_scope', '原来源项目已不在授权范围');
+  await files.protocolPath(project.root, project.root);
+  if (reference.protocol === 'kernel:1') {
+    if (!reference.ledger) throw new SafeError('invalid_arguments', '来源位置缺失');
+    if (currentOnly && (await kernelSource(c, files, project, reference.ledger, signal)).historical) return undefined;
+    return kernelBatch(await queryKernelSource(c, files, project, reference.ledger, signal));
+  }
+  if (!reference.file) throw new SafeError('invalid_arguments', '原卡位置缺失');
+  const batches = await legacyBatches(c, files, [project], signal, reference.file);
+  if (batches.length !== 1) throw new SafeError('unverified', '旧来源未返回唯一原执行，不能视为没有任务');
+  return batches[0];
+}
+export async function queryLoop(c: Config, files: Files, materials: Material[], signal?: AbortSignal, target?: { project: string; file?: string; ledger?: string; probe?: boolean }) {
+  const projects = c.projects.filter(p => !target || [p.id, p.root].includes(target.project));
+  if (target && projects.length !== 1) throw new SafeError('outside_scope', '不是唯一获准项目');
+  // A dispatch precheck is complete and scoped to its target, with an overall
+  // deadline. History is streamed/validated, not truncated at an arbitrary count.
+  const activeSignal = target?.probe ? AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(c.loop.actionTimeoutMs)]) : signal;
+  const batches: LoopBatch[] = []; let excluded = 0, partial = false;
+  if (target?.ledger) {
+    const facts = await queryKernelSource(c, files, projects[0]!, target.ledger, activeSignal);
+    if (facts.binding.cardFile !== target.file) throw new SafeError('identity_mismatch', '原卡身份不符');
+    batches.push(kernelBatch(facts));
+  } else {
+    for (const project of projects) {
+      try {
+        for await (const ledger of projectLedgers(c, files, project, activeSignal, target?.file)) {
+          try {
+            const batch = await readLoopReference(c, files, { protocol: 'kernel:1', project: project.root, ledger }, activeSignal, target?.probe);
+            if (batch && (!target?.probe || running(batch))) batches.push(batch);
+          } catch { activeSignal?.throwIfAborted(); excluded++; }
+        }
+      } catch { activeSignal?.throwIfAborted(); partial = true; }
+    }
+    if (!target?.file || !batches.length) {
+      const oldBinding = projects.some(p => !!files.store.db.prepare("SELECT 1 FROM tasks WHERE json_extract(body,'$.worker.kind')='loop' AND json_extract(body,'$.worker.loop') IS NULL AND json_extract(body,'$.worker.project') IN (?,?) LIMIT 1").get(p.id, p.root));
+      const includeLegacy = !target?.probe || projects.some(p => !!p.loop?.workspace) || oldBinding;
+      if (includeLegacy) {
+        const actualFile = target?.file ? await canonical(target.file) : undefined;
+        if (actualFile && !projects.some(p => [p.root, ...(p.loop?.workspace ? [p.loop.workspace] : [])].some(root => inside(root, actualFile)))) throw new SafeError('outside_scope', '原卡不在获准项目');
+        try {
+          // An exact read can return a formal kernel receipt before this process
+          // has enumerated its ledger. Do not parse that receipt as a v1 list.
+          const receipt = target?.file ? await invoke(c, ['查询', target.file], projects[0]!.root, undefined, activeSignal) : undefined;
+          if (receipt?.kernel === 1) {
+            const facts = await kernelFacts(c, files, receipt, (file, root) => invoke(c, ['查询', file], root, undefined, activeSignal), activeSignal);
+            if (facts.project !== projects[0]!.root || facts.binding.cardFile !== actualFile) throw new SafeError('identity_mismatch', '精确查询未返回目标项目的原卡身份');
+            batches.push(kernelBatch(facts));
+          } else batches.push(...await legacyBatches(c, files, projects, activeSignal, target?.file, receipt));
+        } catch (error) { activeSignal?.throwIfAborted(); if (target?.file) throw error; partial = true; }
+      }
+    }
+  }
+  const unique = [...new Map(batches.map(b => [b.kernel ? JSON.stringify(b.kernel.binding) : JSON.stringify([b.project, b.batch.file]), b])).values()];
+  const result = { v: 1, at: new Date().toISOString(), batches: unique, coverage: { scope: target ? '目标项目/原执行只读核对' : '获准项目来源核对', partial, excludedUnverifiedOrUnauthorized: excluded } };
+  materials.push({ path: 'loop://查询/authorized-projects', sha256: hash(JSON.stringify(result)) }); return result;
 }
 function fingerprint(batch: LoopBatch, stage: string | null) {
   return hash(JSON.stringify({ state: batch.state, branch: batch.branch ?? null, commit: batch.commit ?? null, next: batch.next ?? null,
@@ -140,9 +260,10 @@ export class LoopAdapter implements WorkerAdapter {
   }
   async status(request: WorkerRequest, signal?: AbortSignal): Promise<WorkerSnapshot> {
     const p = this.project(request.project);
-    const { batches } = await queryLoop(this.config, this.files, [], signal);
     if (request.loopBinding && request.loopBinding.repository !== (await repository(this.config, p.root, signal)).common) throw new SafeError('outside_scope', '原仓库授权已变化，控制不可用');
+    const { batches, coverage } = await queryLoop(this.config, this.files, [], signal, request.action === 'dispatch' ? { project: p.root, probe: true } : { project: p.root, file: request.loopBinding?.cardFile ?? request.batchFile, ledger: request.loopBinding?.ledger });
     if (request.action === 'dispatch') {
+      if (coverage.partial || coverage.excludedUnverifiedOrUnauthorized) throw new SafeError('unverified', '项目来源核对不完整，不能以空/部分结果判断可派工');
       if (!p.loop || !p.loopRunDirs.length) throw new SafeError('unavailable', '请先配置 projects[].loop 的批次目录和 scope 及获准 Loop 记录范围');
       loopScope(p, request.id);
       const cfg = await this.files.read(join(p.root, '.autoreview.json'), []);
@@ -196,7 +317,9 @@ export class LoopAdapter implements WorkerAdapter {
   }
   private async kernelStatus(request: WorkerRequest, batch: LoopBatch, signal?: AbortSignal): Promise<WorkerSnapshot> {
     signal?.throwIfAborted();
-    const facts = batch.kernel!, { binding, task } = selectKernel(facts, request.loopBinding, request.sourceTaskId);
+    const facts = batch.kernel!;
+    const sourceTaskId = request.sourceTaskId ?? (facts.tasks.length === 1 ? facts.tasks[0]!.id : undefined);
+    const { binding, task } = selectKernel(facts, request.loopBinding, sourceTaskId);
     if (request.stage) throw new SafeError('unsupported', '新版 Loop 不接受旧 stage；使用原来源任务 ID');
     const active = task ? task.active && !task.waiting : facts.tasks.some(t => t.active && !t.waiting);
     const state = task?.state ?? facts.state;
@@ -275,7 +398,16 @@ export class LoopAdapter implements WorkerAdapter {
     return { status: 'uncertain', reason: '送没送到不能确认，不重发' };
   }
   private async kernelControl(action: '续跑' | '停止', request: WorkerRequest, signal?: AbortSignal): Promise<WorkerReceipt> {
-    const snapshot = await this.status(request, signal), binding = snapshot.loopBinding!;
+    let snapshot: WorkerSnapshot;
+    try { snapshot = await this.status(request, signal); }
+    catch (error) {
+      if (action !== '停止') throw error;
+      // This catch ends BEFORE invoke(): a failed read cannot have issued stop.
+      // Errors after the command boundary must still escape as an unknown effect.
+      const cause = failure(error);
+      return { status: 'blocked', reason: `停止前只读核实失败（${cause.category}）：${cause.error} 未调用停止命令` };
+    }
+    const binding = snapshot.loopBinding!;
     if (!binding || request.expectedFingerprint && request.expectedFingerprint !== snapshot.fingerprint) return { status: 'blocked', reason: '原新版执行身份或依据变化，未执行控制' };
     if (action === '续跑' && snapshot.executable === false) return { status: 'blocked', reason: snapshot.unavailableReason ?? '原执行不能接受安全续跑，未执行' };
     const target = binding.taskId ? (snapshot.data as LoopBatch).kernel!.tasks.find(t => t.id === binding.taskId) : undefined;

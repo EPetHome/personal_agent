@@ -6,6 +6,7 @@ export interface Project {
 export interface Config {
   dataDir: string; attachmentDir: string; inboxDirs: string[]; projects: Project[];
   readAllow: string[]; readDeny: string[]; configPath: string;
+  outputs?: { otherProject: string };
   model: { url: string; name: string; auth: { type: 'pi' | 'env' | 'none'; path: string; provider: string; variable: string }; headers: Record<string, string>; timeoutMs: number; maxOutputTokens: number; dailyTokenLimit: number };
   feishu: { mode: 'fake' | 'real'; userId: string; url: string; envFile: string; pollMs: number; timeoutMs: number };
   loop: { command: string; args: string[]; eventDirs: string[]; timeoutMs: number; actionTimeoutMs: number };
@@ -34,9 +35,15 @@ export interface TaskCard {
   subscriptions: { kind: 'loop' | 'pi' | 'message'; value: string }[];
   worker?: { kind: string; project: string; batchFile: string; loop?: LoopBinding; operation?: string; origin?: 'pa' | 'owner-loop' };
   sourceRevision?: number; sourceFingerprint?: string; lastVerifiedAt?: string; control?: string;
+  sourceDefinition?: { state: 'pending' | 'read'; prompt?: string; sha256?: string };
+  sourceHealth?: { checkedAt: string; ok: boolean; reason?: string };
+  sourceCurrent?: { worker: string; state: string; checkedAt: string; active: boolean; next?: string; reason?: string;
+    stages?: { name: string; state: string; alive: boolean }[]; stageCount?: number;
+    result?: { state: string; summary: string; question?: string; cleaned: boolean } };
   verified?: { event: string; state: string; stage: string | null; branch?: string; commit?: string; layers: unknown; manual: unknown; evidence: Record<string, string>; snapshot: unknown };
   presentation?: { cause: string; assessment: string; suggestion: string };
   notice?: string; deferred?: boolean;
+  outputDraft?: { sourceInput: string; arguments: Record<string, unknown> };
 }
 export interface Material { path: string; sha256: string; bytes?: number }
 export interface Turn { input: Input; materials: Material[]; replied: boolean; call: number; signal: AbortSignal; approvalThread?: string; taskId?: string }

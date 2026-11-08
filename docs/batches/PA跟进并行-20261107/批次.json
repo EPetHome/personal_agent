@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "name": "PA跟进并行-20261107",
+  "nature": "开发",
+  "target": "dev",
+  "base": "chore/PA跟进并行准备-20261107",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试",
+    "验收"
+  ],
+  "tasks": [
+    {
+      "name": "已派出卡",
+      "prompt": "../../prompt/提示词-PA跟进并行-已派出卡.md",
+      "scope": [
+        "code/agent/src/cards.ts",
+        "code/agent/src/worker.ts",
+        "code/agent/src/worker-journal.ts",
+        "code/agent/src/confirmation.ts",
+        "code/agent/src/dispatch-card.ts",
+        "code/agent/test/dispatch-card.test.ts",
+        "code/agent/test/worker.test.ts",
+        "code/agent/test/reliability.test.ts",
+        "code/agent/src/prompt.ts",
+        "code/agent/src/capabilities.ts",
+        "code/agent/使用说明.md",
+        "docs/batches/PA跟进并行-20261107/结果.md",
+        "code/agent/src/loop.ts"
+      ],
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/dispatch-card.test.js dist/test/worker.test.js dist/test/reliability.test.js"
+    },
+    {
+      "name": "无事件检测",
+      "prompt": "../../prompt/提示词-PA跟进并行-无事件检测.md",
+      "scope": [
+        "code/agent/src/loop-monitor.ts",
+        "code/agent/src/app.ts",
+        "code/agent/test/loop-monitor.test.ts",
+        "code/agent/src/prompt.ts",
+        "code/agent/src/capabilities.ts",
+        "code/agent/使用说明.md",
+        "docs/batches/PA跟进并行-20261107/结果.md"
+      ],
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/loop-monitor.test.js dist/test/core.test.js dist/test/worker.test.js dist/test/repair.test.js"
+    },
+    {
+      "name": "渐进感知",
+      "prompt": "../../prompt/提示词-PA跟进并行-渐进感知.md",
+      "scope": [
+        "code/agent/src/intake.ts",
+        "code/agent/src/store.ts",
+        "code/agent/src/router.ts",
+        "code/agent/src/context.ts",
+        "code/agent/src/types.ts",
+        "code/agent/src/loop.ts",
+        "code/agent/src/loop-kernel.ts",
+        "code/agent/src/worker.ts",
+        "code/agent/src/files.ts",
+        "code/agent/src/app.ts",
+        "code/agent/src/loop-discovery.ts",
+        "code/agent/src/task-context.ts",
+        "code/agent/test/task-discovery.test.ts",
+        "code/agent/test/core.test.ts",
+        "code/agent/test/loop-kernel.test.ts",
+        "code/agent/scripts/loop-stub.mjs",
+        "code/agent/scripts/loop-worker-stub.mjs",
+        "code/agent/test/helpers.ts",
+        "code/agent/src/prompt.ts",
+        "code/agent/src/capabilities.ts",
+        "code/agent/使用说明.md",
+        "docs/batches/PA跟进并行-20261107/结果.md"
+      ],
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/task-discovery.test.js dist/test/loop-kernel.test.js dist/test/core.test.js dist/test/worker.test.js"
+    },
+    {
+      "name": "产出文件",
+      "prompt": "../../prompt/提示词-PA跟进并行-产出文件.md",
+      "scope": [
+        "code/agent/src/file-policy.ts",
+        "code/agent/src/pi-permissions.ts",
+        "code/agent/src/pi.ts",
+        "code/agent/src/files.ts",
+        "code/agent/src/config.ts",
+        "code/agent/src/types.ts",
+        "code/agent/src/router.ts",
+        "code/agent/src/outputs.ts",
+        "code/agent/config.example.json",
+        "code/agent/scripts/prepare-outputs.mjs",
+        "code/agent/test/outputs.test.ts",
+        "code/agent/test/pi.test.ts",
+        "code/agent/test/reliability.test.ts",
+        "code/agent/scripts/pi-worker-stub.mjs",
+        "code/agent/src/prompt.ts",
+        "code/agent/src/capabilities.ts",
+        "code/agent/使用说明.md",
+        "docs/batches/PA跟进并行-20261107/结果.md"
+      ],
+      "test": "pa_check_dir=\"$(mktemp -d \"${TMPDIR:-/tmp}/pa-node-check.XXXXXX\")\" && trap 'rm -rf \"$pa_check_dir\"' EXIT && git archive --format=tar --output=\"$pa_check_dir/source.tar\" HEAD && tar -xf \"$pa_check_dir/source.tar\" -C \"$pa_check_dir\" && /bin/cp -R code/agent/node_modules \"$pa_check_dir/code/agent/node_modules\" && cd \"$pa_check_dir/code/agent\" && npm run typecheck && npm run build && node --test --test-concurrency=1 dist/test/outputs.test.js dist/test/pi.test.js dist/test/reliability.test.js dist/test/core.test.js"
+    }
+  ],
+  "acceptance": "整批验收标准.md",
+  "limits": {
+    "开发评审": {
+      "maxRepairs": 4,
+      "timeoutMin": 120
+    },
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20,
+      "maxRecoveries": 1
+    },
+    "验收": {
+      "maxRepairs": 3,
+      "timeoutMin": 40,
+      "maxRecoveries": 1
+    }
+  }
+}

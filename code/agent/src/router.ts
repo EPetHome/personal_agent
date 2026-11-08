@@ -12,10 +12,11 @@ import { turns, turn } from './context.js';
 import { SYSTEM_PROMPT } from './prompt.js';
 import { deliver, type Channel } from './channel.js';
 import { hash } from './util.js';
-import { queryLoop } from './loop.js';
+import { TaskContext } from './task-context.js';
 import { Workers, type PendingAction } from './worker.js';
 import { SafeError, failure } from './errors.js';
 import { capabilities } from './capabilities.js';
+import { OutputRequests } from './outputs.js';
 
 interface GraphSnapshot {
   values: { messages?: { content: unknown }[] }; next: string[];
@@ -29,6 +30,7 @@ export class Router {
   readonly files: Files;
   readonly agent;
   readonly workers: Workers;
+  readonly tasks: TaskContext;
   private readonly toolNames: string[];
   private readonly replyFinal: (text: string) => Promise<unknown>;
   constructor(readonly config: Config, readonly store: Store, readonly channel: Channel) {
@@ -36,6 +38,7 @@ export class Router {
     this.saver.db.pragma('journal_mode = WAL'); this.saver.db.pragma('synchronous = FULL');
     this.files = new Files(config, store);
     this.workers = new Workers(config, store, channel, this.files);
+    const outputs = new OutputRequests(this.workers);
     const make = (name: string, description: string, fields: Record<string, Field>, required: string[], run: (args: Record<string, unknown>) => Promise<unknown> | unknown) => tool(async (args: Record<string, unknown>) => {
       let result: unknown;
       try {
@@ -45,10 +48,15 @@ export class Router {
       const t = turn();
       const view = result && typeof result === 'object' ? result as Record<string, unknown> : {};
       const task = view.card as { id?: string } | undefined;
-      if (task?.id && store.task(task.id)) t.taskId = task.id;
+      if (task?.id && store.task(task.id)) {
+        t.taskId = task.id;
+        const card = store.task(task.id)!;
+        result = { ...view, card: await this.tasks.visibleSummary(card), ...(['loop', 'pi'].includes(card.worker?.kind ?? '') ? { snapshot: undefined } : {}) };
+      }
       store.log('tool_result', { inputId: t.input.id, tool: name, arguments: args, result: name === 'read_file' || name === 'read_image' ? { ok: view.ok, category: view.category, error: view.error, path: view.path, sha256: view.sha256 } : result });
       return result;
     }, { name, description, schema: { type: 'object', properties: { ...fields, reason: stringField, plan: stringField }, required: [...required, 'reason', 'plan'], additionalProperties: false } });
+    this.tasks = new TaskContext(config, store, this.files, this.workers);
     const record = (path: string, value: unknown) => { turn().materials.push({ path, sha256: hash(JSON.stringify(value)) }); return value; };
     const tools = [
       make('reply', '给用户本人发文字。reason 简述依据，plan 给方案或说明不需行动；不向别人发送。', { text: stringField, taskId: stringField }, ['text'], async args => {
@@ -65,9 +73,18 @@ export class Router {
         }
         return result;
       }),
-      make('get_task', '查一张任务卡，不创建卡。', { id: stringField }, ['id'], a => record(`task://${a.id}`, store.task(String(a.id)) ?? { error: '未找到任务卡' })),
-      make('search_closed_tasks', '按原文搜索已关闭的卡，最多 50 张。', { query: stringField }, ['query'], a => record('tasks://closed-search', store.searchClosed(String(a.query)))),
-      make('query_loop', '只读查询授权项目的 Loop 状态，不触发任何恢复。', {}, [], () => queryLoop(config, this.files, turn().materials, turn().signal)),
+      make('get_task', '按当前权限先核对原来源，再按需展开任务定义和分层事实。失败保留最后确认时间；不建卡或永久关注。', { id: stringField }, ['id'], a => this.tasks.detail(String(a.id), turn().materials, turn().signal)),
+      make('list_projects', '获准项目入口分页；给总量、本页量、是否更多、续查位置及来源覆盖。', { cursor: stringField, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], a => this.tasks.projectPage(String(a.cursor ?? ''), Number(a.limit ?? 10))),
+      make('list_tasks', '任务摘要分页；先核对此页原来源，失败/部分不冒充实时全貌。cursor 沿原范围续查；不创建任务、永久关注或执行。', { project: stringField, cursor: stringField, limit: { type: 'integer', minimum: 1, maximum: 50 }, includeClosed: { type: 'boolean' } }, [], a => this.tasks.taskPage({ project: typeof a.project === 'string' ? a.project : undefined, cursor: typeof a.cursor === 'string' ? a.cursor : undefined, limit: Number(a.limit ?? 10), includeClosed: a.includeClosed === true }, turn().signal)),
+      make('read_task_evidence', '只读原事项当前仍获准的证据；key 留空列证据引用，正文按 offset/length 分段。', { id: stringField, key: stringField, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 1, maximum: 64000 } }, ['id'], a => this.tasks.evidence(String(a.id), String(a.key ?? ''), turn().materials, turn().signal, Number(a.offset ?? 0), Number(a.length ?? 16000))),
+      make('search_closed_tasks', '已关闭任务按原文搜索；只返回仍获准的摘要，详情再 get_task。', { query: stringField }, ['query'], async a => {
+        const rows = [];
+        for (const card of store.searchClosed(String(a.query))) {
+          try { const result = await this.tasks.detail(card.id, [], turn().signal, false); rows.push(result); } catch { /* Current grants win over historical indexes. */ }
+        }
+        return record('tasks://closed-search', { rows, count: rows.length, hasMore: rows.length === 20 });
+      }),
+      make('query_loop', '只读查询获准 Loop 摘要，按页给覆盖和核实时间；不恢复执行、不建立任务或永久关注。详细任务用 list_tasks/get_task。', { cursor: stringField, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], a => this.tasks.loopPage(turn().materials, turn().signal, Number(a.offset ?? 0), Number(a.limit ?? 10), String(a.cursor ?? ''))),
       make('list_directory', '只读列授权目录，过滤黑名单及链接；不是新增授权。', { path: stringField }, ['path'], a => this.files.list(String(a.path), turn().materials)),
       make('read_file', '按当前能力事实提取纯文本/DOCX/PDF 文本层或已登记证据；不写产物。offset/length 是提取后 UTF-8 字节，单次最多 64000。', { path: stringField, evidence: { type: 'boolean' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 1, maximum: 64000 } }, ['path'], a => this.files.read(String(a.path), turn().materials, a.evidence === true, Number.isFinite(a.offset) ? Number(a.offset) : 0, Number.isFinite(a.length) ? Number(a.length) : 64000, false, turn().signal)),
       make('read_image', '读取授权范围内图片以理解截图，返回视觉内容，不能绕过黑名单。', { path: stringField }, ['path'], async a => {
@@ -76,11 +93,14 @@ export class Router {
         return [{ type: 'text', text: JSON.stringify({ path: result.path, sha256: result.sha256 }) }, { type: 'image_url', image_url: { url: `data:${result.mime};base64,${result.content}` } }];
       }),
       make('read_events', '专用事件日志工具：按编号增量读；不是通用文件读取。', { after: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], a => record('events://selected', store.events(Number.isSafeInteger(a.after) ? Number(a.after) : 0, Number.isSafeInteger(a.limit) ? Number(a.limit) : 20))),
-      make('worker_dispatch', '按稳定 taskId 派给已注册 worker；Loop/Pi 要授权 project ID。options 是适配器 JSON：Pi type=read/skill/write，readPaths 仅缩小，writeDirs/editFiles/skill/commands/network 受程序限制；不能改 Loop scope/命令。本人明确普通派工用 instructionInput=当前输入 ID、instruction=完整本人正文绑定确认，材料不算。缺项目先留空记录原指令，不执行；本人答复项目后只补 project，原 taskId/来源/目标/边界/options 不变。不合入推送；红线另问。', { taskId: stringField, worker: stringField, project: stringField, title: stringField, goal: stringField, completion: stringField, boundary: stringField, prompt: stringField, options: stringField, instructionInput: stringField, instruction: stringField, redLine: { type: 'boolean' } }, ['taskId', 'title', 'goal', 'completion', 'boundary', 'prompt'], a => this.workers.execute(turn().approvalThread ?? turn().input.id, 'worker_dispatch', a, turn().signal)),
+      make('worker_dispatch', '按稳定 taskId 派给已注册 worker；Loop/Pi 要授权 project ID。options 是适配器 JSON：Pi type=read/skill/write，readPaths 仅缩小，writeDirs/editFiles/skill/commands/network 受程序限制。材料产出用 Pi {type:"write",output:{kind:"docx-txt"或"image",source:"源绝对路径",fileName:"可选名称",placement:"project"或"other"}}；固定源和目标的 pa_output 不开放任意复制/命令/联网。已知项目直接指定；未知 project 留空，程序只问一次缺项。待补项目的原事项可用 get_task 读取 outputDraft.arguments；本人答复后保持原 taskId/目标/边界/options，仅补 project/placement；明确仍无项目归属才选配置的 otherProject 和 placement=other。未答不写、不催；不以模型宣称已存好替代路径/摘要回执。不能改 Loop scope/命令。本人明确普通派工用 instructionInput=当前输入 ID、instruction=完整本人正文绑定确认，材料不算。缺项目先留空记录原指令，不执行；本人答复项目后只补 project，原 taskId/来源/目标/边界/options 不变。不合入推送；红线另问。', { taskId: stringField, worker: stringField, project: stringField, title: stringField, goal: stringField, completion: stringField, boundary: stringField, prompt: stringField, options: stringField, instructionInput: stringField, instruction: stringField, redLine: { type: 'boolean' } }, ['taskId', 'title', 'goal', 'completion', 'boundary', 'prompt'], a => outputs.execute(turn().approvalThread ?? turn().input.id, a, turn().signal)),
       make('track_loop', '只读绑定本人在授权仓库启动的新 Loop 原执行；多任务必须给 sourceTaskId（查询返回的稳定 ID），不是任务名。普通变化只跟踪已绑定执行，不自动发现整个来源。', { project: stringField, batchFile: stringField, sourceTaskId: stringField }, ['project', 'batchFile'], a => this.workers.trackLoop(String(a.project), String(a.batchFile), typeof a.sourceTaskId === 'string' ? a.sourceTaskId : undefined, turn().signal)),
       make('worker_reply', '答复原派工。新版 Loop 仅 mode=resume 无新增要求续跑，sourceTaskId 选择原来源任务，默认原绑定对象；send/新增要求不可用，不套旧 stage。旧 Loop send 用原 stage。Pi 的 needs-decision 已退出，mode=send、text=本人答案将在同件活下新派一次（不修改旧权限）；options 留空。先暂停发带方案的原卡，点头后重核、只执行一次。红线须 redLine=true；授权/手工事项回电脑。', { taskId: stringField, mode: stringField, stage: stringField, sourceTaskId: stringField, text: stringField, assessment: stringField, options: stringField, redLine: { type: 'boolean' } }, ['taskId', 'mode', 'text'], a => this.workers.execute(turn().approvalThread ?? turn().input.id, 'worker_reply', a, turn().signal)),
       make('worker_stop', '按原身份停止，保留成果；sourceTaskId 为新版原来源任务 ID，省略沿原绑定对象，子任务不扩大为整批。按配置先问，执行前核实。', { taskId: stringField, sourceTaskId: stringField, options: stringField, redLine: { type: 'boolean' } }, ['taskId'], a => this.workers.execute(turn().approvalThread ?? turn().input.id, 'worker_stop', a, turn().signal)),
-      make('worker_status', '只读核验原 worker 的启动接收/调用退出事实；接收核销不释放开发空间，不重发、不发起新动作，不代表业务验收。', { id: stringField }, ['id'], async a => record(`worker://${a.id}/status`, await this.workers.status(String(a.id), turn().signal))),
+      make('worker_status', '只读核验原 worker 的启动接收/调用退出事实；接收核销不释放开发空间，不重发、不发起新动作，不代表业务验收。', { id: stringField }, ['id'], async a => {
+        const card = store.task(String(a.id));
+        return record(`worker://${a.id}/status`, card?.worker && !['loop', 'pi'].includes(card.worker.kind) ? await this.workers.status(card.id, turn().signal) : await this.tasks.detail(String(a.id), turn().materials, turn().signal));
+      }),
       make('cancel_task', '本人取消指定这件活；尚未执行的所有点头作废。不会冒充已停止外部批次，停批次另用 worker_stop。', { id: stringField }, ['id'], a => this.workers.cancel(String(a.id), turn().input, turn().signal)),
       make('task_card', '更新同一张任务卡的说明，必须带原因、真假判断和建议。状态、核实事实、按钮可用性由程序决定。要给用户可点的续跑建议，使用 worker_reply。', { id: stringField, cause: stringField, assessment: stringField, suggestion: stringField, buttons: stringField }, ['id', 'cause', 'assessment', 'suggestion'], a => this.workers.show(String(a.id), a, turn().input, turn().signal)),
       make('update_task', '改同一任务的目标/完成标准/边界定义，不能改程序状态或订阅；原点头会因定义变化作废。', { id: stringField, goal: stringField, completion: stringField, boundary: stringField }, ['id', 'goal', 'completion', 'boundary'], a => {
@@ -89,25 +109,27 @@ export class Router {
         card.goal = String(a.goal); card.completion = String(a.completion); card.boundary = String(a.boundary); card.updated = new Date().toISOString(); store.putTask(card); return { ok: true, card };
       }),
     ];
+    // Replace only this task's read adapters after the shared dispatch tool
+    // table is composed. Other adapters keep their original dispatch handlers.
+    for (const selected of [
+      make('read_events', '按编号增量读审计入口摘要，不返回历史原始快照/日志正文；详情用 get_task/read_task_evidence 逐次核权。', { after: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], async a => record('events://selected', await this.tasks.eventPage(Number.isSafeInteger(a.after) ? Number(a.after) : 0, Number.isSafeInteger(a.limit) ? Number(a.limit) : 20))),
+      make('track_loop', '只读绑定已知原执行（正式记录也会自动发现）；多任务必须给 sourceTaskId，不是任务名。不是永久关注或派工。', { project: stringField, batchFile: stringField, sourceTaskId: stringField }, ['project', 'batchFile'], async a => ({ card: this.tasks.summary(await this.workers.trackLoop(String(a.project), String(a.batchFile), typeof a.sourceTaskId === 'string' ? a.sourceTaskId : undefined, turn().signal)) })),
+    ]) tools[tools.findIndex(t => t.name === selected.name)] = selected;
     this.toolNames = tools.map(t => t.name);
     const replyTool: StructuredToolInterface = tools[0]!;
     this.replyFinal = text => replyTool.invoke({ text, reason: '模型直接返回给本人的文字', plan: '原文回复，不执行额外动作' });
     this.agent = createAgent({ model: new RouterModel(config, store), tools, checkpointer: this.saver,
       middleware: [humanInTheLoopMiddleware({ interruptOn: {
         ...Object.fromEntries(tools.map(t => [t.name, false])),
-        worker_dispatch: { allowedDecisions: ['approve', 'reject'], when: r => this.workers.needsApproval('worker_dispatch', r.toolCall.args) },
+        worker_dispatch: { allowedDecisions: ['approve', 'reject'], when: r => outputs.needsApproval(r.toolCall.args) },
         worker_reply: { allowedDecisions: ['approve', 'reject'], when: r => this.workers.needsApproval('worker_reply', r.toolCall.args) },
         worker_stop: { allowedDecisions: ['approve', 'reject'], when: r => this.workers.needsApproval('worker_stop', r.toolCall.args) },
       } })] });
   }
-  context(input: Input) {
+  async context(input: Input) {
     const window = this.store.window().map(m => m.role === 'user' ? new HumanMessage(m.text) : new AIMessage(m.text));
-    const facts = capabilities(this.config, this.toolNames);
-    const tasks = { type: '任务表', rows: this.store.taskTable().map(row => {
-      const card = this.store.task(row.id)!;
-      return this.workers.quietTask(card, input) ? { id: row.id, title: row.title, status: row.status, attention: '保留可查询；没有相关新事实，不催办' } : row;
-    }), matchedCards: this.store.match(input), capabilities: facts,
-      workers: [...this.workers.adapters.keys()], projects: this.config.projects.map(p => ({ id: p.id, root: p.root })) };
+    const facts = { ...capabilities({ ...this.config, projects: this.config.projects.slice(0, 5) }, this.toolNames), projectCoverage: { total: this.config.projects.length, count: Math.min(5, this.config.projects.length), hasMore: this.config.projects.length > 5, rule: '仅入口页；其他项目用 list_projects 按需查询，实际授权仍由工具逐次核对' } };
+    const tasks = { ...await this.tasks.context(input), capabilities: facts, workers: [...this.workers.adapters.keys()] };
     const incoming = { type: '新输入', ...input, raw: undefined };
     // Task data is not a higher-priority system instruction. Source text is always data.
     return [new SystemMessage(SYSTEM_PROMPT), ...window, new HumanMessage(JSON.stringify(tasks)), new HumanMessage(JSON.stringify(incoming))];
@@ -152,7 +174,7 @@ export class Router {
         const decisions = this.workers.decisions(row.id);
         const paused = snapshot.tasks?.some(task => task.interrupts?.length);
         const options = { ...stateConfig, signal, recursionLimit: this.config.maxToolRounds * 2 + 5, callbacks: [] };
-        if (!initialized) await this.agent.invoke({ messages: this.context(row.input) }, options);
+        if (!initialized) await this.agent.invoke({ messages: await this.context(row.input) }, options);
         else if (paused && decisions) await this.agent.invoke(new Command({ resume: decisions }), options);
         else if (!paused && snapshot.next.length) await this.agent.invoke(null, options);
         for (let n = 0; ; n++) {

@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { ScopedFiles, type FilePolicy } from './file-policy.js';
 import { hash, parseJson, parseUrl } from './util.js';
 import { failure, SafeError } from './errors.js';
+import { produceOutput, type OutputResult } from './outputs.js';
+import { atomicJson } from './util.js';
 
 export interface PiPolicy extends FilePolicy { operation: string; token: string; commands: boolean; network: boolean; maxTurns: number }
 interface PiContext { shutdown(): void }
@@ -36,9 +38,16 @@ export default function permissions(pi: PiAPI) {
   tool('pa_ls', '列目录，仅返回允许读的项，不跟随链接。', { path: string }, ['path'], a => files.list(path(a)));
   tool('pa_grep', '文字字面搜索，遍历及每个文件均检查权限；有数量和大小上限。', { path: string, pattern: string }, ['path', 'pattern'], a => files.search(path(a), String(a.pattern), true));
   tool('pa_find', '按路径字面片段找文件，每个文件均检查权限。', { path: string, pattern: string }, ['path', 'pattern'], a => files.search(path(a), String(a.pattern), false));
-  if (p.write.length) tool('pa_write', '只在本派工范围创建文件，不覆盖已有文件。', { path: string, content: string }, ['path', 'content'], a => files.write(path(a), String(a.content)));
+  if (p.write.length && !p.output) tool('pa_write', '只在本派工范围创建文件，不覆盖已有文件。', { path: string, content: string }, ['path', 'content'], a => files.write(path(a), String(a.content)));
   let mutations = Promise.resolve<unknown>(undefined);
-  if (Object.keys(p.edit ?? {}).length) tool('pa_edit', '只修改本次本人逐文件明确批准且版本匹配的文件，oldText 必须唯一。', { path: string, oldText: string, newText: string }, ['path', 'oldText', 'newText'], a => {
+  let outputRun: Promise<OutputResult> | undefined;
+  if (p.output && p.write.length && !p.commands && !p.network) tool('pa_output', '只生成本次已绑定源与目标的产物：完整 DOCX 转 UTF-8 TXT 或按原字节保存图片；无任意路径/内容参数，不覆盖，回执含实际路径/摘要，other 含同名说明。', {}, [], () => outputRun ??= (async () => {
+    const target = p.output!;
+    await atomicJson(join(dir, 'output-result.json'), { ok: false, status: 'incomplete', files: [], expected: [target.target, ...(target.companion ? [target.companion] : [])], error: '产出工具开始，但尚未核实完整交付。' });
+    const result = await produceOutput(files, target);
+    await atomicJson(join(dir, 'output-result.json'), result); log({ kind: 'output', result }); return result;
+  })());
+  if (Object.keys(p.edit ?? {}).length && !p.output) tool('pa_edit', '只修改本次本人逐文件明确批准且版本匹配的文件，oldText 必须唯一。', { path: string, oldText: string, newText: string }, ['path', 'oldText', 'newText'], a => {
     const work = mutations.then(() => files.edit(path(a), String(a.oldText), String(a.newText)));
     mutations = work.catch(() => { log({ kind: 'mutation_failed', path: path(a) }); }); return work;
   });
@@ -65,7 +74,10 @@ export default function permissions(pi: PiAPI) {
     const name = event.toolName ?? '';
     if (!names.includes(name)) { log({ kind: 'denied', tool: name }); return { block: true, reason: '拒绝：本次派工没有这项能力' }; }
     if (['pa_fetch', 'pa_bash'].includes(name)) return;
-    try { await files.check(path(event.input ?? {}), writeTools.has(name) ? 'write' : 'read'); }
+    try {
+      if (name === 'pa_output' && p.output) { await files.check(p.output.source); await files.check(p.output.target, 'write'); if (p.output.companion) await files.check(p.output.companion, 'write'); }
+      else await files.check(path(event.input ?? {}), writeTools.has(name) ? 'write' : 'read');
+    }
     catch (error) { const result = failure(error); return { block: true, reason: `${result.category}: ${result.error}` }; }
     return;
   });

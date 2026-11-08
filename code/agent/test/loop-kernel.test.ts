@@ -37,7 +37,11 @@ async function kernelFixture(t: TestContext, overrides: Record<string, unknown> 
   p.loop = { batchDir: join(project, 'docs/batches'), allow: ['code/'], deny: ['code/private/'] };
   const snapshot = join(root, 'loop.json'), callsFile = join(root, 'calls.jsonl');
   const state = { v: 1, batches: [] as any[], test: { root, project, workspace: project, run: p.loopRunDirs[0], ...overrides.test as object } as Record<string, any> };
-  const save = () => writeFile(snapshot, JSON.stringify(state)); await save();
+  const save = async () => {
+    await writeFile(snapshot, JSON.stringify(state));
+    if (state.batches.some(b => b.kernel) && !state.test.queryFailure)
+      execFileSync(process.execPath, [resolve('scripts/loop-worker-stub.mjs'), '--state', snapshot, '--calls', callsFile, '查询', '--all', '--json'], { env: { PATH: process.env.PATH }, stdio: 'pipe' });
+  }; await save();
   const load = async () => Object.assign(state, JSON.parse(await readFile(snapshot, 'utf8')));
   const calls = async () => (await readFile(callsFile, 'utf8').catch(() => '')).split('\n').filter(Boolean).map(s => JSON.parse(s));
   f.config.loop.args = [resolve('scripts/loop-worker-stub.mjs'), '--state', snapshot, '--calls', callsFile];
@@ -50,7 +54,7 @@ async function kernelFixture(t: TestContext, overrides: Record<string, unknown> 
 }
 
 for (const failure of ['bad-receipt', 'timeout']) test(`R5: final unchanged revision survives failed verification and restart, then notifies once (${failure})`, async t => {
-  const f = await kernelFixture(t), b = await f.seed(); f.config.intake.watch = false; f.config.intake.fallbackMs = 60000;
+  const f = await kernelFixture(t), b = await f.seed([{ id: 'task-a', name: 'task-a', active: true }]); f.config.intake.watch = false; f.config.intake.fallbackMs = 60000;
   await fetch(`${f.model.url}/script`, { method: 'POST', body: JSON.stringify({ flow: [{ tools: [{ name: 'reply', arguments: { text: '已核实最终构造修订' } }] }, { text: 'done' }] }) });
   let app = await f.start(); const card = await app.router.workers.trackLoop('p', b.batch.file, 'task-a'), binding = card.worker!.loop!;
   b.events.lastSeq = 7; b.tasks.forEach((task: any) => { task.active = false; task.state = 'done'; }); b.state = 'done';
@@ -190,7 +194,7 @@ for (const races of [1, 3]) test(`R4: query/ledger interleaving keeps facts pair
     assert.equal(updated.sourceRevision, 2); assert.deepEqual((updated.verified!.layers as any).checks, ['构造新修订 2：验收通过']);
     assert.equal((updated.verified!.layers as any).publication.push, '失败');
   } else {
-    await assert.rejects(app.router.workers.status(card.id), /不能唯一核对/);
+    await assert.rejects(app.router.workers.status(card.id), /修订连续变化/);
     assert.equal(app.store.task(card.id)!.sourceRevision, 1, 'unstable query must not advance the verified revision');
     await f.load(); f.state.test.queryRace = 0; await f.save();
     await app.router.workers.status(card.id);

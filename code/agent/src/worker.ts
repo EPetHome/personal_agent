@@ -1,3 +1,4 @@
+import { sameBinding as sameSourceBinding } from './loop-kernel.js';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import type { Config, Input, TaskCard, LoopBinding } from './types.js';
@@ -12,8 +13,9 @@ import { canonical, hash, parseJson } from './util.js';
 import { PiAdapter, piOptions } from './pi.js';
 import { SafeError, failure } from './errors.js';
 import { turns } from './context.js';
-import { kernelFingerprint, repository, selectKernel, type KernelFacts } from './loop-kernel.js';
-import { ownerInstruction, redLineText, requestHash, type InstructionConfirmation } from './confirmation.js';
+import { kernelFingerprint, repository, selectKernel, sameBinding, type KernelFacts } from './loop-kernel.js';
+import { ownerInstruction, redLineText, requestHash, type InstructionConfirmation, type CardStopConfirmation } from './confirmation.js';
+import { DispatchCards, selectedLoopStopped } from './dispatch-card.js';
 
 export type WorkerAction = 'dispatch' | 'reply' | 'stop';
 export interface WorkerRequest {
@@ -45,6 +47,9 @@ export interface WorkerOperation {
   state: 'planned' | 'approved' | 'rejected' | 'executing' | 'sent' | 'blocked' | 'uncertain' | 'stale' | 'cancelled';
   basis: WorkerSnapshot; definition: string; needsApproval: boolean; by?: string; reason: string; confirmation?: InstructionConfirmation; failure?: ReturnType<typeof failure>;
   resources?: string[]; resourceState?: 'held' | 'released'; resolution?: WorkerResolution; resourceResolution?: WorkerResolution;
+  dispatchReceipt?: { at: string; snapshot?: WorkerSnapshot }; cardStop?: CardStopConfirmation;
+  /** Program-owned proof of a definite pre-effect rejection; never inferred from an unknown result. */
+  stopNotCalled?: boolean;
 }
 export interface PendingAction { name: string; args: Record<string, unknown> }
 export interface ApprovalGroup { operations: string[] }
@@ -74,6 +79,7 @@ export class Workers {
   readonly adapters = new Map<string, WorkerAdapter>();
   readonly messages: TaskMessages;
   readonly journal: WorkerJournal;
+  readonly dispatchCards: DispatchCards;
   readonly pi: PiAdapter;
   private readonly inFlight = new Map<string, Promise<unknown>>();
   constructor(readonly config: Config, readonly store: Store, readonly channel: Channel, readonly files: Files) {
@@ -81,6 +87,7 @@ export class Workers {
     this.pi = new PiAdapter(config, store, files); this.adapters.set('pi', this.pi);
     this.messages = new TaskMessages(store, channel);
     this.journal = new WorkerJournal(store);
+    this.dispatchCards = new DispatchCards(store);
   }
   private adapter(kind: string) { const a = this.adapters.get(kind); if (!a) throw new SafeError('unavailable', 'worker 尚未接入'); return a; }
   operation(id: string) { return this.journal.operation(id); }
@@ -310,10 +317,59 @@ export class Workers {
     this.store.log('worker_resolution', { operation: resolved.id, resolution: resolved.resolution });
     await this.messages.publish(card.id, input.id, undefined, signal);
   }
+  private async dispatchStopCallback(input: Input, value: Record<string, unknown>, signal?: AbortSignal) {
+    if (typeof value.task !== 'string') return;
+    const record = this.dispatchCards.valid(value.task, value.operation, value.token, input.quoteId);
+    if (!record || !this.config.projects.some(p => p.id === record.target.project || p.root === record.target.project)) return;
+    const original = this.operation(record.operation);
+    if (!original || original.state !== 'sent') return;
+    const { target } = record;
+    const request: WorkerRequest = { id: hash(JSON.stringify(['dispatch-stop', record.token])).slice(0, 48), taskId: record.task,
+      worker: target.worker, action: 'stop', project: target.project, batchFile: target.batchFile, stage: target.legacy?.stage ?? null,
+      title: '', goal: '', completion: '', boundary: '', prompt: '', text: '', mode: 'resume', redLine: false, options: {},
+      ...(target.loop ? { loopBinding: target.loop, sourceTaskId: target.loop.taskId! } : {}) };
+    let basis: WorkerSnapshot;
+    try { basis = await this.adapter(target.worker).status(request, signal); }
+    catch (error) {
+      signal?.throwIfAborted();
+      this.store.log('worker_stop_unverified', { task: record.task, inputId: input.id, failure: failure(error), outcome: '无法核对原对象，未发停止' });
+      const current = this.store.task(record.task);
+      if (current && this.dispatchCards.valid(record.task, record.operation, record.token, input.quoteId)) {
+        current.notice = '尚不能核对卡上原执行，未发送停止，不代表已停止；请稍后核对'; this.store.putTask(current);
+        await this.messages.publish(current.id, input.id, undefined, signal);
+      }
+      return;
+    }
+    if (!this.dispatchCards.matches(record, basis) || basis.executable === false) return;
+    const card = this.store.task(record.task)!;
+    const op: WorkerOperation = { id: request.id, thread: input.id, tool: 'worker_stop', args: {}, request, token: randomUUID(),
+      state: 'approved', basis, definition: definition(card), needsApproval: true, by: input.id, reason: '',
+      cardStop: { dispatch: record.operation, token: record.token, messageId: input.quoteId!, targetHash: hash(JSON.stringify(target)), inputId: input.id } };
+    if (!this.dispatchCards.consume(record, op, () => this.save(op))) return;
+    this.store.log('worker_decision', { operation: op.id, task: record.task, by: input.who, inputId: input.id, decision: '原卡停止指令，保留成果' });
+    // This approved operation is the click itself, not a global approval bypass.
+    await this.executeGuarded(op, signal);
+  }
+  private async cardStopReceipt(op: WorkerOperation, receipt: WorkerReceipt, signal?: AbortSignal): Promise<WorkerReceipt> {
+    if (!op.cardStop || receipt.status !== 'sent') return receipt;
+    try {
+      const record = this.dispatchCards.get(op.request.taskId)!;
+      const snapshot = await this.adapter(op.request.worker).status(op.request, signal);
+      const facts = (snapshot.data as LoopBatch | undefined)?.kernel;
+      const pi = snapshot.data as { result?: { cleaned?: boolean } };
+      const revisionOk = !facts || facts.revision >= ((op.basis.data as LoopBatch).kernel?.revision ?? -1);
+      const stopped = this.dispatchCards.matches(record, snapshot, false) && revisionOk && (facts
+        ? await selectedLoopStopped(this.config, this.files, record, snapshot)
+        : op.request.worker === 'pi' ? snapshot.state === 'stopped' && pi.result?.cleaned === true : snapshot.state === 'stopped');
+      if (stopped) return { ...receipt, snapshot, reason: '已按卡上原执行身份核实停止，保留成果；不代表业务验收通过' };
+    } catch { /* The stop may already have taken effect. Never retry it. */ }
+    return { status: 'uncertain', reason: '停止请求已送出，但停止结果不确定，不重复停止；保留成果，请核对原执行' };
+  }
   async callback(input: Input, signal?: AbortSignal): Promise<{ handled: boolean; thread?: string }> {
     const button = input.button as { value?: Record<string, unknown> } | undefined, value = button?.value;
-    if (!value || !['worker', 'task', 'unavailable', 'dispatch-reconcile'].includes(String(value.pa))) return { handled: false };
+    if (!value || !['worker', 'task', 'unavailable', 'dispatch-reconcile', 'dispatch-stop'].includes(String(value.pa))) return { handled: false };
     if (input.source !== 'feishu' || input.who !== this.config.feishu.userId || input.chatType !== 'p2p') return { handled: true };
+    if (value.pa === 'dispatch-stop') { await this.dispatchStopCallback(input, value, signal); return { handled: true }; }
     if (value.pa === 'dispatch-reconcile') { await this.dispatchReviewCallback(input, value, signal); return { handled: true }; }
     if (value.pa === 'unavailable') { this.store.log('worker_blocked', { inputId: input.id, reason: '合入、推送当前不可用，请回电脑操作' }); return { handled: true }; }
     if (value.pa === 'task') {
@@ -356,7 +412,7 @@ export class Workers {
   private async executeOnce(thread: string, name: string, args: Record<string, unknown>, signal?: AbortSignal) {
     const op = await this.prepare(thread, name, args, signal), card = this.store.task(op.request.taskId)!;
     if (['sent', 'uncertain', 'blocked', 'stale', 'cancelled', 'rejected'].includes(op.state)) return { ok: op.state === 'sent', status: op.state, reason: op.reason, card };
-    if (op.state === 'executing') return this.uncertain(op, '上次调用未定案，不重发', signal);
+    if (op.state === 'executing') return this.uncertain(op, '上次调用结果不确定，不重发', signal);
     if ((op.needsApproval || this.requiresExplicitApproval(op.request)) && op.state !== 'approved') return { ok: false, reason: '没有本次有效的本人点头' };
     if (terminal(card)) return this.stale(op, '这件活已取消，旧点头作废', signal);
     if (op.confirmation) {
@@ -441,7 +497,7 @@ export class Workers {
       if (snapshot?.loopBinding) this.refreshKernelCard(card, snapshot, `dispatch:${op.id}`);
     }
     card.waiting = ''; card.notice = op.reason;
-    card.dispatches.push({ id: op.id, outcome: manual ? 'manual-reconciliation' : 'dispatch-reconciliation', resolution: op.resolution });
+    card.dispatches.push({ id: op.id, action: op.request.action, outcome: manual ? 'manual-reconciliation' : 'dispatch-reconciliation', resolution: op.resolution });
     card.updated = new Date().toISOString(); this.store.putTask(card);
   }
   private async reconcileTaskDispatches(task: string, source: string, signal?: AbortSignal, publish = true) {
@@ -461,24 +517,34 @@ export class Workers {
     const resolved = this.journal.resolveDispatch(owner.id, operationIdentity(owner), { event: source, reason, by: 'program', at: new Date().toISOString(), dispatchPhase: proof.phase, acceptance: proof.acceptance, bindingHash: proof.bindingHash, evidence: proof.evidence }, proof.terminal, op => this.resolutionCard(op, snapshot));
     if (!resolved) return false;
     this.store.log('worker_resolution', { operation: resolved.id, resolution: resolved.resolution });
-    if (publish) await this.messages.publish(resolved.request.taskId, source, undefined, signal); return true;
+    const settled = this.operation(resolved.id)!; // release() may have advanced the durable resource state.
+    settled.dispatchReceipt = { at: settled.resolution?.at ?? new Date().toISOString(), snapshot };
+    if (snapshot.loopBinding) settled.request.loopBinding = snapshot.loopBinding;
+    this.save(settled);
+    this.dispatchCards.accept(settled, snapshot);
+    // Receipt publication is program-owned and cannot wait for a later model turn.
+    if (publish || this.dispatchCards.current(this.store.task(resolved.request.taskId))) await this.messages.publish(resolved.request.taskId, source, this.currentApproval(resolved.request.taskId), signal); return true;
   }
   private async executeGuarded(op: WorkerOperation, signal?: AbortSignal) {
     const card = this.store.task(op.request.taskId)!;
     let latest: WorkerSnapshot;
     try { latest = await this.adapter(op.request.worker).status(op.request, signal); }
     catch (error) {
-      signal?.throwIfAborted(); op.failure = failure(error);
+      if (!op.cardStop) signal?.throwIfAborted(); op.failure = failure(error);
       this.store.log('worker_check_failed', { operation: op.id, failure: op.failure });
-      return this.stale(op, `执行前核实失败（${op.failure.category}）：${op.failure.error} 未执行。`, signal);
+      return this.stale(op, `执行前核实失败（${op.failure.category}）：${op.failure.error} 未执行。`, op.cardStop && signal?.aborted ? undefined : signal);
     }
-    if (latest.fingerprint !== op.basis.fingerprint) return this.stale(op, activeStates.includes(latest.state) && !activeStates.includes(op.basis.state) ? '批次已自己恢复' : '状态或提交已变化，旧点头作废', signal, latest.state);
+    if (op.cardStop && (!this.dispatchCards.ownsStop(op) || !this.dispatchCards.matches(this.dispatchCards.get(card.id)!, latest))) return this.stale(op, '卡上原执行身份已变化，旧停止令牌作废，未停止', signal);
+    if (!op.cardStop && latest.fingerprint !== op.basis.fingerprint) return this.stale(op, activeStates.includes(latest.state) && !activeStates.includes(op.basis.state) ? '批次已自己恢复' : '状态或提交已变化，旧点头作废', signal, latest.state);
     if (latest.executable === false) return this.stale(op, 'worker 当前已不能接受该操作，未执行；请回电脑核对', signal);
     const currentCard = this.store.task(card.id)!;
     if (terminal(currentCard) || definition(currentCard) !== op.definition) return this.stale(op, '任务已取消或定义变化，旧点头作废', signal);
     // Re-derive mandatory consent after awaited checks, including for legacy
     // operations with an incorrect cached needsApproval/redLine flag.
     if ((op.needsApproval || this.requiresExplicitApproval(op.request)) && op.state !== 'approved') return this.stale(op, '执行前核对：缺少本次有效的本人独立点头，未执行', signal);
+    // A fresh card click authorizes this original identity, not a frozen progress
+    // revision of every sibling. Keep the adapter's final guard on the latest facts.
+    if (op.cardStop) op.basis = latest;
     // The irreversible execution claim is before EVERY adapter effect. No retry path.
     const expected = op.state; op.state = 'executing';
     if (!this.journal.claim(op, expected)) return this.stale(op, '派工编号已被消费，或原操作结果未核销，不重复执行', signal);
@@ -495,37 +561,66 @@ export class Workers {
         this.store.putTask(current); op.request.batchFile = file; if (launch) op.request.launch = launch; this.save(op);
       }, signal);
       else receipt = await adapter[op.request.action](request, signal);
-    } catch { return this.uncertain(op, '调用结果不确定，不重发；请回电脑核对原批次', signal); }
+    } catch { return this.uncertain(op, op.cardStop ? '停止调用结果不确定，不重复停止；保留成果，请核对卡上原执行' : '调用结果不确定，不重发；请回电脑核对原批次', signal); }
+    receipt = await this.cardStopReceipt(op, receipt, signal);
+    if (op.cardStop && receipt.status === 'blocked') {
+      op.stopNotCalled = true;
+      receipt = { ...receipt, reason: `${receipt.reason}；已核实未调用停止，可重新点击原卡停止按钮，届时重新核对原对象` };
+    }
     if (op.request.worker === 'pi' && receipt.workerId) {
       const current = this.store.task(card.id)!;
-      current.worker = { kind: 'pi', project: op.request.project, batchFile: receipt.workerId };
+      current.worker = { kind: 'pi', project: op.request.project, batchFile: receipt.workerId, operation: op.id, origin: 'pa' };
       if (!current.subscriptions.some(s => s.kind === 'pi' && s.value === receipt.workerId)) current.subscriptions.push({ kind: 'pi', value: receipt.workerId });
       this.store.putTask(current); op.request.batchFile = receipt.workerId;
     }
     if (receipt.snapshot?.loopBinding) op.request.loopBinding = receipt.snapshot.loopBinding;
-    op.state = receipt.status; op.reason = receipt.reason; this.save(op);
-    const current = this.store.task(card.id)!;
+    op.state = receipt.status; op.reason = receipt.reason;
+    if (receipt.status === 'sent' && (op.request.action === 'dispatch' || op.request.worker === 'pi' && op.request.action === 'reply')) op.dispatchReceipt = { at: new Date().toISOString(), snapshot: receipt.snapshot };
+    this.save(op);
+    if (op.stopNotCalled) this.dispatchCards.rearm(op);
+    this.receiptCard(op, receipt);
+    this.dispatchCards.accept(op, receipt.snapshot);
+    this.store.log('worker_result', { operation: op.id, task: card.id, receipt });
+    const messageDigest = hash(JSON.stringify(this.messages.view(this.store.task(card.id)!)));
+    await this.messages.publish(card.id, op.thread, undefined, op.stopNotCalled && signal?.aborted ? undefined : signal);
+    const delivery = this.messages.delivery(card.id, messageDigest);
+    return { ok: op.state === 'sent', status: op.state, reason: op.reason, card: this.store.task(card.id), delivery };
+  }
+  private receiptCard(op: WorkerOperation, receipt: WorkerReceipt) {
+    const current = this.store.task(op.request.taskId);
+    if (!current || current.worker?.batchFile !== op.request.batchFile || current.worker.kind !== op.request.worker) return;
+    if (op.request.action === 'dispatch' && (current.worker.operation && current.worker.operation !== op.id
+      || [current.goal, current.completion, current.boundary].join('\0') !== [op.request.goal, op.request.completion, op.request.boundary].join('\0'))) return;
+    const binding = receipt.snapshot?.loopBinding;
+    if (!op.cardStop && binding && current.worker.loop && !sameBinding(binding, current.worker.loop)) return;
+    if (current.dispatches.some(d => d && typeof d === 'object' && 'id' in d && d.id === op.id && 'action' in d && d.action === op.request.action)) {
+      if (binding && !op.cardStop) this.refreshKernelCard(current, receipt.snapshot!, `receipt:${op.id}`);
+      return;
+    }
     current.dispatches.push({ id: op.id, action: op.request.action, outcome: op.state, by: op.by ?? 'config', at: new Date().toISOString() });
-    current.waiting = ''; current.notice = `${!op.needsApproval && receipt.status === 'sent' ? '已直接处理。' : ''}${receipt.reason}`;
-    if (op.state === 'uncertain') current.status = 'uncertain';
-    else if (op.state === 'sent') {
-      if (op.request.loopBinding) current.status = op.request.action === 'stop' ? op.request.loopBinding.taskId ? current.status : 'stopped' : 'resume-requested';
-      else current.status = op.request.worker === 'pi' ? op.request.action === 'stop' ? 'stopping' : this.pi.job(op.request.batchFile)?.state === 'queued' ? 'queued' : 'running' : op.request.action === 'stop' ? 'stopped' : 'running';
+    if (!terminal(current)) {
+      current.waiting = ''; current.notice = `${!op.needsApproval && receipt.status === 'sent' ? '已直接处理。' : ''}${receipt.reason}`;
+      if (op.state === 'uncertain') current.status = 'uncertain';
+      else if (op.state === 'sent') {
+        if (op.cardStop) current.status = 'stopped';
+        else if (op.request.loopBinding) current.status = op.request.action === 'stop' ? op.request.loopBinding.taskId ? current.status : 'stopped' : 'resume-requested';
+        else current.status = op.request.worker === 'pi' ? op.request.action === 'stop' ? 'stopping' : this.pi.job(op.request.batchFile)?.state === 'queued' ? 'queued' : 'running' : op.request.action === 'stop' ? 'stopped' : 'running';
+      }
     }
     current.updated = new Date().toISOString(); this.store.putTask(current);
-    if (receipt.snapshot?.loopBinding) this.refreshKernelCard(current, receipt.snapshot, `receipt:${op.id}`);
-    this.store.log('worker_result', { operation: op.id, task: card.id, receipt });
-    await this.messages.publish(card.id, op.thread, undefined, signal);
-    return { ok: op.state === 'sent', status: op.state, reason: op.reason, card: current };
+    if (receipt.snapshot?.loopBinding && !op.cardStop) this.refreshKernelCard(current, receipt.snapshot, `receipt:${op.id}`);
   }
   private async stale(op: WorkerOperation, reason: string, signal?: AbortSignal, state?: string) {
     const current = this.operation(op.id);
     if (current && !['planned', 'approved'].includes(current.state)) return { ok: false, status: current.state, reason: current.reason, card: this.store.task(op.request.taskId) };
-    op.state = 'stale'; op.reason = reason; this.save(op);
+    op.state = 'stale';
+    if (op.cardStop) { op.stopNotCalled = true; reason += ' 已核实未调用停止；可重新点击原卡停止按钮，届时重新核对原对象。'; }
+    op.reason = reason; this.save(op);
+    if (op.cardStop) this.dispatchCards.rearm(op);
     const card = this.store.task(op.request.taskId)!; card.notice = reason; card.waiting = '';
     if (state && !terminal(card)) card.status = state;
     card.dispatches.push({ id: op.id, outcome: 'stale', reason, at: new Date().toISOString() }); this.store.putTask(card);
-    await this.messages.publish(card.id, op.thread, undefined, signal);
+    await this.messages.publish(card.id, op.thread, op.cardStop ? this.currentApproval(card.id) : undefined, signal);
     this.store.log('worker_stale', { id: op.id, reason });
     return { ok: false, status: 'stale', reason, ...(op.failure ? { category: op.failure.category, error: op.failure.error } : {}), card, next: '把当前整张卡和变化用于重新给建议，不执行旧方案' };
   }
@@ -547,15 +642,23 @@ export class Workers {
       if (op.state === 'executing' && op.request.worker === 'pi' && this.pi.job(op.id)) {
         const job = this.pi.job(op.id)!;
         op.state = 'sent'; op.reason = 'Pi 原派工已持久化，继续跟踪原编号，不重派'; op.resolution = { event: `recovery:${op.id}`, reason: op.reason };
-        op.request.batchFile = job.id; this.save(op);
+        op.request.batchFile = job.id; op.dispatchReceipt = { at: new Date(job.created).toISOString() }; this.save(op);
         const card = this.store.task(op.request.taskId);
-        if (card) { card.worker = { kind: 'pi', project: op.request.project, batchFile: job.id }; if (!card.subscriptions.some(s => s.kind === 'pi' && s.value === job.id)) card.subscriptions.push({ kind: 'pi', value: job.id }); this.store.putTask(card); }
-      } else if (op.state === 'executing') await this.uncertain(this.operation(op.id)!, '上次 PA 中断时调用未定案，不确定、不重发；请回电脑核对');
+        if (card) { card.worker = { kind: 'pi', project: op.request.project, batchFile: job.id, operation: op.id, origin: 'pa' }; if (!card.subscriptions.some(s => s.kind === 'pi' && s.value === job.id)) card.subscriptions.push({ kind: 'pi', value: job.id }); this.store.putTask(card); }
+      } else if (op.cardStop && op.state === 'approved') await this.stale(op, '上次停止点击在执行领取前中断，未调用停止');
+      else if (op.state === 'executing') await this.uncertain(this.operation(op.id)!, op.cardStop ? '上次 PA 中断时停止未定案，停止结果不确定、不重复停止；保留成果，请核对原执行' : '上次 PA 中断时调用未定案，不确定、不重发；请回电脑核对');
       else if (op.state === 'uncertain') this.save(op); // Rebuild legacy per-task unresolved indexes, never from display status.
       const pending = this.operation(op.id)!;
+      if (pending.stopNotCalled && this.dispatchCards.rearm(pending)) await this.messages.publish(pending.request.taskId, `recovery:${pending.id}`, this.currentApproval(pending.request.taskId));
       if (pending.state === 'uncertain' && pending.request.action === 'dispatch' && pending.request.launch) {
         const probe = await this.probeDispatch(pending);
         if (probe.snapshot) await this.reconcileDispatch(pending, probe.snapshot, `recovery:${pending.id}`);
+      }
+      const settled = this.operation(op.id)!;
+      if (settled.state === 'sent' && (settled.request.action === 'dispatch' || settled.request.worker === 'pi' && settled.request.action === 'reply')) {
+        if (settled.dispatchReceipt) this.receiptCard(settled, { status: 'sent', reason: settled.reason, snapshot: settled.dispatchReceipt.snapshot });
+        this.dispatchCards.accept(settled, settled.dispatchReceipt?.snapshot);
+        if (this.dispatchCards.current(this.store.task(settled.request.taskId))) await this.messages.publish(settled.request.taskId, `recovery:${settled.id}`, this.currentApproval(settled.request.taskId));
       }
     }
     // Crash may occur after the last decision is durable but before its queue
@@ -625,6 +728,9 @@ export class Workers {
     const op = this.operation(job.id);
     card.waiting = job.state === 'needs-decision' ? job.outcome.answer.question ?? '需要你决定' : '';
     card.conclusion = job.outcome.answer.summary;
+    card.lastVerifiedAt = new Date().toISOString();
+    card.sourceCurrent = { worker: 'pi', state: job.state, checkedAt: card.lastVerifiedAt, active: false };
+    card.sourceHealth = { ok: true, checkedAt: card.lastVerifiedAt };
     card.notice = `${op && !op.needsApproval ? '已直接处理。' : ''}${input.text}${!job.outcome.cleaned ? '（未确认无残留，保留并发占用，请回电脑核对）' : ''}`;
     card.presentation = job.state === 'needs-decision' ? { cause: input.text, assessment: 'Pi 已结束，不能原地等答复', suggestion: '请回答这项取舍；带本人答案在同一件活下新派一次，不自动重派' } : { cause: input.text, assessment: '按本次身份及结果文件核实，不代表业务验收通过', suggestion: job.state === 'done' ? '查看结果及证据；不合入、不推送' : '请核对本次派工日志；没有自动重派' };
     card.verified = { event: input.id, state: job.state, stage: null, layers: null, manual: [], evidence: input.evidence ?? {}, snapshot: { operation: job.id, cleaned: job.outcome.cleaned, fingerprint: raw.fingerprint } };
@@ -639,49 +745,132 @@ export class Workers {
     const facts = (snapshot.data as LoopBatch).kernel!;
     if (!sourceTaskId && facts.tasks.length > 1) throw new SafeError('ambiguous_target', '多任务须指定来源任务 ID，不将整批当一件任务');
     const actual = binding.taskId ?? facts.tasks[0]!.id, selected = { ...binding, taskId: actual };
+    return this.adoptKernel(facts, actual, snapshot, true);
+  }
+  /** Discovery is read-only adoption, never dispatch. All identities in one run
+   * are persisted together; a failed save leaves the discovery cursor untouched. */
+  observeLoop(facts: KernelFacts) {
+    return this.store.transaction(() => facts.tasks.map(task => this.adoptKernel(facts, task.id)));
+  }
+  private adoptKernel(facts: KernelFacts, actual: string, snapshot?: WorkerSnapshot, refresh = false) {
+    const binding = facts.binding, selected = { ...binding, taskId: actual };
     const id = `loop-${hash(JSON.stringify(selected)).slice(0, 24)}`;
-    const old = this.store.task(id) ?? this.store.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.loop.runId')=? AND json_extract(body,'$.worker.loop.repository')=?").all(binding.runId, binding.repository).map(r => parseJson<TaskCard>(String(r.body))).find(t => t.worker?.loop?.cardFile === binding.cardFile && (t.worker.loop.taskId === actual || t.worker.loop.taskId === null && facts.tasks.length === 1));
-    if (old) return old;
-    const p = this.config.projects.find(p => p.id === project || p.root === project)!;
+    const candidates = this.store.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.kind')='loop' AND json_extract(body,'$.worker.batchFile')=?").all(binding.cardFile).map(r => parseJson<TaskCard>(String(r.body)));
+    const old = this.store.task(id) ?? candidates.find(t => t.worker?.loop?.repository === binding.repository && t.worker.loop.runId === binding.runId
+      && (t.worker.loop.taskId === actual || t.worker.loop.taskId === null && facts.tasks.length === 1)) ?? candidates.find(t => {
+        const launch = t.worker?.operation ? this.operation(t.worker.operation)?.request.launch : undefined;
+        return !t.worker?.loop && facts.tasks.length === 1 && launch?.protocol === 'kernel:1' && launch.batchFile === binding.cardFile && launch.repository === binding.repository;
+      });
+    const awakened = old && ['已合入', '已放弃', 'done'].includes(old.status) && !facts.executionEnded;
+    if (old && (terminal(old) || !refresh && old.worker?.loop && !awakened)) return old;
     const task = facts.tasks.find(t => t.id === actual)!;
-    const card: TaskCard = { id, title: task.name, goal: '跟踪本人在获准仓库启动的原 Loop 任务', completion: '分别核对执行、技术检查、发布和业务验收，不以可合入冒充业务完成', boundary: '原项目授权内；不合入、不推送、不部署', status: task.state, waiting: '', dispatches: [], conclusion: '', updated: facts.verifiedAt,
-      subscriptions: [{ kind: 'loop', value: batchFile }], worker: { kind: 'loop', project: p.root, batchFile: binding.cardFile, loop: selected, origin: 'owner-loop' } };
-    this.store.putTask(card); this.refreshKernelCard(card, { ...snapshot, loopBinding: selected }, `bind:${id}`); return this.store.task(id)!;
+    const card: TaskCard = old ?? { id, title: task.name, goal: '', completion: '分别核对执行、技术检查、发布和业务验收；任务定义待读取', boundary: '原项目授权内；不合入、不推送、不部署', status: task.state, waiting: '', dispatches: [], conclusion: '', updated: facts.verifiedAt,
+      sourceDefinition: { state: 'pending' }, subscriptions: [{ kind: 'loop', value: binding.cardFile }], worker: { kind: 'loop', project: facts.project, batchFile: binding.cardFile, loop: selected, origin: 'owner-loop' } };
+    const data: LoopBatch = { project: facts.project, batch: { file: binding.cardFile, name: facts.name }, state: facts.state, stages: [], kernel: facts };
+    return this.store.transaction(() => {
+      if (!old) this.store.putTask(card);
+      this.refreshKernelCard(card, { ...(snapshot ?? { state: task.state, fingerprint: kernelFingerprint(facts, actual), data }), loopBinding: selected }, `bind:${card.id}`);
+      return this.store.task(card.id)!;
+    });
   }
   private refreshKernelCard(card: TaskCard, snapshot: WorkerSnapshot, event: string) {
-    const facts = (snapshot.data as LoopBatch).kernel, binding = snapshot.loopBinding;
+    const facts = (snapshot.data as LoopBatch).kernel, sourceBinding = snapshot.loopBinding, original = card.worker?.loop;
+    // A whole-run dispatch receipt for a sole task must not erase a more precise
+    // source task identity already established by discovery.
+    const binding = sourceBinding?.taskId === null && original?.taskId && sameSourceBinding(original, { ...sourceBinding, taskId: original.taskId }) ? original : sourceBinding;
     if (!facts || !binding || terminal(card)) return false;
     const selected = selectKernel(facts, binding).task;
     card.worker!.loop = binding;
     return this.store.applyLoopSnapshot(card, facts.revision, kernelFingerprint(facts, binding.taskId), () => {
-      card.status = selected?.state ?? facts.state; card.lastVerifiedAt = facts.verifiedAt; card.control = `查询、按原对象停止；${facts.resumeBlocked ? `普通续跑不可用：${facts.resumeBlocked}` : '仅无新增要求且无发布后果的续跑'}；送话/合入/推送/部署不可用`;
-      card.verified = { event, state: card.status, stage: null, layers: { execution: selected ?? facts.tasks, checks: facts.checks, results: facts.results, missing: facts.missing, publication: facts.publication, businessAcceptance: '未验证' }, manual: facts.acceptanceItems, evidence: facts.evidence, snapshot: facts };
+      if (card.sourceDefinition) card.sourceDefinition.state = 'pending';
+      card.status = facts.executionEnded && ['已合入', '已放弃'].includes(facts.state) ? facts.state : selected?.state ?? facts.state; card.lastVerifiedAt = facts.verifiedAt; card.sourceHealth = { ok: true, checkedAt: facts.verifiedAt }; card.control = `查询、按原对象停止；${facts.resumeBlocked ? `普通续跑不可用：${facts.resumeBlocked}` : '仅无新增要求且无发布后果的续跑'}；送话/合入/推送/部署不可用`;
+      card.verified = { event, state: card.status, stage: null, layers: { execution: selected ?? facts.tasks, checks: facts.checks, results: facts.results, missing: facts.missing, publication: facts.publication, businessAcceptance: '未验证' }, manual: facts.acceptanceItems, evidence: facts.evidence, snapshot: { protocol: 'kernel:1', binding, revision: facts.revision, state: facts.state, node: facts.node, verifiedAt: facts.verifiedAt, tasks: (selected ? [selected] : facts.tasks).map(t => ({ id: t.id, epoch: t.epoch })), note: '当前事实投影；原任务详情和证据按需读取，不保留完整来源快照' } };
       card.dispatches.push({ event, revision: facts.revision, runId: binding.runId, sourceTaskId: binding.taskId, at: facts.verifiedAt });
       card.updated = facts.verifiedAt;
     });
+  }
+  private markSourceRemoved(card: TaskCard, facts: KernelFacts, event: string) {
+    const binding = card.worker!.loop!;
+    if (!binding.taskId || terminal(card) || card.verified?.state === 'source-removed') return false;
+    const changed = this.store.applyLoopSnapshot(card, facts.revision, kernelFingerprint(facts, binding.taskId), () => {
+      card.status = 'incomplete'; // Not business completion or stop/release proof.
+      card.lastVerifiedAt = facts.verifiedAt; card.sourceHealth = { ok: true, checkedAt: facts.verifiedAt };
+      card.control = '原来源任务已移出；保留原绑定与历史，不能转绑兄弟任务或扩大控制范围';
+      card.verified = { event, state: 'source-removed', stage: null,
+        layers: { execution: { id: binding.taskId, state: 'source-removed', stopped: '未核实', reason: '原任务已从正式记录移出；不代表执行清理或业务完成' }, checks: '历史检查保留，未重新核对', publication: '原事项未核实', businessAcceptance: '未验证' },
+        manual: card.verified?.manual ?? [], evidence: card.verified?.evidence ?? {},
+        snapshot: { protocol: 'kernel:1', binding, revision: facts.revision, state: 'source-removed', verifiedAt: facts.verifiedAt, tasks: [] } };
+      card.dispatches.push({ event, revision: facts.revision, sourceTaskId: binding.taskId, state: 'source-removed', at: facts.verifiedAt }); card.updated = facts.verifiedAt;
+    });
+    if (changed) {
+      const current = this.store.task(card.id)!;
+      if (!current.waiting) current.waiting = '原来源任务已移出，请核对原事项的后续安排；没有自动重派';
+      current.notice = `原来源任务 ${binding.taskId} 已移出；原绑定及历史保留，停止/清理和业务交付仍未核实。${current.notice ?? ''}`;
+      this.store.putTask(current);
+    }
+    return changed;
+  }
+  private sourceCards(binding: LoopBinding, project: string) {
+    const p = this.config.projects.find(p => p.id === project || p.root === project);
+    if (!p) return [];
+    return this.store.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.kind')='loop' AND json_extract(body,'$.worker.project') IN (?,?) AND json_extract(body,'$.worker.loop.protocol')='kernel:1' AND json_extract(body,'$.worker.loop.repository')=? AND json_extract(body,'$.worker.loop.runId')=? AND json_extract(body,'$.worker.loop.cardFile')=? AND json_extract(body,'$.worker.loop.ledger')=? ORDER BY rowid")
+      .all(p.id, p.root, binding.repository, binding.runId, binding.cardFile, binding.ledger).map(row => parseJson<TaskCard>(String(row.body))).filter(card => !terminal(card) && card.verified?.state !== 'source-removed');
   }
   private async ingestKernel(input: Input, signal?: AbortSignal) {
     const raw = input.raw as { runId?: string; revision?: number; ledger?: string };
     const card = input.workerId ? this.store.task(input.workerId) : undefined, binding = card?.worker?.loop;
     if (!card || !binding || raw.runId !== binding.runId || raw.ledger !== binding.ledger || !Number.isSafeInteger(raw.revision)) return false;
-    if (raw.revision! <= (card.sourceRevision ?? -1)) { this.store.loopVerification(input, false); return false; }
+    const existing = this.sourceCards(binding, card.worker!.project);
+    if (!existing.length || existing.every(c => raw.revision! <= (c.sourceRevision ?? -1))) { this.store.loopVerification(input, false); return false; }
     this.store.loopVerification(input, true); // Durable observation is not yet successful verification.
     const request = this.request(`kernel:${input.id}`, 'worker_reply', { taskId: card.id, mode: 'resume' });
-    const snapshot = await this.adapter('loop').status(request, signal), facts = (snapshot.data as LoopBatch).kernel;
-    if (!facts || facts.revision < raw.revision!) throw new SafeError('unverified', '原修订尚不能核实，保留只读重核');
-    const changed = this.refreshKernelCard(card, snapshot, input.id);
-    this.store.loopVerification(input, false); // Clear BEFORE any Router turn/control/notification can start.
-    if (!changed) return false;
-    const pendingId = this.store.get<string | null>(`worker:pending:${card.id}`, null), pending = pendingId ? this.operation(pendingId) : null;
-    if (pending?.state === 'planned' && pending.basis.fingerprint !== snapshot.fingerprint) {
-      pending.state = 'stale'; pending.reason = '原执行版本变化，旧点头作废'; this.save(pending); this.resumeReadyGroup(pending.thread);
+    // This is verification of the original RUN, not a control operation on the
+    // wake-up card. Its former task may have been removed from that run.
+    const snapshot = await this.adapter('loop').status({ ...request, loopBinding: { ...binding, taskId: null } }, signal), facts = (snapshot.data as LoopBatch).kernel;
+    if (!facts || !sameSourceBinding(binding, { ...facts.binding, taskId: binding.taskId })) throw new SafeError('identity_mismatch', '运行级核实没有返回原仓库/运行/原卡/ledger 身份');
+    if (facts.revision < raw.revision!) throw new SafeError('unverified', '原修订尚不能核实，保留只读重核');
+    const changed = this.store.transaction(() => {
+      const current = this.sourceCards(binding, card.worker!.project);
+      if (current.some(c => (c.sourceRevision ?? -1) > facts.revision)) throw new SafeError('unverified', '原来源返回旧修订，保留最新可靠事实');
+      this.observeLoop(facts);
+      const updated: TaskCard[] = [];
+      // A run revision wakes Router once, while every original task keeps its
+      // own binding, facts, approval, output references and message identity.
+      for (const selected of this.sourceCards(binding, card.worker!.project)) {
+        const target = selected.worker!.loop!;
+        const taskId = target.taskId ?? (facts.tasks.length === 1 ? facts.tasks[0]!.id : null);
+        if (!taskId) continue;
+        const present = facts.tasks.some(t => t.id === taskId);
+        const saved = present ? this.refreshKernelCard(selected, { ...snapshot, loopBinding: { ...target, taskId }, fingerprint: kernelFingerprint(facts, taskId) }, input.id) : this.markSourceRemoved(selected, facts, input.id);
+        if (saved) {
+          this.store.db.prepare('INSERT OR IGNORE INTO task_events(task,event) VALUES(?,?)').run(selected.id, input.id);
+          updated.push(this.store.task(selected.id)!);
+        }
+      }
+      this.store.loopVerification(input, false); // Facts + event association are durable before Router.
+      return updated;
+    });
+    if (!changed.length) return false;
+    for (const selected of changed) {
+      const pendingId = this.store.get<string | null>(`worker:pending:${selected.id}`, null), pending = pendingId ? this.operation(pendingId) : null;
+      if (pending?.state === 'planned' && pending.basis.fingerprint !== kernelFingerprint(facts, selected.worker!.loop!.taskId)) {
+        pending.state = 'stale'; pending.reason = selected.verified?.state === 'source-removed' ? '原来源任务已移出，旧操作不能执行' : '原执行版本变化，旧点头作废'; this.save(pending); this.resumeReadyGroup(pending.thread);
+      }
+      // Removal is absence from the formal task set, never release/stop proof.
+      if (selected.verified?.state !== 'source-removed') await this.reconcileTaskDispatches(selected.id, input.id, signal, false);
     }
-    await this.reconcileTaskDispatches(card.id, input.id, signal, false);
-    return !card.deferred;
+    const quietRecovery = this.store.get<boolean>(`kernel:quiet-recovery:${input.id}`, false);
+    if (quietRecovery) this.store.set(`kernel:quiet-recovery:${input.id}`, false);
+    return changed.some(c => !c.deferred) && !quietRecovery;
   }
   async ingest(input: Input, signal?: AbortSignal) {
     if (input.source === 'loop' && (input.raw as { kernel?: number } | undefined)?.kernel === 1) {
-      try { return await this.ingestKernel(input, signal); } catch (error) { signal?.throwIfAborted(); this.store.log('worker_unverified', { inputId: input.id, failure: failure(error) }); return false; }
+      try { return await this.ingestKernel(input, signal); } catch (error) {
+        signal?.throwIfAborted();
+        const card = input.workerId ? this.store.task(input.workerId) : undefined;
+        if (card?.worker?.loop) { card.sourceHealth = { ok: false, checkedAt: new Date().toISOString(), reason: failure(error).error }; this.store.putTask(card); }
+        this.store.log('worker_unverified', { inputId: input.id, failure: failure(error) }); return false;
+      }
     }
     if (input.source === 'pi') return this.ingestPi(input, signal);
     if (input.source !== 'loop' || !input.project || !input.batchFile || !input.status) return true;
@@ -749,6 +938,9 @@ export class Workers {
       }
       const unresolved = this.journal.unresolved(card.id);
       if (unresolved.length) card.notice = `原操作 ${unresolved.join('、')} 结果仍不确定、尚未按原编号核销，不重发；请回电脑核对`;
+      card.lastVerifiedAt = new Date().toISOString();
+      card.sourceCurrent = { worker: 'loop', state: snapshot.state, checkedAt: card.lastVerifiedAt, active: snapshot.active === true, next: snapshot.next };
+      card.sourceHealth = { ok: true, checkedAt: card.lastVerifiedAt };
       this.store.recordTaskEvent(card, input, status);
       if (event.status === 'done' || event.status === 'resumed') await this.messages.publish(card.id, input.id, this.currentApproval(card.id), signal);
     }

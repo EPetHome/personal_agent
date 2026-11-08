@@ -9,8 +9,9 @@
       "base": "dev",
       "allow": ["code/"], "deny": ["code/private/"]
     },
-    "pi": { "writeDirs": ["/tmp/pa-example/project/docs"], "skills": {} }
+    "pi": { "writeDirs": ["/tmp/pa-example/project/PA产出"], "skills": {} }
   }],
+  "outputs": {"otherProject": "example"},
   "readAllow": [],
   "readDeny": [],
   "model": {

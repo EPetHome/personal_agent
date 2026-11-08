@@ -6,11 +6,13 @@ import { Router } from './router.js';
 import { deliver, makeChannel, normalizeFeishu, prepareAttachments, type Channel } from './channel.js';
 import { Intake } from './intake.js';
 import { atomicJson } from './util.js';
+import { LoopMonitor } from './loop-monitor.js';
 
 export class App {
   readonly store: Store;
   readonly router: Router;
   readonly intake: Intake;
+  readonly loopMonitor: LoopMonitor;
   readonly identity = { pid: process.pid, token: randomUUID(), started: Date.now() };
   private stopping = false;
   private heartbeatTimer?: NodeJS.Timeout;
@@ -27,10 +29,11 @@ export class App {
     this.acquire();
     try {
       this.router = new Router(c, this.store, channel);
+      this.loopMonitor = new LoopMonitor(c, this.store, this.router.workers);
       this.intake = new Intake(c, this.store, this.router.files, input => {
         // A scan already accepted before stop may finish persisting, but cannot start work.
         if (this.store.enqueue(input) || this.store.retryLoopSource(input)) this.pump();
-      });
+      }, facts => this.router.workers.observeLoop(facts));
     } catch (error) { this.release(); this.store.close(); throw error; }
   }
   static async create(c: Config) { const store = new Store(c); try { return new App(c, await makeChannel(c, store), store); } catch (e) { if (store.db.isOpen) store.close(); throw e; } }
@@ -71,6 +74,7 @@ export class App {
     });
     await pollPi();
     this.piTimer = setInterval(() => { this.piWork = this.piWork.then(pollPi).catch(error => this.fail(error)); }, this.c.pi.pollMs);
+    this.loopMonitor.start(error => this.fail(error));
   }
   receive(input: Input) { if (!this.stopping && (this.store.enqueue(input) || this.store.retryLoopSource(input))) this.pump(); }
   private pump() {
@@ -106,17 +110,25 @@ export class App {
     }
   }
   private heartbeat() { return atomicJson(join(this.c.dataDir, 'heartbeat.json'), { ...this.identity, at: Date.now() }); }
-  private fail(error: unknown) { this.fatal?.(error); }
+  private fail(error: unknown) {
+    // Fatal background work must detach this observer even without a host callback.
+    void this.loopMonitor.stop().catch(() => {});
+    this.fatal?.(error);
+  }
   async stop() {
     if (this.stopping) return;
     this.stopping = true;
     clearInterval(this.busyTimer); clearInterval(this.heartbeatTimer); clearInterval(this.piTimer);
+    const stoppingMonitor = this.loopMonitor.stop();
     // Stop intake first; no newly acknowledged messages disappear during drain.
     const stoppingIntake = Promise.all([this.channel.stop(), this.intake.stop()]);
     const grace = setTimeout(() => this.controller?.abort(new Error('shutdown')), Math.max(1, this.c.queue.stopMs - 2000));
     try {
-      await Promise.all([stoppingIntake, this.running, this.busyWork, this.heartbeatWork, this.piWork]);
+      await Promise.all([stoppingMonitor, stoppingIntake, this.running, this.busyWork, this.heartbeatWork, this.piWork]);
       await this.router.workers.pi.idle(); // Detach monitoring only; never kill running Pi.
+      // Router may admit a card after observation stopped. Join all producers
+      // before the final delivery barrier, then release ownership/close Store.
+      await this.loopMonitor.idle();
       this.release();
     } finally { clearTimeout(grace); this.router.close(); this.store.close(); }
   }

@@ -6,6 +6,8 @@ import type { Config, Input } from './types.js';
 import type { Store } from './store.js';
 import type { Files } from './files.js';
 import { canonical, hash } from './util.js';
+import { LoopDiscovery, DISCOVERY_FALLBACK_MS, DISCOVERY_WAKE_MS } from './loop-discovery.js';
+import type { KernelFacts } from './loop-kernel.js';
 
 export class Intake {
   private watchers: FSWatcher[] = [];
@@ -13,32 +15,47 @@ export class Intake {
   private fallback?: NodeJS.Timeout;
   private debounce?: NodeJS.Timeout;
   private stopped = false;
+  private restoring = true;
+  private boundCycleComplete = false;
   private scanPromise: Promise<void> = Promise.resolve();
-  constructor(readonly c: Config, readonly store: Store, readonly files: Files, readonly receive: (input: Input) => void) {}
+  readonly discovery?: LoopDiscovery;
+  constructor(readonly c: Config, readonly store: Store, readonly files: Files, readonly receive: (input: Input) => void, adopt?: (facts: KernelFacts) => unknown) {
+    if (adopt) this.discovery = new LoopDiscovery(c, store, files, adopt, () => this.wake());
+  }
+  private wake() {
+    // Do not reset this timer on every write: a busy producer cannot starve verification.
+    if (!this.debounce && !this.stopped) this.debounce = setTimeout(() => { this.debounce = undefined; void this.scan(); }, DISCOVERY_WAKE_MS);
+  }
   async start() {
     const roots = [...this.c.inboxDirs, ...this.c.loop.eventDirs];
     if (this.c.intake.watch) for (const root of roots) {
       try {
-        const watcher = watch(root, { recursive: true }, () => { clearTimeout(this.debounce); this.debounce = setTimeout(() => this.scan(), 60); });
+        const watcher = watch(root, { recursive: true }, () => this.wake());
         watcher.on('error', () => { this.store.log('intake_watch_failure', { path: root, outcome: '文件通知失效，继续低频兜底' }); });
         this.watchers.push(watcher);
       } catch { this.store.log('intake_watch_failure', { path: root, outcome: '文件通知不可用，继续低频兜底' }); }
     }
-    this.fallback = setInterval(() => this.scan(), this.c.intake.fallbackMs);
+    this.fallback = setInterval(() => this.scan(), Math.min(DISCOVERY_FALLBACK_MS, this.c.intake.fallbackMs));
     await this.scan();
   }
-  scan() {
+  scan(continuation = false) {
     this.scanPromise = this.scanPromise.then(async () => {
       if (this.stopped) return;
+      if (!continuation) this.boundCycleComplete = false;
       for (const root of this.c.inboxDirs) await this.walk(root, false);
       for (const root of this.c.loop.eventDirs) await this.walk(root, true);
-      await this.boundLoops();
+      const more = await this.discovery?.scan(continuation);
+      const boundMore = this.boundCycleComplete ? false : await this.boundLoops();
+      if (!boundMore) this.boundCycleComplete = true;
+      if ((more || boundMore) && !this.stopped) setImmediate(() => this.scan(true));
     }).catch(() => { if (!this.stopped) this.store.log('intake_failure', { outcome: '来源暂不可读；保留游标，下次兜底再收' }); });
     return this.scanPromise;
   }
-  /** Existing bindings only. Never enumerate the kernel root or expose a raw ledger as input. */
+  /** Bound revisions share the existing durable verification queue. Discovery
+   * above handles only authorized new identities, never global session bodies. */
   private async boundLoops() {
-    for (const card of this.store.boundLoops()) {
+    const page = this.store.boundLoopPage(this.store.get<{ after: number; upper?: number }>('kernel:scan-position', { after: 0 })), emitted = new Set<string>();
+    for (const card of page.cards) {
       const binding = card.worker!.loop!, project = this.c.projects.find(p => p.id === card.worker!.project || p.root === card.worker!.project);
       if (!project) continue;
       try {
@@ -46,25 +63,42 @@ export class Intake {
         await check();
         if (this.c.intake.watch && !this.boundWatches.has(binding.ledger)) {
           const watcher = watch(dirname(binding.ledger), (_kind, file) => {
-            if (file === 'ledger.json') { clearTimeout(this.debounce); this.debounce = setTimeout(() => this.scan(), 60); }
+            if (file === 'ledger.json') this.wake();
           });
           watcher.on('error', () => { this.boundWatches.delete(binding.ledger); watcher.close(); });
           this.boundWatches.add(binding.ledger); this.watchers.push(watcher);
         }
         const info = await lstat(binding.ledger), signature = `${info.dev}:${info.ino}:${info.mtimeMs}:${info.size}`;
-        const key = `kernel-source:${card.id}`, previous = this.store.get<string | { signature: string; revision: number }>(key, '');
-        let revision: number;
-        if (typeof previous === 'object' && previous.signature === signature) revision = previous.revision;
+        const key = `kernel-source:${hash(JSON.stringify([binding.repository, binding.runId, binding.ledger]))}`, previous = this.store.get<string | { signature: string; revision: number; historical?: boolean }>(key, '');
+        let revision: number, historical: boolean;
+        if (typeof previous === 'object' && previous.signature === signature && typeof previous.historical === 'boolean') { revision = previous.revision; historical = previous.historical; }
         else {
           const { data } = await readBytes(binding.ledger, check, this.c.intake.maxFileBytes);
           const raw = JSON.parse(data.toString('utf8'));
-          if (raw.id !== binding.runId || raw.common !== binding.repository || raw.file !== binding.cardFile || !Number.isSafeInteger(raw.revision)) continue;
+          if (raw.id !== binding.runId || raw.common !== binding.repository || raw.file !== binding.cardFile || !Number.isSafeInteger(raw.revision)) throw new Error('原运行记录身份不符');
           revision = raw.revision;
-          this.store.set(key, { signature, revision }); // Observed cursor only; card.sourceRevision is the verified cursor.
+          historical = !!raw.abandoned || raw.publication?.local === 'merged' && !raw.activity && !(raw.taskRecords ?? []).some((t: { activity?: unknown }) => t.activity);
+          this.store.set(key, { signature, revision, historical }); // Observed cursor only; card.sourceRevision is the verified cursor.
         }
-        if (revision > (card.sourceRevision ?? -1)) this.receive({ id: `kernel:${hash(JSON.stringify([binding, revision]))}`, source: 'loop', who: 'loop', at: new Date().toISOString(), text: '已绑定 Loop 原执行的记录修订变化，请沿原身份核实。', project: project.root, batchFile: binding.cardFile, workerId: card.id, status: 'revision', attachments: [], raw: { kernel: 1, runId: binding.runId, revision, ledger: binding.ledger } });
-      } catch { /* Keep previous verified facts; no-event detection is a later task. */ }
+        if (revision <= (card.sourceRevision ?? -1)) continue;
+        const source = JSON.stringify([binding.repository, binding.runId, binding.cardFile, binding.ledger, revision]);
+        if (emitted.has(source)) continue;
+        const pending = this.store.pendingLoopInput(binding, revision);
+        if (pending && ['pending', 'processing'].includes(pending.state)) { emitted.add(source); continue; }
+        const inputId = pending?.id ?? `kernel:${hash(JSON.stringify([binding, revision]))}`;
+        if (this.restoring && historical) this.store.set(`kernel:quiet-recovery:${inputId}`, true);
+        this.receive(pending?.input ?? { id: inputId, source: 'loop', who: 'loop', at: new Date().toISOString(), text: '已绑定 Loop 原执行的记录修订变化，请沿原身份核实。', project: project.root, batchFile: binding.cardFile, workerId: card.id, status: 'revision', attachments: [], raw: { kernel: 1, runId: binding.runId, revision, ledger: binding.ledger } });
+        emitted.add(source);
+      } catch {
+        // Freshness metadata only; do not turn an unreadable/half-written source
+        // into a lifecycle event, failed task or notification.
+        const current = this.store.task(card.id);
+        if (current) { current.sourceHealth = { ok: false, checkedAt: new Date().toISOString(), reason: '来源记录当前不可读或未通过权限核对；保留最后确认事实，待补查' }; this.store.putTask(current); }
+      }
     }
+    this.store.set('kernel:scan-position', page.cursor);
+    if (!page.hasMore) this.restoring = false;
+    return page.hasMore;
   }
   private async walk(path: string, loop: boolean) {
     if (this.stopped) return;
@@ -114,5 +148,5 @@ export class Intake {
     } finally { await fd.close(); }
   }
   private cursor(path: string, signature: string, offset: number) { this.store.db.prepare('INSERT INTO sources VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,offset=excluded.offset').run(path, signature, offset); }
-  async stop() { this.stopped = true; clearInterval(this.fallback); clearTimeout(this.debounce); for (const w of this.watchers) w.close(); await this.scanPromise; }
+  async stop() { this.stopped = true; clearInterval(this.fallback); clearTimeout(this.debounce); await this.scanPromise; for (const w of this.watchers) w.close(); await this.discovery?.stop(); }
 }

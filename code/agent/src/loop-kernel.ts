@@ -1,4 +1,5 @@
 import { dirname, join, resolve, basename } from 'node:path';
+import { homedir } from 'node:os';
 import { lstat, opendir } from 'node:fs/promises';
 import type { Config, LoopBinding, Project } from './types.js';
 import type { Files } from './files.js';
@@ -30,6 +31,57 @@ export async function repository(c: Config, root: string, signal?: AbortSignal) 
   const common = await canonical((await command('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], c.loop.timeoutMs, root, undefined, signal)).trim());
   const top = await canonical((await command('git', ['rev-parse', '--show-toplevel'], c.loop.timeoutMs, root, undefined, signal)).trim());
   return { common, top };
+}
+/** Locate only the authorized repository's conventional index, never the global runs tree. */
+export async function kernelIndexes(c: Config, files: Files, project: Project, signal?: AbortSignal) {
+  await files.protocolPath(project.root, project.root);
+  const identity = await repository(c, project.root, signal), key = hash(identity.common);
+  const candidates = new Set<string>(), directLedgers: string[] = [];
+  const defaultIndex = join(homedir(), '.pi-autoreview/kernel/runs', key);
+  // Out-of-scope defaults are not promised coverage. Declared sources, however,
+  // must never disappear silently when their permission/read gate fails.
+  if (project.loopRunDirs.some(grant => inside(grant, defaultIndex))) candidates.add(defaultIndex);
+  let unavailable = !project.loopRunDirs.length;
+  for (const grant of project.loopRunDirs) {
+    const runDir = basename(grant) === 'ledger.json' ? dirname(grant) : grant;
+    const exactRun = basename(dirname(dirname(runDir))) === 'runs' && /^[a-f0-9]{64}$/.test(basename(dirname(runDir))) && /^[a-f0-9]{64}$/.test(basename(runDir));
+    if (exactRun) {
+      if (basename(dirname(runDir)) !== key) { unavailable = true; continue; }
+      const ledger = join(runDir, 'ledger.json');
+      try { await files.protocolPath(project.root, ledger); directLedgers.push(ledger); }
+      catch { signal?.throwIfAborted(); unavailable = true; }
+    } else if (basename(dirname(grant)) === 'runs' && /^[a-f0-9]{64}$/.test(basename(grant))) {
+      if (basename(grant) === key) candidates.add(grant); else unavailable = true;
+    } else if (basename(grant) === 'runs') candidates.add(join(grant, key));
+    else candidates.add(join(grant, 'runs', key));
+  }
+  const indexes: string[] = [];
+  for (const path of candidates) {
+    // An authorized absent conventional index can be empty (e.g. first launch).
+    // A refused index cannot be counted as that successful empty observation.
+    try { await files.protocolPath(project.root, path); indexes.push(path); }
+    catch { signal?.throwIfAborted(); unavailable = true; }
+  }
+  const ok = !unavailable && !!(indexes.length || directLedgers.length);
+  return { ...identity, indexes, directLedgers: [...new Set(directLedgers)], coverage: { ok, reason: ok ? undefined : '新版 Loop 运行索引未接通或当前无法核对；不能判断来源为空' } };
+}
+/** Permission/identity gate BEFORE the public query sees the source's card path. */
+export async function kernelSource(c: Config, files: Files, project: Project, ledger: string, signal?: AbortSignal) {
+  const { common } = await repository(c, project.root, signal);
+  if (basename(dirname(dirname(ledger))) !== hash(common)) throw new SafeError('outside_scope', '不是获准仓库的运行索引');
+  const { data } = await readBytes(ledger, () => files.protocolPath(project.root, ledger), c.intake.maxFileBytes);
+  const raw = parseJson<any>(data.toString('utf8'));
+  if (raw.v !== 1 || typeof raw.id !== 'string' || !raw.id || !Number.isSafeInteger(raw.revision) || raw.revision < 0 || raw.common !== common
+    || typeof raw.file !== 'string' || basename(dirname(ledger)) !== hash(raw.file) || join(raw.dir ?? '', 'ledger.json') !== ledger
+    || typeof raw.repo !== 'string' || !inside(raw.repo, raw.file) || await canonical(raw.file) !== raw.file)
+    throw new SafeError('identity_mismatch', '来源不是完整的正式运行记录');
+  const source = await repository(c, raw.repo, signal);
+  if (source.common !== common || source.top !== await canonical(raw.repo)) throw new SafeError('outside_scope', '来源仓库身份不符');
+  if (raw.card?.version !== 1 || raw.card?.nature === '评审' || !Array.isArray(raw.card?.tasks) || !raw.card.tasks.length)
+    throw new SafeError('unsupported', '未知 Loop 开发卡协议');
+  return { id: raw.id as string, card: raw.file as string, ledger, repository: common, revision: raw.revision as number,
+    historical: !!raw.abandoned || raw.publication?.local === 'merged' && !raw.activity && !(raw.taskRecords ?? []).some((t: { activity?: unknown }) => t.activity),
+    initial: { ok: true, kernel: 1, id: raw.id, card: raw.file, ledger, status: '等你决定', tasks: [] } };
 }
 export const sameBinding = (a: LoopBinding, b: LoopBinding) => a.repository === b.repository && a.runId === b.runId && a.cardFile === b.cardFile && a.ledger === b.ledger && a.taskId === b.taskId;
 export function kernelFingerprint(f: KernelFacts, taskId: string | null = null) {
@@ -154,7 +206,8 @@ export async function kernelFacts(c: Config, files: Files, initial: any, query: 
   };
   const summary = await safeEvidence(row.summary); if (summary) evidence.summary = summary;
   const tasks: KernelTask[] = [];
-  const definitions = raw.taskRecords ? raw.taskRecords.filter((t: any) => !t.removed) : [{ ...raw, id: raw.card?.tasks?.[0]?.name, name: raw.card?.tasks?.[0]?.name }];
+  const definitions = Array.isArray(raw.taskRecords) ? raw.taskRecords.filter((t: any) => !t.removed) : [{ ...raw, id: raw.card?.tasks?.[0]?.name, name: raw.card?.tasks?.[0]?.name }];
+  if (definitions.length > 1000) throw new SafeError('resource_limit', '单次运行任务数超过核对上限');
   if (definitions.length !== row.tasks.length || new Set(definitions.map((t: any) => t.id)).size !== definitions.length) throw new SafeError('identity_mismatch', '任务身份集合与 ledger 不一致');
   for (const t of row.tasks) {
     const bound = definitions.find((r: any) => r.id === t.id && r.name === t.name);
@@ -196,6 +249,7 @@ export async function kernelFacts(c: Config, files: Files, initial: any, query: 
     results, release: release(row.release), evidence, verifiedAt: new Date().toISOString() };
 }
 export function selectKernel(facts: KernelFacts, binding: LoopBinding | undefined, taskId?: string | null) {
+  if (binding?.taskId && taskId != null && taskId !== binding.taskId) throw new SafeError('identity_mismatch', '已绑定事项不能切换到其他来源任务；请查询对应原事项');
   const selected = taskId ?? binding?.taskId ?? null;
   const identity = { ...facts.binding, taskId: selected };
   if (binding && !sameBinding(binding, { ...identity, taskId: binding.taskId })) throw new SafeError('identity_mismatch', '原执行身份变化，不猜映射');

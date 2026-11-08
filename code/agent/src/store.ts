@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { appendFileSync, mkdirSync, readSync, openSync, closeSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Config, Input, QueueRow, TaskCard } from './types.js';
+import type { Config, Input, LoopBinding, QueueRow, TaskCard } from './types.js';
 import { parseJson, tokenBudget } from './util.js';
 
 type Row = Record<string, unknown>;
@@ -69,6 +69,11 @@ export class Store {
     if (!identity(input) || identity(input) !== identity(previous)) return false;
     return !!this.db.prepare("UPDATE inputs SET state='pending',started=NULL,finished=NULL WHERE id=? AND state IN ('done','failed')").run(input.id).changes;
   }
+  pendingLoopInput(binding: LoopBinding, revision: number) {
+    // One queued verification per formal run revision, not per projected task.
+    // Retrying is still limited to the durable pre-Router verification marker.
+    return this.decode(this.db.prepare("SELECT i.* FROM inputs i LEFT JOIN kv v ON v.key='kernel:verification:'||i.id WHERE json_extract(i.body,'$.source')='loop' AND json_extract(i.body,'$.raw.kernel')=1 AND json_extract(i.body,'$.raw.runId')=? AND json_extract(i.body,'$.raw.ledger')=? AND json_extract(i.body,'$.batchFile')=? AND json_extract(i.body,'$.raw.revision')=? AND (i.state IN ('pending','processing') OR (i.state IN ('done','failed') AND v.value='true')) ORDER BY i.seq LIMIT 1").get(binding.runId, binding.ledger, binding.cardFile, revision));
+  }
   decode(row: Row | undefined): QueueRow | undefined { return row && { id: String(row.id), seq: Number(row.seq), state: String(row.state), input: parseJson<Input>(String(row.body)), prepared: Boolean(row.prepared), started: row.started === null ? null : Number(row.started) }; }
   row(id: string) { return this.decode(this.db.prepare('SELECT * FROM inputs WHERE id=?').get(id)); }
   next() { return this.decode(this.db.prepare("SELECT * FROM inputs WHERE state IN ('pending','processing') ORDER BY CASE WHEN state='processing' THEN 0 ELSE 1 END,priority,seq LIMIT 1").get()); }
@@ -90,9 +95,50 @@ export class Store {
     } catch (e) { if (ownsTransaction) this.db.exec('ROLLBACK'); throw e; }
   }
   task(id: string): TaskCard | undefined { const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(id); return row ? parseJson<TaskCard>(String(row.body)) : undefined; }
+  /** Stable insertion-order paging. A cursor freezes the upper rowid, so concurrent
+   * updates/new discoveries cannot repeat or silently skip rows on later pages. */
+  taskPage(projects: string[], options: { project?: string | string[]; cursor?: string; limit?: number; includeClosed?: boolean; protocol?: string; decisionOnly?: boolean } = {}) {
+    const scope = JSON.stringify([projects, options.project ?? '', !!options.includeClosed, options.protocol ?? '', !!options.decisionOnly]);
+    let after = 0, upper = Number(this.db.prepare('SELECT COALESCE(MAX(rowid),0) AS n FROM tasks').get()!.n);
+    if (options.cursor) {
+      const cursor = parseJson<{ scope: string; after: number; upper: number }>(Buffer.from(options.cursor, 'base64url').toString());
+      if (cursor.scope !== scope || !Number.isSafeInteger(cursor.after) || !Number.isSafeInteger(cursor.upper) || cursor.after < 0 || cursor.upper < cursor.after) throw new Error('分页位置无效或权限/范围已变，请从第一页重新查询');
+      ({ after, upper } = cursor);
+    }
+    const project = "json_extract(body,'$.worker.project')", permitted = projects.length ? `${project} IN (${projects.map(() => '?').join(',')})` : '0';
+    const selected = options.project ? Array.isArray(options.project) ? options.project : [options.project] : [];
+    const clauses = ['rowid<=?', `(${project} IS NULL OR ${permitted})`, ...(options.includeClosed ? [] : ["status NOT IN ('closed','cancelled','reconciled','done','已合入','已放弃')"]), ...(selected.length ? [`${project} IN (${selected.map(() => '?').join(',')})`] : []), ...(options.protocol ? ["json_extract(body,'$.worker.loop.protocol')=?"] : []), ...(options.decisionOnly ? ["(COALESCE(json_extract(body,'$.waiting'),'')<>'' OR json_extract(body,'$.deferred')=1 OR status IN ('waiting-approval','等你决定'))"] : [])];
+    const params = [upper, ...projects, ...selected, ...(options.protocol ? [options.protocol] : [])];
+    const where = clauses.join(' AND '), limit = Math.min(50, Math.max(1, Math.floor(options.limit ?? 10)));
+    const total = Number(this.db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE ${where}`).get(...params)!.n);
+    const rows = this.db.prepare(`SELECT rowid AS position,id,status,updated,
+      json_extract(body,'$.title') AS title, substr(json_extract(body,'$.goal'),1,180) AS goal,
+      ${project} AS project, json_extract(body,'$.worker.kind') AS worker,
+      json_extract(body,'$.worker.origin') AS origin, json_extract(body,'$.lastVerifiedAt') AS lastVerifiedAt,
+      json_extract(body,'$.sourceCurrent.state') AS sourceState,
+      json_extract(body,'$.sourceDefinition.state') AS definitionState,
+      json_extract(body,'$.sourceHealth') AS health,
+      CASE WHEN COALESCE(json_extract(body,'$.waiting'),'')<>'' OR json_extract(body,'$.deferred')=1 THEN 1 ELSE 0 END AS decision
+      FROM tasks WHERE ${where} AND rowid>? ORDER BY rowid LIMIT ?`).all(...params, after, limit + 1);
+    const more = rows.length > limit, page = rows.slice(0, limit), last = page.at(-1);
+    return { total, count: page.length, hasMore: more, nextCursor: more && last ? Buffer.from(JSON.stringify({ scope, after: Number(last.position), upper })).toString('base64url') : null,
+      rows: page.map(({ position: _position, health, ...row }) => ({ ...row, id: String(row.id), title: String(row.title), status: String(row.status), localTaskState: String(row.status), ...(health ? { health: parseJson(String(health)) } : {}), goal: row.definitionState === 'pending' ? '任务定义待读取' : row.goal })) };
+  }
+  transaction<T>(run: () => T): T {
+    const own = !this.db.isTransaction;
+    if (own) this.db.exec('BEGIN IMMEDIATE');
+    try { const value = run(); if (own) this.db.exec('COMMIT'); return value; }
+    catch (error) { if (own) this.db.exec('ROLLBACK'); throw error; }
+  }
   taskTable() { return (this.db.prepare("SELECT body FROM tasks WHERE status<>'closed' ORDER BY updated DESC").all() as Row[]).map(r => { const t = parseJson<TaskCard>(String(r.body)); return { id: t.id, title: t.title, status: t.status, waiting: t.waiting, updated: t.updated }; }); }
   searchClosed(query: string, limit = 20) { return (this.db.prepare("SELECT body FROM tasks WHERE status='closed' AND instr(body,?)>0 ORDER BY updated DESC LIMIT ?").all(query, Math.min(50, Math.max(1, limit))) as Row[]).map(r => parseJson<TaskCard>(String(r.body))); }
   match(input: Input) {
+    if (input.source === 'loop' && (input.raw as { kernel?: number } | undefined)?.kernel === 1) {
+      const card = input.workerId ? this.task(input.workerId) : undefined, binding = card?.worker?.loop;
+      if (!card || !binding) return [];
+      const linked = this.db.prepare("SELECT t.body FROM task_events e JOIN tasks t ON t.id=e.task WHERE e.event=? AND json_extract(t.body,'$.worker.loop.repository')=? AND json_extract(t.body,'$.worker.loop.runId')=? AND json_extract(t.body,'$.worker.loop.cardFile')=? AND json_extract(t.body,'$.worker.loop.ledger')=? ORDER BY t.rowid").all(input.id, binding.repository, binding.runId, binding.cardFile, binding.ledger);
+      return linked.length ? linked.map(row => parseJson<TaskCard>(String(row.body))) : [card];
+    }
     const sources = [['message', input.quoteId], ['message', input.messageId], ['loop', input.batchFile], ['pi', input.workerId]].filter((x): x is [string, string] => !!x[1]);
     const ids = new Set<string>();
     for (const [kind, value] of sources) for (const r of this.db.prepare('SELECT task FROM subscriptions WHERE kind=? AND value=?').all(kind, value)) ids.add(String(r.task));
@@ -107,10 +153,31 @@ export class Store {
     if (own) this.db.exec('BEGIN IMMEDIATE');
     try {
       const current = this.task(card.id);
-      if (!current || revision <= (current.sourceRevision ?? -1)) { if (own) this.db.exec('COMMIT'); return false; }
-      update(); card.sourceRevision = revision; card.sourceFingerprint = fingerprint;
-      this.putTask(card); if (own) this.db.exec('COMMIT'); return true;
+      if (!current || ['closed', 'cancelled', 'reconciled'].includes(current.status) || revision < (current.sourceRevision ?? -1)) { if (own) this.db.exec('COMMIT'); return false; }
+      if (revision === current.sourceRevision && fingerprint === current.sourceFingerprint) {
+        // An identical read only refreshes freshness. A pure query can reveal a
+        // changed process/external-merge fact even when ledger bytes are unchanged.
+        current.lastVerifiedAt = new Date().toISOString();
+        current.sourceHealth = { checkedAt: current.lastVerifiedAt, ok: true };
+        this.putTask(current); if (own) this.db.exec('COMMIT'); return false;
+      }
+      const historyLength = card.dispatches.length;
+      update();
+      // A read-only query may overlap a user definition/approval/message update.
+      // Enrich only source-owned fields; never overwrite that newer local work.
+      const next: TaskCard = { ...current, status: card.status, sourceRevision: revision, sourceFingerprint: fingerprint,
+        lastVerifiedAt: card.lastVerifiedAt, sourceHealth: card.sourceHealth, control: card.control, verified: card.verified,
+        worker: current.worker ? { ...current.worker, ...(card.worker?.loop ? { loop: card.worker.loop } : {}) } : card.worker,
+        sourceDefinition: current.sourceDefinition ? { ...current.sourceDefinition, state: 'pending' } : card.sourceDefinition,
+        dispatches: [...current.dispatches, ...card.dispatches.slice(historyLength)], updated: current.updated > card.updated ? current.updated : card.updated };
+      this.putTask(next); Object.assign(card, next); if (own) this.db.exec('COMMIT'); return true;
     } catch (error) { if (own) this.db.exec('ROLLBACK'); throw error; }
+  }
+  boundLoopPage(cursor: { after: number; upper?: number }, limit = 24) {
+    const upper = cursor.upper ?? Number(this.db.prepare('SELECT COALESCE(MAX(rowid),0) AS n FROM tasks').get()!.n);
+    const rows = this.db.prepare("SELECT rowid,body FROM tasks WHERE rowid>? AND rowid<=? AND json_extract(body,'$.worker.loop.protocol')='kernel:1' AND status NOT IN ('closed','cancelled','reconciled','已合入','已放弃') AND COALESCE(json_extract(body,'$.verified.state'),'')<>'source-removed' ORDER BY rowid LIMIT ?").all(cursor.after, upper, limit + 1);
+    const page = rows.slice(0, limit), hasMore = rows.length > limit;
+    return { cards: page.map(r => parseJson<TaskCard>(String(r.body))), hasMore, cursor: hasMore ? { after: Number(page.at(-1)!.rowid), upper } : { after: 0 } };
   }
   boundLoops() {
     return this.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.loop.protocol')='kernel:1' AND status NOT IN ('closed','cancelled','reconciled')").all().map(r => parseJson<TaskCard>(String(r.body)));

@@ -5,6 +5,12 @@ import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 const hash = s => createHash('sha256').update(s).digest('hex');
+// A producer publishes only actual byte changes. Repeated read-only queries do
+// not generate artificial filesystem notifications or endlessly wake Intake.
+const publish = async (path, content) => {
+  if (await readFile(path, 'utf8').catch(() => undefined) === content) return;
+  const temp = `${path}.${process.pid}.tmp`; await writeFile(temp, content); await rename(temp, path);
+};
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`用法：node scripts/loop-worker-stub.mjs --state <构造快照JSON> --calls <调用JSONL> <查询|开工|启动|送话|续跑|停止> [批次文件] --json [--all] [--id <编号>] [--stage <原段>]
@@ -38,10 +44,10 @@ async function kernelSnapshot(b) {
       activity: live || t.active ? { id: t.attempt ?? `attempt-${t.id}`, node: t.node ?? '开发评审', kind: t.waiting ? 'waiting' : 'developing', ...(live ? { session: stage.session.id, pid: stage.session.pid, started: stage.session.started } : {}) } : undefined };
   });
   const cardText = await readFile(b.batch.file, 'utf8'), card = JSON.parse(cardText);
-  const raw = { v: 1, id: b.runId, revision, repo: b.repo ?? test.project, common, file: b.batch.file, dir, cardHash: hash(cardText), card: { flow: b.flow ?? card.flow, tasks: definitions.map(t => ({ name: t.name })) },
+  const raw = { v: 1, id: b.runId, revision, repo: b.repo ?? test.project, common, file: b.batch.file, dir, cardHash: hash(cardText), card: { ...card, flow: b.flow ?? card.flow, tasks: definitions.map(t => ({ ...card.tasks?.find(definition => definition.name === t.name), name: t.name })) },
     pendingCard: b.pendingCard, changes: b.changes, publication: b.publication, stopped: b.stopped ?? b.state === 'failed', abandoned: b.state === 'abandoned',
-    ...(definitions.length > 1 ? { taskRecords: records } : { ...records[0], id: b.runId }), results: b.results ?? [], userInputs: ['SYNTHETIC_PRIVATE_INPUT_NOT_FOR_MODEL'] };
-  await mkdir(dir, { recursive: true }); await writeFile(join(dir, 'frozen-card.json'), cardText); await writeFile(join(dir, 'summary.md'), 'Constructed summary; not business acceptance.\n'); const temp = `${ledger}.${process.pid}.tmp`; await writeFile(temp, JSON.stringify(raw)); await rename(temp, ledger);
+    ...(definitions.length > 1 ? { taskRecords: records } : { ...records[0], id: b.runId }), results: b.results ?? [], userFileVersions: b.userFileVersions, userInputs: ['SYNTHETIC_PRIVATE_INPUT_NOT_FOR_MODEL'] };
+  await mkdir(dir, { recursive: true }); await publish(join(dir, 'frozen-card.json'), cardText); await publish(join(dir, 'summary.md'), 'Constructed summary; not business acceptance.\n'); await publish(ledger, JSON.stringify(raw));
   const attempts = [];
   for (const base of [dir, ...(definitions.length > 1 ? records.map(r => r.dir) : [])]) {
     const root = join(base, 'attempts');
@@ -64,7 +70,7 @@ if (verb === '查询') {
   if (rest[0] === '--all') console.log(JSON.stringify({ ...state, test: undefined, batches: await Promise.all(state.batches.map(b => b.kernel ? kernelSnapshot(b) : b)) }));
   else {
     const batch = state.batches.find(b => b.kernel && b.batch.file === rest[0]);
-    const result = batch ? await kernelSnapshot(batch) : { ok: false, kernel: 1 };
+    const result = batch ? await kernelSnapshot(batch) : { v: 1, batches: state.batches.filter(b => !b.kernel && b.batch.file === rest[0]) };
     if (batch && test.queryRace > 0) {
       test.queryRace--; batch.events.lastSeq++;
       batch.checks = [`构造新修订 ${batch.events.lastSeq}：验收通过`]; batch.publication = { local: 'merged', push: '失败', reason: '构造发布缺项' };
@@ -108,7 +114,8 @@ if (verb === '开工') {
     const sessionId = `synthetic-session-${b.batch.name}`;
     b.state = 'running'; b.next = null; b.events = { lastSeq: 1 };
     b.stages = [{ stage: '开发', state: 'paused', next: 'send', round: 1, repairs: 0, session: { host: 'pi', id: sessionId, alive: true, pid: session.pid, started: execFileSync('/bin/ps', ['-p', String(session.pid), '-o', 'lstart='], { encoding: 'utf8', env: { LC_ALL: 'C' } }).trim() }, pause: { since: new Date().toISOString() }, evidence: {} }];
-    await save(); await appendFile(calls, JSON.stringify({ verb: 'session-start', id: sessionId, pid: session.pid, cliPid: process.pid }) + '\n');
+    await save(); if (b.kernel) await kernelSnapshot(b);
+    await appendFile(calls, JSON.stringify({ verb: 'session-start', id: sessionId, pid: session.pid, cliPid: process.pid }) + '\n');
     await finished;
     const latest = JSON.parse(await readFile(statePath, 'utf8')), ended = latest.batches.find(row => row.batch.file === file);
     ended.state = 'done'; ended.commit = git('rev-parse', 'HEAD').toString('utf8').trim();

@@ -1,9 +1,10 @@
 import { constants } from 'node:fs';
-import { open, stat, realpath, opendir, mkdir } from 'node:fs/promises';
+import { open, stat, realpath, opendir, mkdir, lstat } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
 import { canonical, inside, hash } from './util.js';
 import { SafeError } from './errors.js';
 import { extract, READ_CAPABILITY, textChunk } from './documents.js';
+import type { OutputPlan } from './outputs.js';
 
 export class ReadDenied extends SafeError {
   constructor(category = 'outside_scope') { super(category, category === 'blacklist' ? '拒绝读取：命中不许读名单。' : '拒绝读取：不在授权范围内。'); }
@@ -40,6 +41,7 @@ export function nameDenied(path: string) {
 export interface FilePolicy {
   cwd: string; roots: string[]; evidence: string[]; narrow: string[]; deny: string[];
   attachmentDir: string; origins: Record<string, string>; write: string[]; scope?: string[]; edit?: Record<string, string>; maxReadBytes?: number;
+  output?: OutputPlan;
 }
 /** Serializable policy, shared with Pi. Evidence grants only the registered file. */
 export class ScopedFiles {
@@ -116,14 +118,44 @@ export class ScopedFiles {
       return { path: actual, sha256: hash(next) };
     } finally { await fd.close(); }
   }
-  async write(path: string, content: string) {
-    const actual = await this.check(path, 'write');
-    if (Buffer.byteLength(content) > 2 * 1024 * 1024) throw new Error('文件过大');
-    await mkdir(dirname(actual), { recursive: true });
+  /** New-file primitive, not a general binary-copy tool. Callers must validate type/source. */
+  async create(path: string, data: Buffer) {
+    const requested = resolve(this.policy.cwd, path), actual = await this.check(path, 'write');
+    const root = this.policy.write.find(root => inside(root, actual))!;
+    await noLinkedParents(dirname(requested), root);
+    try { if ((await lstat(requested)).isSymbolicLink()) return this.refuse(path, 'write'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    await noLinkedParents(dirname(actual));
+    await mkdir(dirname(actual), { recursive: true, mode: 0o700 });
+    await noLinkedParents(dirname(actual));
+    const parent = await stat(dirname(actual));
     if (actual !== await this.check(path, 'write')) return this.refuse(path, 'write');
-    // No overwrite: destructive edits need separate red-line authorization, not a directory grant.
-    const fd = await open(actual, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-    try { await fd.writeFile(content); await fd.sync(); } finally { await fd.close(); }
-    return { path: actual, sha256: hash(content) };
+    let fd;
+    try { fd = await open(actual, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new SafeError('output_exists', '目标已存在，未覆盖；请明确另存新名。'); throw error; }
+    try {
+      const info = await fd.stat(), current = await lstat(actual), now = await stat(dirname(actual));
+      if (!info.isFile() || info.nlink !== 1 || info.ino !== current.ino || info.dev !== current.dev || now.ino !== parent.ino || now.dev !== parent.dev || actual !== await this.check(path, 'write')) throw new Error('changed_destination');
+      await fd.writeFile(data); await fd.sync();
+      await noLinkedParents(dirname(actual));
+      const after = await lstat(actual), directory = await stat(dirname(actual));
+      if (after.ino !== info.ino || after.dev !== info.dev || after.nlink !== 1 || after.size !== data.length || directory.ino !== parent.ino || directory.dev !== parent.dev || actual !== await this.check(path, 'write')) throw new Error('changed_destination');
+    } catch { throw new SafeError('output_incomplete', `交付不完整：新建文件可能只有部分内容，未作为成功产物；保留现场、不覆盖或删除。路径：${actual}`); }
+    finally { await fd.close(); }
+    return { path: actual, sha256: hash(data), bytes: data.length };
+  }
+  async write(path: string, content: string) {
+    if (Buffer.byteLength(content) > 2 * 1024 * 1024) throw new Error('文件过大');
+    return this.create(path, Buffer.from(content, 'utf8'));
+  }
+}
+/** Reject every existing directory alias, including aliases that stay inside a grant. */
+export async function noLinkedParents(path: string, stopAt?: string): Promise<void> {
+  let current = resolve(path);
+  while (true) {
+    try { const info = await lstat(current); if (!info.isDirectory() || info.isSymbolicLink()) throw new SafeError('outside_scope', '目标目录含链接或非目录冲突，未写入。'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (stopAt && await canonical(current) === stopAt) return;
+    const parent = dirname(current); if (parent === current) return; current = parent;
   }
 }

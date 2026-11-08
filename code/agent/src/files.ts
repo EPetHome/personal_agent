@@ -52,13 +52,16 @@ export class Files {
     return actual;
   }
   /** Protocol-only read gate. Does not grant the model access to a ledger/root. */
-  async protocolPath(projectRoot: string, path: string) {
+  async protocolPath(projectRoot: string, path: string, legacy = false) {
     const project = this.config.projects.find(p => p.root === projectRoot);
-    const actual = await canonical(path), policy = await this.policy(projectRoot);
-    if (!project || actual !== resolve(path) || nameDenied(path) || nameDenied(actual)
-      || policy.deny.some(root => inside(root, actual))
+    // Protocol reads do not need the model/Pi evidence inventory. Avoid rebuilding
+    // every historical evidence/attachment row for each discovery header.
+    const actual = await canonical(path), c = this.config;
+    const deny = await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny].filter(Boolean).map(canonical));
+    if (!project || !legacy && actual !== resolve(path) || nameDenied(path) || nameDenied(actual)
+      || deny.some(root => inside(root, actual) || inside(root, resolve(path)))
       || this.config.readAllow.length && !this.config.readAllow.some(root => inside(root, actual))
-      || ![project.root, ...project.loopRunDirs].some(root => inside(root, actual))) throw new ReadDenied();
+      || ![project.root, ...project.loopRunDirs, ...(legacy && project.loop?.workspace ? [project.loop.workspace] : [])].some(root => inside(root, actual))) throw new ReadDenied();
     return actual;
   }
   async registerEvidence(projectRoot: string, paths: Record<string, string>) {

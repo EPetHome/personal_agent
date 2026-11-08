@@ -5,7 +5,8 @@ import { SafeError } from './errors.js';
 import type { Config } from './types.js';
 
 export const CONFIG_FIELDS: Record<string, string[]> = Object.fromEntries(Object.entries({
-  root: 'dataDir attachmentDir inboxDirs projects readAllow readDeny windowTokens checkpointKeep maxToolRounds model feishu loop pi queue intake concurrency approval watchdog',
+  root: 'dataDir attachmentDir inboxDirs projects readAllow readDeny windowTokens checkpointKeep maxToolRounds model feishu loop pi queue intake concurrency approval watchdog outputs',
+  outputs: 'otherProject',
   model: 'url name auth headers timeoutMs maxOutputTokens dailyTokenLimit', 'model.auth': 'type path provider variable',
   feishu: 'mode userId url envFile pollMs timeoutMs', loop: 'command args eventDirs timeoutMs actionTimeoutMs',
   pi: 'command args timeoutMs pollMs startupMs maxTurns model', 'pi.model': 'url name',
@@ -49,7 +50,7 @@ async function businessConfig(path: string): Promise<Config> {
   const raw = await jsonFile<Partial<Config>>(path);
   fields(raw, 'root');
   for (const key of ['model', 'feishu', 'loop', 'pi', 'queue', 'intake', 'concurrency', 'approval', 'watchdog'] as const) fields(raw[key], key);
-  fields(raw.model?.auth, 'model.auth'); fields(raw.pi?.model, 'pi.model'); fields(raw.watchdog?.local, 'watchdog.local');
+  fields(raw.model?.auth, 'model.auth'); fields(raw.pi?.model, 'pi.model'); fields(raw.watchdog?.local, 'watchdog.local'); fields(raw.outputs, 'outputs');
   if (raw.projects !== undefined && !Array.isArray(raw.projects)) throw new ConfigError('projects 必须是数组。');
   for (const p of raw.projects ?? []) { fields(p, 'project'); fields(p.loop, 'project.loop'); fields(p.pi, 'project.pi'); }
   const notification = await notificationConfig(raw), home = homedir();
@@ -103,5 +104,10 @@ async function businessConfig(path: string): Promise<Config> {
   const incoming = [...c.inboxDirs, ...c.loop.eventDirs];
   if (incoming.some(p => inside(p, c.dataDir) || inside(c.dataDir, p) || inside(p, c.attachmentDir) || inside(c.attachmentDir, p))) throw new ConfigError('来源目录不能与数据/附件目录重叠');
   if (inside(c.dataDir, configReal)) throw new ConfigError('配置文件须在数据目录之外（PA 不写配置）');
+  if (c.outputs && (typeof c.outputs.otherProject !== 'string' || !c.projects.some(p => p.id === c.outputs!.otherProject && p.pi?.writeDirs.includes(resolve(p.root, 'PA产出'))))) throw new ConfigError('outputs.otherProject 须指向已明确启用 PA产出 写目录的 PA 项目。');
+  for (const p of c.projects) {
+    const output = resolve(p.root, 'PA产出');
+    if (p.pi?.writeDirs.includes(output) && [...incoming, c.attachmentDir, c.dataDir].some(path => inside(path, output) || inside(output, path))) throw new ConfigError('PA产出 不能与输入监听、附件或数据目录重叠。');
+  }
   return c;
 }
