@@ -2,6 +2,7 @@ import type { Store } from './store.js';
 import type { LoopBinding } from './types.js';
 import type { WorkerOperation, WorkerResolution } from './worker.js';
 import { hash } from './util.js';
+import { operationExecution } from './work-tracking.js';
 
 export const DISPATCH_MANUAL_ACK = '本人已在电脑核对：原开工/启动调用及所有相关进程已结束；终结此任务托管，核销原编号并释放其占用，不重发、不续跑、不代表业务通过。';
 export interface DispatchReview { operation: string; token: string; identityHash: string; basisHash: string; description: string; by: string; at: string; state: 'pending' | 'consumed' | 'cancelled' | 'stale' }
@@ -42,7 +43,7 @@ export class WorkerJournal {
     this.transaction(() => {
       const old = this.operation(op.id);
       if (old?.state === 'uncertain' && op.state !== 'uncertain' && !op.resolution) throw new Error('原操作尚未按编号核销，不允许解除不确定状态');
-      this.store.set(operationKey(op.id), op); this.index(op);
+      this.store.set(operationKey(op.id), op); this.index(op); operationExecution(this.store, op);
     });
   }
   unresolved(task: string) {

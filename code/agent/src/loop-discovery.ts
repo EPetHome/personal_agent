@@ -8,12 +8,13 @@ import { kernelIndexes, kernelSource, type KernelFacts } from './loop-kernel.js'
 import { queryKernelSource } from './loop.js';
 import { hash, inside, parseJson } from './util.js';
 import { failure } from './errors.js';
+import { Attention } from './attention.js';
 
 export const DISCOVERY_FALLBACK_MS = 60_000;
 export const DISCOVERY_WAKE_MS = 60;
 const PAGE = 24;
 interface IndexState { signature?: string; position: number; complete: boolean; checkedAt?: string }
-interface SourceState { signature: string; revision: number; runId: string; historical: boolean; project?: string; ledger?: string }
+interface SourceState { signature: string; revision: number; runId: string; historical: boolean; project?: string; ledger?: string; attentionRevision?: string }
 interface OpenIndex { dir: Dir; position: number; skip: number; signature: string }
 interface Job { kind: 'direct' | 'index' | 'known' | 'retry'; project?: string; path?: string; after?: number; upper?: number }
 interface Round { scope: string; pending: Job[]; errors: Record<string, string> }
@@ -37,7 +38,8 @@ export class LoopDiscovery {
     try {
       await this.files.protocolPath(project.root, ledger);
       const info = await lstat(ledger), sig = signature(info), previous = this.store.get<SourceState | null>(this.key(ledger), null);
-      if (previous?.signature === sig) {
+      const attentionRevision = hash(JSON.stringify(new Attention(this.c, this.store).matching('loop', project.id).map(r => [r.id, r.revision, r.state])));
+      if (previous?.signature === sig && previous.attentionRevision === attentionRevision) {
         // Add index metadata to older cursors without changing their verified position.
         if (previous.project !== project.id || previous.ledger !== ledger) this.store.set(this.key(ledger), { ...previous, project: project.id, ledger });
         this.store.set(retryKey, null); return;
@@ -47,7 +49,7 @@ export class LoopDiscovery {
       const facts = source.historical ? undefined : await queryKernelSource(this.c, this.files, project, ledger);
       this.store.transaction(() => {
         if (facts) this.adopt(facts);
-        this.store.set(this.key(ledger), { signature: sig, revision: facts?.revision ?? source.revision, runId: facts?.binding.runId ?? source.id, historical: source.historical, project: project.id, ledger } satisfies SourceState);
+        this.store.set(this.key(ledger), { signature: sig, revision: facts?.revision ?? source.revision, runId: facts?.binding.runId ?? source.id, historical: source.historical, project: project.id, ledger, attentionRevision } satisfies SourceState);
         this.store.set(retryKey, null);
       });
     } catch (error) { this.store.set(retryKey, { project: project.id, ledger, reason: failure(error).error, checkedAt: new Date().toISOString() }); }

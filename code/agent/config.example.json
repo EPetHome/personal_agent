@@ -12,6 +12,8 @@
     "pi": { "writeDirs": ["/tmp/pa-example/project/PA产出"], "skills": {} }
   }],
   "outputs": {"otherProject": "example"},
+  "timeZone": "America/New_York",
+  "piObservation": {"sources": []},
   "readAllow": [],
   "readDeny": [],
   "model": {

@@ -205,11 +205,16 @@ test('丙 A9: owner asks to make reads direct; script sees system instructions n
 
 test('Pi needs-decision result ends process, owner answer dispatches a new ID on the same task, no auto-retry', async t => {
   const f = await piFixture(t, { turns: [dispatch(), [{ text: '问题已呈现' }], [{ tools: [{ name: 'worker_reply', arguments: { taskId: 'pi-task', mode: 'send', text: '选择方案甲' } }] }, { text: '已重派' }], [{ text: '已收到' }]] });
-  await writeFile(f.control, JSON.stringify({ status: 'needs-decision', question: '甲还是乙？', delayMs: 100 })); const app = await f.start();
+  await writeFile(f.control, JSON.stringify({ status: 'needs-decision', question: '甲还是乙？', summary: '构造 Pi 结果：第一次待决定', delayMs: 100 })); const app = await f.start();
   await f.inject({ id: 'question', text: '查询后需要决定' }); await until(() => !!f.approval()); await f.click(); await f.done('pi-task', 'needs-decision');
   const first = app.router.workers.pi.jobs()[0]!; assert.equal(await alive(first.binding!.child), false); await sleep(150); assert.equal((await f.calls()).filter(c => c.event === 'start').length, 1);
-  await writeFile(f.control, JSON.stringify({ delayMs: 100 })); await f.inject({ id: 'answer', quoteId: f.feishu.messages[0]!.id, text: '选择方案甲' }); await until(() => !!f.approval()); await f.click('pi-task', 'approve-answer'); await f.done();
+  await writeFile(f.control, JSON.stringify({ summary: '构造 Pi 结果：第二次交付', delayMs: 100 })); await f.inject({ id: 'answer', quoteId: f.feishu.messages[0]!.id, text: '选择方案甲' }); await until(() => !!f.approval()); await f.click('pi-task', 'approve-answer'); await f.done();
   const jobs = app.router.workers.pi.jobs(); assert.equal(jobs.length, 2); assert.notEqual(jobs[0]!.id, jobs[1]!.id); assert.equal(app.store.taskTable().length, 1); assert.match(jobs[1]!.request.prompt, /选择方案甲/); assert.equal(f.feishu.messages.length, 1);
+  const executions = await app.router.tasks.executionPage('pi-task'); assert.equal(executions.total, 2);
+  assert.match(executions.rows.find(e => e.executionId === first.id)!.result!.summary, /第一次待决定/);
+  assert.match(executions.rows.find(e => e.executionId === jobs[1]!.id)!.result!.summary, /第二次交付/);
+  assert.equal(executions.rows.find(e => e.key === executions.currentExecution)!.executionId, jobs[1]!.id);
+  assert.equal(app.store.task('pi-task')!.work!.tracking!.state, 'reported');
 });
 
 test('Pi scopes: recursive search, links, hard links, PEM files, attachment origins, evidence and config cannot bypass blacklist', async t => {

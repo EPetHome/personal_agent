@@ -13,6 +13,7 @@ import { outputOptions, planOutput, verifyOutput, type OutputOptions, type Outpu
 import { SafeError, failure } from './errors.js';
 import { READ_CAPABILITY } from './documents.js';
 import type { PiPolicy } from './pi-permissions.js';
+import { syncExecutionFacts } from './work-tracking.js';
 import { alive, identity, privateJson, sameProcess, signalOwned, stopGroup, processes } from './pi-process.js';
 import { launchPi, answerFrom, type PiSpec, type PiIdentity, type PiOutcome, type PiState } from './pi-launch.js';
 
@@ -265,7 +266,7 @@ export class PiAdapter implements WorkerAdapter {
       const card = this.store.task(job.task);
       if (card?.worker?.batchFile === job.id && ['queued', 'launching', 'running'].includes(job.state) && !['cancelled', 'closed', 'reconciled'].includes(card.status)) {
         const state = job.state === 'launching' ? 'running' : job.state;
-        if (card.status !== state) { card.status = state; card.updated = new Date().toISOString(); this.store.putTask(card); }
+        if (card.status !== state) { card.status = state; card.updated = new Date().toISOString(); this.store.putTask(card); syncExecutionFacts(this.store, card); }
       }
       if (!job.outcome || job.emitted) continue;
       const evidence: Record<string, string> = {};

@@ -8,23 +8,46 @@ import type { Files } from './files.js';
 import { canonical, hash } from './util.js';
 import { LoopDiscovery, DISCOVERY_FALLBACK_MS, DISCOVERY_WAKE_MS } from './loop-discovery.js';
 import type { KernelFacts } from './loop-kernel.js';
+import { PiObservation } from './pi-observation.js';
 
 export class Intake {
   private watchers: FSWatcher[] = [];
   private boundWatches = new Set<string>();
   private fallback?: NodeJS.Timeout;
   private debounce?: NodeJS.Timeout;
+  private observationDebounce?: NodeJS.Timeout;
+  private observationWork?: Promise<void>;
+  private observationAgain = false;
   private stopped = false;
   private restoring = true;
   private boundCycleComplete = false;
   private scanPromise: Promise<void> = Promise.resolve();
   readonly discovery?: LoopDiscovery;
+  readonly observations: PiObservation;
   constructor(readonly c: Config, readonly store: Store, readonly files: Files, readonly receive: (input: Input) => void, adopt?: (facts: KernelFacts) => unknown) {
     if (adopt) this.discovery = new LoopDiscovery(c, store, files, adopt, () => this.wake());
+    this.observations = new PiObservation(c, store, files, receive, () => this.wakeObservation());
   }
   private wake() {
     // Do not reset this timer on every write: a busy producer cannot starve verification.
     if (!this.debounce && !this.stopped) this.debounce = setTimeout(() => { this.debounce = undefined; void this.scan(); }, DISCOVERY_WAKE_MS);
+  }
+  private wakeObservation() {
+    if (!this.observationDebounce && !this.stopped) this.observationDebounce = setTimeout(() => { this.observationDebounce = undefined; void this.scanObservations(); }, DISCOVERY_WAKE_MS);
+  }
+  private scanObservations(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    if (this.observationWork) { this.observationAgain = true; return this.observationWork; }
+    const work = (async () => {
+      do {
+        this.observationAgain = false;
+        let more = await this.observations.scan(false);
+        while (more && !this.stopped) { await new Promise<void>(resolve => setImmediate(resolve)); more = await this.observations.scan(true); }
+      } while (this.observationAgain && !this.stopped);
+    })().catch(() => { if (!this.stopped) this.store.log('pi_observation_failure', { outcome: '观察源暂未核实；保留最后可靠事实，等待有界补查' }); });
+    this.observationWork = work;
+    void work.finally(() => { this.observationWork = undefined; if (this.observationAgain && !this.stopped) void this.scanObservations(); });
+    return work;
   }
   async start() {
     const roots = [...this.c.inboxDirs, ...this.c.loop.eventDirs];
@@ -39,6 +62,8 @@ export class Intake {
     await this.scan();
   }
   scan(continuation = false) {
+    // Independent lane: a slow/failed Loop query must not hold a healthy Pi notification.
+    const observations = this.scanObservations();
     this.scanPromise = this.scanPromise.then(async () => {
       if (this.stopped) return;
       if (!continuation) this.boundCycleComplete = false;
@@ -49,7 +74,7 @@ export class Intake {
       if (!boundMore) this.boundCycleComplete = true;
       if ((more || boundMore) && !this.stopped) setImmediate(() => this.scan(true));
     }).catch(() => { if (!this.stopped) this.store.log('intake_failure', { outcome: '来源暂不可读；保留游标，下次兜底再收' }); });
-    return this.scanPromise;
+    return Promise.all([this.scanPromise, observations]).then(() => {});
   }
   /** Bound revisions share the existing durable verification queue. Discovery
    * above handles only authorized new identities, never global session bodies. */
@@ -148,5 +173,5 @@ export class Intake {
     } finally { await fd.close(); }
   }
   private cursor(path: string, signature: string, offset: number) { this.store.db.prepare('INSERT INTO sources VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,offset=excluded.offset').run(path, signature, offset); }
-  async stop() { this.stopped = true; clearInterval(this.fallback); clearTimeout(this.debounce); await this.scanPromise; for (const w of this.watchers) w.close(); await this.discovery?.stop(); }
+  async stop() { this.stopped = true; clearInterval(this.fallback); clearTimeout(this.debounce); clearTimeout(this.observationDebounce); await Promise.all([this.scanPromise, this.observationWork]); for (const w of this.watchers) w.close(); await this.discovery?.stop(); await this.observations.stop(); }
 }

@@ -9,6 +9,7 @@ import { observeLaunch } from './loop-launch.js';
 import { canonical, hash, inside, parseJson } from './util.js';
 import { SafeError, failure } from './errors.js';
 import type { ApprovalView } from './cards.js';
+import { Attention } from './attention.js';
 
 export const LOOP_MONITOR_MS = 60_000;
 export const LOOP_MONITOR_QUIET_MS = 5 * LOOP_MONITOR_MS;
@@ -317,6 +318,7 @@ export class LoopMonitor {
     this.store.db.exec('BEGIN IMMEDIATE');
     try { this.store.putTask(card); this.store.set(key(card.id), state); this.store.db.exec('COMMIT'); }
     catch (error) { this.store.db.exec('ROLLBACK'); throw error; }
+    if (!new Attention(this.c, this.store).mayNotify(card, true)) return;
     this.store.log('loop_monitor_notice', { task: card.id, identity: state.identity, at, kind: state.issue?.kind ?? 'recovery' });
     const pending = this.store.get<string | null>(`worker:pending:${card.id}`, null), op = pending ? this.workers.operation(pending) : null;
     await this.workers.messages.publish(card.id, `loop-monitor:${card.id}`, op?.state === 'planned' ? this.workers.view(op) : undefined, this.controller.signal);

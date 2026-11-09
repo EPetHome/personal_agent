@@ -10,6 +10,7 @@ export { ReadDenied } from './file-policy.js';
 export class Files {
   constructor(readonly config: Config, readonly store: Store) {}
   private readonly nameDenied = nameDenied;
+  private observationRoots() { return [...new Set([...(this.config.piObservation?.sources.map(s => s.exportRoot) ?? []), ...this.store.get<string[]>('pi-observation:private-roots', [])])]; }
   async policy(cwd: string, write: string[] = [], narrow: string[] = []): Promise<FilePolicy> {
     const c = this.config, evidence: string[] = [], origins: Record<string, string> = {};
     for (const row of this.store.db.prepare('SELECT path FROM evidence').all()) {
@@ -19,7 +20,7 @@ export class Files {
     return { cwd, write, evidence, origins, maxReadBytes: c.intake.maxFileBytes, attachmentDir: c.attachmentDir,
       roots: [...c.projects.map(p => p.root), ...c.inboxDirs, c.attachmentDir],
       narrow: c.readAllow, scope: await Promise.all(narrow.map(canonical)),
-      deny: await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny].filter(Boolean).map(canonical)) };
+      deny: await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny, ...this.observationRoots()].filter(Boolean).map(canonical)) };
   }
   async check(path: string, registeredEvidence = false, protocolReceipt = false) {
     const requested = resolve(path);
@@ -37,7 +38,7 @@ export class Files {
     // Pre-fix generated attachments without origin metadata cannot be proven safe.
     // Do not infer their original policy name from a lossy/sanitized saved filename.
     if (!origin && inside(c.attachmentDir, actual) && /^[a-f0-9]{24}-/.test(basename(actual))) throw new ReadDenied('blacklist');
-    const denied = [c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny].filter(Boolean);
+    const denied = [c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny, ...this.observationRoots()].filter(Boolean);
     for (const root of denied) if (inside(await canonical(root), actual) || inside(resolve(root), requested)) throw new ReadDenied('blacklist');
     const roots = [...c.projects.map(p => p.root), ...c.inboxDirs, c.attachmentDir, ...(protocolReceipt ? c.loop.eventDirs : [])];
     let allowed = roots.some(root => inside(root, actual));
@@ -57,7 +58,7 @@ export class Files {
     // Protocol reads do not need the model/Pi evidence inventory. Avoid rebuilding
     // every historical evidence/attachment row for each discovery header.
     const actual = await canonical(path), c = this.config;
-    const deny = await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny].filter(Boolean).map(canonical));
+    const deny = await Promise.all([c.dataDir, `${homedir()}/.personal-agent`, `${homedir()}/.personal-agent-v2`, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.readDeny, ...this.observationRoots()].filter(Boolean).map(canonical));
     if (!project || !legacy && actual !== resolve(path) || nameDenied(path) || nameDenied(actual)
       || deny.some(root => inside(root, actual) || inside(root, resolve(path)))
       || this.config.readAllow.length && !this.config.readAllow.some(root => inside(root, actual))
@@ -86,6 +87,15 @@ export class Files {
       materials.push(material); this.store.log('directory_read', material); return value;
     } catch (error) { return failure(error); }
   }
+  async search(path: string, query: string, materials: Material[] = []) {
+    try {
+      if (!query || query.length > 1000) return { ok: false, partial: true, reason: '检索问题为空或过长' };
+      const actual = await this.check(path), scoped = new ScopedFiles(await this.policy(actual));
+      const result = await scoped.search(actual, query, true);
+      for (const file of new Set(result.matches.map(m => (m as { path: string }).path))) await this.read(file, materials);
+      return { ok: true, ...result, partial: true, scope: actual, note: '有界本地检索，最多检查 2000 项/100 条匹配/每文件首块；不是全资料覆盖。不建立派单或对外发送。' };
+    } catch (error) { return { ...failure(error), partial: true }; }
+  }
   async read(path: string, materials: Material[], evidence = false, offset = 0, length = 64000, image = false, signal?: AbortSignal) {
     try {
       const actual = await this.check(path, evidence);
@@ -99,7 +109,7 @@ export class Files {
         result = await scoped.read(actual, offset, length, signal);
       }
       await this.check(path, evidence);
-      const material = { path: actual, sha256: result.sha256, bytes: Buffer.byteLength(result.content) };
+      const material = { path: actual, sha256: 'sourceSha256' in result ? result.sourceSha256 : result.sha256, bytes: Buffer.byteLength(result.content) };
       materials.push(material); this.store.log('file_read', { ...material, offset: result.offset, input: this.store.get('activeInput', null) });
       return { ok: true as const, ...result, name: basename(actual) };
     } catch (error) { signal?.throwIfAborted(); return failure(error); }

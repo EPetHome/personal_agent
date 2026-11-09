@@ -35,6 +35,7 @@ export async function repository(c: Config, root: string, signal?: AbortSignal) 
 /** Locate only the authorized repository's conventional index, never the global runs tree. */
 export async function kernelIndexes(c: Config, files: Files, project: Project, signal?: AbortSignal) {
   await files.protocolPath(project.root, project.root);
+  if (!project.loop && !project.loopRunDirs.length) return { common: '', top: project.root, indexes: [] as string[], directLedgers: [] as string[], coverage: { ok: true, applicable: false, reason: '未配置 Loop 来源；不影响已有授权本地材料读取与办公交付' } };
   const identity = await repository(c, project.root, signal), key = hash(identity.common);
   const candidates = new Set<string>(), directLedgers: string[] = [];
   const defaultIndex = join(homedir(), '.pi-autoreview/kernel/runs', key);
@@ -225,7 +226,8 @@ export async function kernelFacts(c: Config, files: Files, initial: any, query: 
     if (![raw.id, ...tasks.map(t => t.id)].includes(r.task)) continue;
     const paths: string[] = [];
     for (const p of strings(r.evidence)) { const checked = await safeEvidence(p); if (checked) { paths.push(checked); evidence[`result-${Object.keys(evidence).length}`] = checked; } }
-    results.push({ id: text(r.id, 200), task: text(r.task, 200), node: text(r.node, 40), candidate: candidate(r.candidate), inputs: text(r.inputs, 128), status: text(r.status, 40), started: text(r.started, 80), ended: text(r.ended, 80), released: r.released === true, evidence: paths });
+    const originalResult = (Array.isArray(raw.results) ? raw.results : []).find((item: any) => item.id === r.id && item.task === r.task);
+    results.push({ ...(Number.isSafeInteger(r.epoch) && originalResult?.epoch === r.epoch ? { epoch: r.epoch } : {}), id: text(r.id, 200), task: text(r.task, 200), node: text(r.node, 40), candidate: candidate(r.candidate), inputs: text(r.inputs, 128), status: text(r.status, 40), started: text(r.started, 80), ended: text(r.ended, 80), released: r.released === true, evidence: paths });
   }
   await files.registerEvidence(project.root, evidence);
   const p = row.publication, flow = strings(raw.card?.flow);

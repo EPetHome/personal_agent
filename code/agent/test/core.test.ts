@@ -180,8 +180,8 @@ test('model failures accumulate across inputs, no automatic retry, reset only on
   await fetch(`${f.model.url}/script`, { method: 'POST', body: JSON.stringify(replyScript) }); await f.inject({ id: 'recover', text: 'test' }); await until(() => app.store.row('feishu:recover')?.state === 'done'); assert.equal(app.store.get('modelFailures', 0), 0);
 });
 
-test('plain model-authored final text uses the same durable reply tool, without keyword routing', async t => {
-  const f = await fixture({ flow: [{ text: '今天想随口聊聊也可以。' }] }); t.after(() => f.close());
+test('plain model-authored final text gets one correction into the same reply tool, without keyword routing or raw fallback', async t => {
+  const f = await fixture({ flow: [{ text: '未经 reply 的最终文字不会原文发送' }, { tools: [{ name: 'reply', arguments: { text: '今天想随口聊聊也可以。' } }] }, { text: 'done' }] }); t.after(() => f.close());
   const app = await f.start(); await f.inject({ id: 'plain', text: '随口说句话' }); await until(() => app.store.row('feishu:plain')?.state === 'done');
   assert.equal(f.feishu.messages.length, 1); assert.equal(f.feishu.messages[0]!.text, '今天想随口聊聊也可以。'); assert.equal(app.store.taskTable().length, 0);
 });

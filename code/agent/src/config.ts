@@ -5,8 +5,8 @@ import { SafeError } from './errors.js';
 import type { Config } from './types.js';
 
 export const CONFIG_FIELDS: Record<string, string[]> = Object.fromEntries(Object.entries({
-  root: 'dataDir attachmentDir inboxDirs projects readAllow readDeny windowTokens checkpointKeep maxToolRounds model feishu loop pi queue intake concurrency approval watchdog outputs',
-  outputs: 'otherProject',
+  root: 'dataDir attachmentDir inboxDirs projects readAllow readDeny windowTokens checkpointKeep maxToolRounds model feishu loop pi queue intake concurrency approval watchdog outputs timeZone piObservation',
+  outputs: 'otherProject', piObservation: 'sources', observationSource: 'id enabled exportRoot cwds ownerUid project allowSubject allowResult',
   model: 'url name auth headers timeoutMs maxOutputTokens dailyTokenLimit', 'model.auth': 'type path provider variable',
   feishu: 'mode userId url envFile pollMs timeoutMs', loop: 'command args eventDirs timeoutMs actionTimeoutMs',
   pi: 'command args timeoutMs pollMs startupMs maxTurns model', 'pi.model': 'url name',
@@ -50,7 +50,10 @@ async function businessConfig(path: string): Promise<Config> {
   const raw = await jsonFile<Partial<Config>>(path);
   fields(raw, 'root');
   for (const key of ['model', 'feishu', 'loop', 'pi', 'queue', 'intake', 'concurrency', 'approval', 'watchdog'] as const) fields(raw[key], key);
-  fields(raw.model?.auth, 'model.auth'); fields(raw.pi?.model, 'pi.model'); fields(raw.watchdog?.local, 'watchdog.local'); fields(raw.outputs, 'outputs');
+  fields(raw.model?.auth, 'model.auth'); fields(raw.pi?.model, 'pi.model'); fields(raw.watchdog?.local, 'watchdog.local'); fields(raw.outputs, 'outputs'); fields(raw.piObservation, 'piObservation');
+  if (raw.timeZone !== undefined) { if (typeof raw.timeZone !== 'string') throw new ConfigError('timeZone 须为本人时区'); try { new Intl.DateTimeFormat('en', { timeZone: raw.timeZone }); } catch { throw new ConfigError('timeZone 无效'); } }
+  if (raw.piObservation && !Array.isArray(raw.piObservation.sources)) throw new ConfigError('piObservation.sources 须为显式登记列表');
+  for (const source of raw.piObservation?.sources ?? []) fields(source, 'observationSource');
   if (raw.projects !== undefined && !Array.isArray(raw.projects)) throw new ConfigError('projects 必须是数组。');
   for (const p of raw.projects ?? []) { fields(p, 'project'); fields(p.loop, 'project.loop'); fields(p.pi, 'project.pi'); }
   const notification = await notificationConfig(raw), home = homedir();
@@ -99,6 +102,18 @@ async function businessConfig(path: string): Promise<Config> {
   c.readAllow = await Promise.all(c.readAllow.map(canonical)); c.readDeny = await Promise.all(c.readDeny.map(canonical));
   if (!c.pi.command || !Array.isArray(c.pi.args) || c.pi.args.some(a => typeof a !== 'string')) throw new ConfigError('Pi 命令配置无效');
   if (c.pi.model && (!c.pi.model.name || c.model.auth.type === 'none' && !localUrl(c.pi.model.url))) throw new ConfigError('无凭证 Pi 只允许本地模型替身');
+  if (c.piObservation) {
+    c.piObservation.sources = await Promise.all(c.piObservation.sources.map(async s => {
+      if (!/^[\w.@-]{1,160}$/.test(s.id) || typeof s.enabled !== 'boolean' || typeof s.allowSubject !== 'boolean' || typeof s.allowResult !== 'boolean'
+        || !isAbsolute(s.exportRoot) || !Array.isArray(s.cwds) || !s.cwds.length || s.cwds.some(p => typeof p !== 'string' || !isAbsolute(p))
+        || !Number.isSafeInteger(s.ownerUid) || s.ownerUid < 0 || s.project !== undefined && !c.projects.some(p => p.id === s.project)) throw new ConfigError('Pi 观察来源须明确身份、根、cwd、所有者及允许导出的字段');
+      const exportRoot = await canonical(s.exportRoot), cwds = await Promise.all(s.cwds.map(canonical));
+      const blocked = [c.dataDir, c.attachmentDir, c.configPath, c.model.auth.path, c.feishu.envFile, ...c.inboxDirs, ...c.loop.eventDirs].filter(Boolean);
+      if (blocked.some(p => inside(p, exportRoot) || inside(exportRoot, p)) || c.projects.some(p => inside(exportRoot, p.root)) || s.project && cwds.some(path => !inside(c.projects.find(p => p.id === s.project)!.root, path))) throw new ConfigError('Pi 导出根须独立，项目归属不能扩展 cwd 范围');
+      return { ...s, exportRoot, cwds };
+    }));
+    if (new Set(c.piObservation.sources.map(s => s.id)).size !== c.piObservation.sources.length || c.piObservation.sources.some((s, i, all) => all.some((other, j) => i !== j && (inside(s.exportRoot, other.exportRoot) || inside(other.exportRoot, s.exportRoot))))) throw new ConfigError('Pi 观察身份和导出根不能重复或重叠');
+  }
   const configReal = await canonical(c.configPath);
   if (inside(c.dataDir, c.attachmentDir) || inside(c.attachmentDir, c.dataDir)) throw new ConfigError('附件目录必须独立于数据目录');
   const incoming = [...c.inboxDirs, ...c.loop.eventDirs];

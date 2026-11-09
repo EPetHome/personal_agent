@@ -1,6 +1,6 @@
 import { dirname, resolve, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import type { Config, Input, Material, Project, TaskCard } from './types.js';
+import type { Config, Input, Material, Project, TaskCard, Verification } from './types.js';
 import type { Store } from './store.js';
 import type { Files } from './files.js';
 import type { Workers, WorkerSnapshot } from './worker.js';
@@ -9,29 +9,41 @@ import { kernelSource, repository } from './loop-kernel.js';
 import { readBytes } from './file-policy.js';
 import { hash, parseJson } from './util.js';
 import { SafeError, failure } from './errors.js';
+import { PiObservation } from './pi-observation.js';
+import { executionOrigin, ownExecution, syncExecutionFacts, WorkTracking } from './work-tracking.js';
+import { Attention } from './attention.js';
 
-export const SOURCE_GAPS = ['未登记的 Loop 单会话未接通', '独立 Pi 未接通（PA 已派 Pi 沿原任务查询）', '未知协议未接通', '办公/搜索新来源及完整长期关注管理未接通'];
+export const SOURCE_GAPS = ['未登记的 Loop 单会话未接通', '独立 Pi 仅显式登记且已加载导出的来源可见；未登记/旧窗口未接通', '未知协议未接通', '办公仅已有授权本地材料；公网/外部账号/任意周期执行未接通'];
 const short = (v: string | undefined, n = 240) => (v ?? '').slice(0, n);
 
 /** Model-facing projections only. Full task bodies/snapshots remain in the
  * existing Store; index/detail/evidence all recheck the current grants. */
 export class TaskContext {
   private readonly loopQueries = new Map<string, { scope: string; created: number; refs: LoopReference[]; errors: string[]; checked: Map<number, { current: boolean; ok: boolean }> }>();
-  constructor(readonly c: Config, readonly store: Store, readonly files: Files, readonly workers: Workers) {}
+  readonly observations: PiObservation;
+  readonly work: WorkTracking;
+  constructor(readonly c: Config, readonly store: Store, readonly files: Files, readonly workers: Workers) { this.observations = new PiObservation(c, store, files); this.work = new WorkTracking(c, store, files); }
+  private observedSources() { return this.c.piObservation?.sources.flatMap(s => { try { this.observations.source(s.id); return [s.id]; } catch { return []; } }) ?? []; }
   private async projects() {
     const allowed: Project[] = [];
     for (const p of this.c.projects) try { await this.files.protocolPath(p.root, p.root); allowed.push(p); } catch { /* Counts must not expose denied projects either. */ }
     return allowed;
   }
-  private async authorize(card: TaskCard) {
-    if (!card.worker || !card.worker.project && !['loop', 'pi'].includes(card.worker.kind)) return;
-    const p = (await this.projects()).find(p => [p.id, p.root].includes(card.worker!.project));
-    if (!p) throw new SafeError('outside_scope', '原事项当前不在获准读取范围');
-    const b = card.worker.loop;
-    if (!b && card.worker.kind === 'loop' && card.worker.batchFile) await this.files.protocolPath(p.root, card.worker.batchFile, true);
-    if (b) {
-      await this.files.protocolPath(p.root, b.ledger);
-      if ((await repository(this.c, p.root)).common !== b.repository) throw new SafeError('outside_scope', '原仓库身份已变化');
+  async authorize(card: TaskCard) {
+    const ownerId = this.store.taskTarget(card.id);
+    if (ownerId !== card.id) { const owner = this.store.workTask(ownerId); if (!owner) throw new SafeError('outside_scope', '关联归属当前无法核对'); await this.authorize(owner); }
+    await this.work.authorize(card);
+    await this.observations.authorize(card);
+    const origins = new Set([card.id, ...(card.work?.executions.flatMap(e => e.originTaskId && ['pi', 'loop'].includes(e.kind) ? [e.originTaskId] : []) ?? [])]);
+    const projects = await this.projects();
+    for (const id of origins) {
+      const worker = (id === card.id ? card : this.store.task(id))?.worker;
+      if (!worker || !worker.project && !['loop', 'pi'].includes(worker.kind)) continue;
+      const p = projects.find(p => [p.id, p.root].includes(worker.project));
+      if (!p) throw new SafeError('outside_scope', '原事项当前不在获准读取范围');
+      const b = worker.loop;
+      if (!b && worker.kind === 'loop' && worker.batchFile) await this.files.protocolPath(p.root, worker.batchFile, true);
+      if (b) { await this.files.protocolPath(p.root, b.ledger); if ((await repository(this.c, p.root)).common !== b.repository) throw new SafeError('outside_scope', '原仓库身份已变化'); }
     }
   }
   async visibleSummary(card: TaskCard) {
@@ -39,43 +51,49 @@ export class TaskContext {
     catch { return { id: card.id, unavailable: true, reason: '原事项当前不在获准读取范围' }; }
   }
   summary(card: TaskCard) {
-    return { id: card.id, title: short(card.title, 160), project: card.worker?.project, status: card.status, localTaskState: card.status,
+    const origin = executionOrigin(this.store, card);
+    return { id: card.id, title: short(card.title, 160), project: origin.worker?.project, status: card.status, localTaskState: card.status,
       sourceState: card.sourceCurrent?.state ?? card.verified?.state,
       goal: card.sourceDefinition?.state === 'pending' ? '任务定义待读取' : short(card.goal) || '任务定义按需读取',
-      definitionState: card.sourceDefinition?.state, lastVerifiedAt: card.lastVerifiedAt ?? null, updated: card.updated,
+      definitionState: card.sourceDefinition?.state, sourceRevision: card.sourceRevision ?? null, lastVerifiedAt: card.lastVerifiedAt ?? null, updated: card.updated,
       freshness: card.sourceHealth?.ok === false ? '当前未核实；保留最后可靠事实' : '最后已知事实；问当前状态须先查询来源',
       ...(card.sourceHealth ? { sourceHealth: card.sourceHealth } : {}),
-      decision: !!card.waiting || !!card.deferred, waiting: short(card.waiting, 120), origin: card.worker?.origin,
-      ...(card.worker?.loop ? { source: { repository: card.worker.loop.repository, runId: card.worker.loop.runId, taskId: card.worker.loop.taskId }, sourceRevision: card.sourceRevision } : {}) };
+      decision: !!card.waiting || !!card.deferred, waiting: short(card.waiting, 120), origin: card.observation ? 'owner-pi' : origin.worker?.origin,
+      executionTaskId: origin.id, linkedTo: card.work?.linkedTo,
+      ownership: card.work?.ownership, executionCount: card.work?.executions.length ?? 0, currentExecution: card.work?.currentExecution, tracking: card.work?.tracking,
+      ...(card.observation ? { observation: { sourceId: card.observation.sourceId }, control: '仅运行观察；业务交付未核实' } : {}),
+      ...(origin.worker?.loop ? { source: { repository: origin.worker.loop.repository, runId: origin.worker.loop.runId, taskId: origin.worker.loop.taskId }, sourceRevision: card.sourceRevision } : {}) };
   }
   async context(input: Input) {
     const projects = await this.projects(), names = projects.flatMap(p => [p.id, p.root]);
-    const page = this.store.taskPage(names, { limit: 5 }), decisions = this.store.taskPage(names, { limit: 3, decisionOnly: true });
+    const page = this.store.taskPage(names, { limit: 5, observationSources: this.observedSources(), observationDeny: this.c.readDeny }), decisions = this.store.taskPage(names, { limit: 3, decisionOnly: true, observationSources: this.observedSources(), observationDeny: this.c.readDeny });
     const visible = [], pending = [];
     for (const row of page.rows) {
-      const card = this.store.task(row.id)!;
+      const card = this.store.workTask(row.id)!;
       try { await this.authorize(card); visible.push(row); } catch { /* Withhold cached source bodies after a grant changes. */ }
     }
     for (const row of decisions.rows) {
-      try { await this.authorize(this.store.task(row.id)!); pending.push({ id: row.id, title: row.title, status: row.status, attention: '保留待决定；无关问答不催办，详情按需读取' }); } catch { /* Same gate for hints. */ }
+      try { await this.authorize(this.store.workTask(row.id)!); pending.push({ id: row.id, title: row.title, status: row.status, attention: '保留待决定；无关问答不催办，详情按需读取' }); } catch { /* Same gate for hints. */ }
     }
     const matched: ReturnType<TaskContext['summary']>[] = [];
     for (const card of this.store.match(input).slice(0, 5)) {
       try {
         await this.authorize(card);
-        matched.push({ ...this.summary(card), completion: short(card.completion, 180), boundary: short(card.boundary, 180), worker: card.worker ? { kind: card.worker.kind, project: card.worker.project, batchFile: card.worker.batchFile } : undefined,
+        matched.push({ ...this.summary(card), completion: short(card.completion, 180), boundary: short(card.boundary, 180), worker: executionOrigin(this.store, card).worker ? { kind: executionOrigin(this.store, card).worker!.kind, project: executionOrigin(this.store, card).worker!.project, batchFile: executionOrigin(this.store, card).worker!.batchFile, originTaskId: executionOrigin(this.store, card).id } : undefined,
           verified: card.verified ? { state: card.verified.state, event: card.verified.event } : undefined,
           dispatches: card.dispatches.slice(-1).map(value => { const event = value as { event?: string; status?: string }; return { event: event.event, status: event.status }; }) } as ReturnType<TaskContext['summary']>);
       } catch { /* Old quote IDs are not grants. */ }
     }
     return { type: '任务表', rows: visible, total: page.total, count: visible.length, withheld: page.count - visible.length, partial: page.hasMore || visible.length !== page.count, totalKind: '已登记的当前事项索引；历史用 includeClosed，索引计数不等于实时全来源总量', hasMore: page.hasMore, nextCursor: page.nextCursor,
       matchedCards: matched, decisions: { total: decisions.total, count: pending.length, hasMore: decisions.hasMore, rows: pending }, detail: '这里只含摘要。list_projects/list_tasks 分页；get_task 按需读原定义、事实及证据。问现在先查来源；不把部分/失败说成无任务。',
-      coverage: this.coverage(projects), projects: projects.slice(0, 5).map(p => ({ id: p.id })), projectIndex: { total: projects.length, count: Math.min(5, projects.length), hasMore: projects.length > 5 } };
+      coverage: this.coverage(projects), attention: new Attention(this.c, this.store).rules().map(r => ({ id: r.id, revision: r.revision, kind: r.kind, project: r.project, sourceId: r.sourceId, state: r.state, expiresAt: r.expiresAt, notify: r.notify })).slice(0, 10), projects: projects.slice(0, 5).map(p => ({ id: p.id })), projectIndex: { total: projects.length, count: Math.min(5, projects.length), hasMore: projects.length > 5 } };
   }
   coverage(projects: Project[]) {
     return { scope: '获准项目正式新版 Loop 单/多任务记录；旧 v1 保留兼容。不是全来源、全过程恢复',
       projects: projects.slice(0, 10).map(p => ({ id: p.id, ...this.store.get<Record<string, unknown>>(`discovery:coverage:${p.id}`, { ok: false, partial: true, checkedAt: null, reason: '尚未完成来源核对' }) })),
-      totalProjects: projects.length, count: Math.min(10, projects.length), hasMore: projects.length > 10, gaps: SOURCE_GAPS };
+      totalProjects: projects.length, count: Math.min(10, projects.length), hasMore: projects.length > 10,
+      pi: this.c.piObservation?.sources.filter(s => s.enabled).map(s => ({ sourceId: s.id, ...(this.observedSources().includes(s.id) && !this.c.readDeny.some(p => p === s.exportRoot || p.startsWith(`${s.exportRoot}/`)) ? this.store.get<Record<string, unknown>>(`pi-observation:coverage:${s.id}`, { ok: false, partial: true, reason: '尚未接通/核实' }) : { ok: false, partial: true, reason: '当前观察读取范围受限，不披露旧正文或计数' }) })) ?? [],
+      office: { scope: '现有获准本地材料，不要求 Git；Loop 覆盖失败不阻断本地读取', businessAcceptance: '未验证' }, gaps: SOURCE_GAPS };
   }
   async projectPage(cursor = '', limit = 10) {
     const projects = (await this.projects()).sort((a, b) => a.id.localeCompare(b.id));
@@ -87,18 +105,20 @@ export class TaskContext {
       nextCursor: rest.length > page.length ? Buffer.from(JSON.stringify({ scope, after: page.at(-1)!.id })).toString('base64url') : null,
       rows: page.map(p => ({ id: p.id, root: p.root, tasks: this.store.taskPage([p.id, p.root], { project: [p.id, p.root], limit: 1 }).total, coverage: this.store.get(`discovery:coverage:${p.id}`, { ok: false, partial: true, checkedAt: null }) })), gaps: SOURCE_GAPS };
   }
-  async taskPage(options: { project?: string; cursor?: string; limit?: number; includeClosed?: boolean } = {}, signal?: AbortSignal) {
+  async taskPage(options: { project?: string; businessProject?: string; cursor?: string; limit?: number; includeClosed?: boolean } = {}, signal?: AbortSignal) {
     const projects = await this.projects(), names = projects.flatMap(p => [p.id, p.root]);
     const project = options.project ? projects.find(p => [p.id, p.root].includes(options.project!)) : undefined;
     if (options.project && !project) throw new SafeError('outside_scope', '不是当前获准项目');
-    const page = this.store.taskPage(names, { ...options, project: project ? [project.id, project.root] : undefined });
+    const page = this.store.taskPage(names, { ...options, observationSources: this.observedSources(), observationDeny: this.c.readDeny, project: project ? [project.id, project.root] : undefined });
     const rows = [];
     let withheld = 0;
     for (const row of page.rows) {
       try { rows.push(await this.detail(String(row.id), [], signal, false)); }
       catch (error) { signal?.throwIfAborted(); withheld++; }
     }
-    return { ...page, rows, count: rows.length, withheld, partial: page.hasMore || withheld > 0 || rows.some(row => !row.ok), coverage: this.coverage(project ? [project] : projects), checkedAt: new Date().toISOString(), note: '仅核对此页，未读完不代表完整实时全貌；查询不建立任务或永久关注' };
+    const verified = rows.map(row => 'verification' in row ? row.verification : undefined), times = verified.flatMap(v => v?.checkedAt ? [v.checkedAt] : []).sort();
+    const verification: Verification = { basis: 'index', checkedAt: times[0] ?? null, current: rows.length > 0 && verified.every(v => v?.current) && !withheld, indexComplete: !page.hasMore && !withheld, sourceComplete: false };
+    return { ...page, rows, count: rows.length, withheld, partial: page.hasMore || withheld > 0 || rows.some(row => !row.ok), coverage: this.coverage(project ? [project] : projects), checkedAt: verification.checkedAt, verification, note: '仅核对此页，未读完不代表完整实时全貌；查询不建立任务或永久关注' };
   }
   private async pendingDefinition(card: TaskCard) {
     // Optional consumer metadata is not part of default context. Preserve the
@@ -132,39 +152,56 @@ export class TaskContext {
     return view;
   }
   async detail(id: string, materials: Material[], signal?: AbortSignal, expand = true) {
-    let card = this.store.task(id);
-    if (!card) return { ok: false, reason: '未找到任务；不据此断言来源没有任务' };
+    let card = this.store.workTask(id);
+    if (!card) return { ok: false, category: 'not_found', reason: '未找到任务；不据此断言来源没有任务' };
     await this.authorize(card); signal?.throwIfAborted();
-    let ok = true, reason: string | undefined;
-    if (card.worker?.batchFile) {
+    let ok = true, reason: string | undefined, category: string | undefined;
+    let origin = executionOrigin(this.store, card), observation: Awaited<ReturnType<PiObservation['view']>> | undefined;
+    const verification: Verification = { basis: 'cache', checkedAt: card.lastVerifiedAt ?? null, current: false, indexComplete: true, sourceComplete: false };
+    if (card.observation) {
+      const view = observation = await this.observations.view(card); ok = view.ok;
+      card = this.store.workTask(id)!;
+      Object.assign(verification, { basis: 'source', checkedAt: card.lastVerifiedAt ?? null, current: ok, sourceComplete: ok });
+      if (!ok) { reason = 'reason' in view ? view.reason : '来源当前未核实'; category = 'unverified'; }
+    } else if (origin.worker?.batchFile) {
       try {
-        const result = await this.workers.status(id, signal);
+        const result = await this.workers.status(origin.id, signal, true);
         if (!result.ok) throw new SafeError('unverified', result.reason ?? '原来源当前未核实');
-        card = this.store.task(id)!;
+        origin = this.store.task(origin.id)!;
         if (result.snapshot && !result.snapshot.loopBinding) {
-          await this.authorize(card);
-          const view = this.sourceView(card, result.snapshot);
-          const current = this.store.task(id)!;
-          current.sourceCurrent = view; current.lastVerifiedAt = view.checkedAt;
-          current.sourceHealth = { ok: true, checkedAt: view.checkedAt }; this.store.putTask(current); card = current;
+          await this.authorize(origin);
+          const view = this.sourceView(origin, result.snapshot);
+          if (origin.worker?.kind === 'pi') view.checkedAt = (origin.verified?.snapshot as { operation?: string } | undefined)?.operation === origin.worker.batchFile ? origin.lastVerifiedAt ?? null : null;
+          origin.sourceCurrent = view;
+          if (origin.worker?.kind !== 'pi' && view.checkedAt) { origin.lastVerifiedAt = view.checkedAt; origin.sourceHealth = { ok: true, checkedAt: view.checkedAt }; }
+          this.store.putTask(origin);
+          syncExecutionFacts(this.store, origin, ownExecution(origin)?.key);
         }
+        card = this.store.workTask(id)!;
+        const direct = origin.worker?.kind === 'loop';
+        Object.assign(verification, { basis: direct ? 'source' : 'cache', checkedAt: direct ? card.lastVerifiedAt ?? null : card.sourceCurrent?.checkedAt ?? null, current: direct && card.sourceHealth?.ok === true, sourceComplete: direct && card.sourceHealth?.ok === true });
       } catch (error) {
-        signal?.throwIfAborted(); ok = false; reason = failure(error).error;
-        card = this.store.task(id)!;
-        card.sourceHealth = { ok: false, checkedAt: new Date().toISOString(), reason }; this.store.putTask(card);
+        signal?.throwIfAborted(); ok = false; const safe = failure(error); reason = safe.error; category = safe.category;
+        origin = this.store.task(origin.id)!;
+        origin.sourceHealth = { ok: false, checkedAt: new Date().toISOString(), reason }; this.store.putTask(origin);
+        syncExecutionFacts(this.store, origin, ownExecution(origin)?.key); card = this.store.workTask(id)!;
       }
     }
     await this.authorize(card);
+    const definition = expand ? origin.sourceDefinition ? await this.definition(origin, materials) : { state: 'read', goal: origin.goal, completion: origin.completion, boundary: origin.boundary } : undefined;
+    if (expand && origin.id !== id) { syncExecutionFacts(this.store, this.store.task(origin.id)!); card = this.store.workTask(id)!; }
     const summary = this.summary(card);
-    if (!expand) return { ok, ...summary, ...(reason ? { reason } : {}) };
+    if (!expand) return { ok, ...summary, verification, ...(reason ? { reason, category } : {}) };
     const layers = card.verified?.layers as Record<string, unknown> | undefined;
-    const result = { ok, ...summary, ...(reason ? { reason } : {}), completion: short(card.completion, 600), boundary: short(card.boundary, 600), conclusion: short(card.conclusion, 2000),
-      worker: card.worker ? { kind: card.worker.kind, project: card.worker.project, batchFile: card.worker.batchFile, loop: card.worker.loop } : undefined,
-      layers: card.worker?.loop ? { execution: layers?.execution, checks: layers?.checks, results: Array.isArray(layers?.results) ? layers.results.filter(r => { const value = r as { task?: string }; return [card!.worker!.loop!.taskId, card!.worker!.loop!.runId].includes(value.task ?? ''); }).slice(-10) : [], publication: layers?.publication, businessAcceptance: '未验证' }
+    const result = { ok, ...summary, verification, ...(reason ? { reason, category } : {}), completion: short(card.completion, 600), boundary: short(card.boundary, 600), conclusion: short(card.conclusion, 2000),
+      worker: origin.worker ? { kind: origin.worker.kind, project: origin.worker.project, batchFile: origin.worker.batchFile, loop: origin.worker.loop, originTaskId: origin.id } : undefined,
+      layers: origin.worker?.loop ? { execution: layers?.execution, checks: layers?.checks, results: Array.isArray(layers?.results) ? layers.results.filter(r => { const value = r as { task?: string }; return [origin.worker!.loop!.taskId, origin.worker!.loop!.runId].includes(value.task ?? ''); }).slice(-10) : [], publication: layers?.publication, businessAcceptance: '未验证' }
         : { execution: card.sourceCurrent ?? { state: card.verified?.state ?? card.status, checkedAt: card.lastVerifiedAt ?? null }, gate: layers?.gate ?? '未核实', review: layers?.review ?? '未核实', acceptance: layers?.acceptance ?? '未核实', businessAcceptance: '未验证' },
+      observation,
+      work: card.work ? { ...card.work, current: undefined, executions: { total: card.work.executions.length, count: Math.min(10, card.work.executions.length), hasMore: card.work.executions.length > 10, rows: card.work.executions.slice(-10) } } : undefined,
       outputDraft: await this.pendingDefinition(card),
       evidence: '用 read_task_evidence 按当前权限读取；这里不注入原日志或完整 snapshot',
-      definition: card.sourceDefinition ? await this.definition(card, materials) : { state: 'read', goal: card.goal, completion: card.completion, boundary: card.boundary } };
+      definition };
     materials.push({ path: `task://${id}`, sha256: hash(JSON.stringify(result)) }); return result;
   }
   private async definition(card: TaskCard, materials: Material[]) {
@@ -226,9 +263,11 @@ export class TaskContext {
     return { rows, count: rows.length, withheld: page.length - rows.length, nextAfter: page.at(-1)?.seq ?? after, hasMore: page.length === limit };
   }
   async evidence(id: string, key: string, materials: Material[], signal?: AbortSignal, offset = 0, length = 16000) {
-    const card = this.store.task(id); if (!card) throw new SafeError('not_found', '未找到原事项');
+    const card = this.store.workTask(id); if (!card) throw new SafeError('not_found', '未找到原事项');
     await this.authorize(card);
-    const paths = card.verified?.evidence ?? {};
+    if (card.observation) return this.observations.evidence(card, key, materials, signal);
+    const archived = card.work?.executions.flatMap(e => (e.result?.refs ?? []).map((ref, i) => ({ key: `execution-${e.key}-${i}`, ...ref }))) ?? [];
+    const paths = { ...Object.fromEntries((card.work?.materials ?? []).map((m, i) => [`material-${i}`, m.path])), ...Object.fromEntries(archived.map(ref => [ref.key, ref.path])), ...(card.verified?.evidence ?? {}) };
     if (!key) {
       const rows = [];
       for (const [name, path] of Object.entries(paths).slice(0, 20)) {
@@ -237,7 +276,22 @@ export class TaskContext {
       return { total: Object.keys(paths).length, count: rows.length, hasMore: Object.keys(paths).length > 20, rows };
     }
     const path = paths[key]; if (!path) throw new SafeError('not_found', '该原事项没有此证据引用');
-    return this.files.read(path, materials, true, offset, Math.min(64000, length), false, signal);
+    const material = archived.find(m => m.key === key) ?? card.work?.materials?.find(m => m.path === path);
+    if (material) {
+      const { data } = await readBytes(path, () => this.files.check(path, true), this.c.intake.maxFileBytes);
+      if (hash(data) !== material.sha256) throw new SafeError('file_changed', '原事项材料内容版本已变化，不冒充原交付依据');
+    }
+    const result = await this.files.read(path, materials, true, offset, Math.min(64000, length), false, signal);
+    if (material && result.ok && 'sourceSha256' in result && result.sourceSha256 !== material.sha256) throw new SafeError('file_changed', '读取期间材料变化');
+    return result;
+  }
+  async executionPage(id: string, offset = 0, limit = 10) {
+    const card = this.store.workTask(id); if (!card) throw new SafeError('not_found', '原事项不存在');
+    await this.authorize(card);
+    const refs = card.work?.executions ?? [];
+    const times = refs.flatMap(ref => ref.verifiedAt ? [ref.verifiedAt] : []).sort();
+    const verification: Verification = { basis: 'cache', checkedAt: times[0] ?? card.lastVerifiedAt ?? null, current: false, indexComplete: offset + limit >= refs.length, sourceComplete: false };
+    return { taskId: id, currentExecution: card.work?.currentExecution, total: refs.length, rows: refs.slice(offset, offset + limit), hasMore: offset + limit < refs.length, nextOffset: offset + limit < refs.length ? offset + limit : null, verification };
   }
   private async lastConfirmed(reference: LoopReference, signal?: AbortSignal) {
     const project = this.c.projects.find(p => p.root === reference.project);

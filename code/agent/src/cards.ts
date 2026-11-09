@@ -5,13 +5,16 @@ import type { TaskCard } from './types.js';
 import { hash } from './util.js';
 import { WorkerJournal, operationIdentity, DISPATCH_MANUAL_ACK } from './worker-journal.js';
 import { DispatchCards } from './dispatch-card.js';
+import { SafeError } from './errors.js';
+import { retainObservationGrants } from './context.js';
 
 export interface ApprovalView { id: string; token: string; description: string; redLine: boolean; again: boolean }
 export interface TaskDelivery { status: 'sent' | 'pending' | 'uncertain'; id?: string; reason?: string }
+export interface PublicationGrant { sources: Record<string, string>; access: string }
 const labels: Record<string, string> = { 'waiting-approval': '等你点头', running: '进行中', queued: '排队中', stopping: '正在停止', 'timed-out': '已超时', interrupted: '已中断', paused: '卡住', 'needs-decision': '需要你决定', 'repair-limit': '没全过', done: '做完', incomplete: '没全过', cancelled: '已取消', closed: '已关闭', uncertain: '不确定', failed: '卡住', stopped: '已停止', reconciled: '已人工核销（非业务通过）' };
 export class TaskMessages {
   private readonly publishing = new Map<string, Promise<unknown>>();
-  constructor(readonly store: Store, readonly channel: Channel) {}
+  constructor(readonly store: Store, readonly channel: Channel, readonly authorize?: (card: TaskCard, inherited: Record<string, string>) => Promise<PublicationGrant | void>) {}
   view(card: TaskCard, approval?: ApprovalView): MessageCard {
     const state = labels[card.status] ?? card.status, closed = ['cancelled', 'closed', 'reconciled'].includes(card.status);
     const dispatches = new DispatchCards(this.store), dispatched = dispatches.current(card), stop = dispatches.stoppable(card, dispatched);
@@ -23,7 +26,10 @@ export class TaskMessages {
     const storedReview = unknown ? journal.review(unknown.id) : null;
     const review = unknown && storedReview?.state === 'pending' && storedReview.identityHash === operationIdentity(unknown) ? storedReview : undefined;
     const identity = unknown ? `原派工编号：${unknown.id}\n原批次：${unknown.request.batchFile || '尚未取得'}\n原分支：${unknown.request.launch?.branch ?? `feat/pa-${unknown.id}`}\n原资源：${JSON.stringify(unknown.resources ?? [])}\n原启动器：${unknown.request.launch?.launcher ? `PID ${unknown.request.launch.launcher.pid}，启动时间 ${unknown.request.launch.launcher.started ?? '未能确认'}` : '未记录，须按原批次和运行记录在电脑核对'}\n原结束回执：${unknown.request.launch?.receiptFile ?? '未取得'}\n请同时核对批次、PID 与启动时间，不按进程名或仅凭 PID 猜测结束。` : '';
-    const text = [title, `目标：${card.goal}`, `完成标准：${card.completion}`, `边界：${card.boundary}`,
+    const owner = this.store.workTask(this.store.taskTarget(card.id)) ?? card;
+    const origin = owner.work?.executions.find(e => e.key === owner.work?.currentExecution)?.originTaskId;
+    const relation = owner.id !== card.id ? `归属事项：${owner.id} · ${owner.title}；本卡仍按原执行 ${card.id} 回收结果、保留原操作和按钮。` : origin && origin !== card.id ? `当前主执行的原编号：${origin}；本卡保留原执行 ${card.id} 的回执/控制绑定，关联执行详情按原编号查询。` : '';
+    const text = [title, relation, `目标：${card.goal}`, `完成标准：${card.completion}`, `边界：${card.boundary}`,
       dispatched ? `${dispatches.describe(dispatched)}\n已派出只是接收事实，不代表工作完成或业务验收通过。${stop ? '理解有误可直接点停止，按卡上原对象停止并保留成果，无需再点好。' : ''}` : '',
       stopResult ? `本次卡内停止回执：${stopResult.reason || '停止正在核对，尚未确认完成；不会重复停止'}\n停止操作编号：${stopResult.id}` : '',
       card.worker ? `派给 ${card.worker.kind === 'loop' ? 'Loop' : card.worker.kind}：${card.worker.batchFile || '确认后开工'}` : '',
@@ -77,6 +83,15 @@ export class TaskMessages {
   }
   private async publishOnce(taskId: string, inputId: string, approval?: ApprovalView, signal?: AbortSignal) {
     const card = this.store.task(taskId); if (!card) return;
+    const owner = this.store.workTask(this.store.taskTarget(taskId));
+    let inherited = retainObservationGrants(this.store, inputId);
+    for (const item of [card, ...(owner && owner.id !== card.id ? [owner] : [])]) if (Object.keys(inherited).length || item.observation || item.work?.executions.some(e => e.kind === 'pi-observation')) {
+      if (!this.authorize) throw new SafeError('outside_scope', '观察卡缺少当前披露授权检查，未发送');
+      const grant = await this.authorize(item, inherited);
+      if (grant) {
+        inherited = retainObservationGrants(this.store, inputId, grant.sources, grant.access);
+      }
+    } // Tag program-owned callbacks too: their sent cards can enter the verbatim window without a Router/model turn.
     const dispatches = new DispatchCards(this.store), dispatch = dispatches.current(card);
     const view = this.view(card, approval), digest = hash(JSON.stringify(view));
     const key = `task-message:${taskId}`;

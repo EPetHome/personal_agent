@@ -30,8 +30,12 @@ export function capabilities(c: Config, tools: string[]) {
   };
   // Compose only this adapter's facts; retain other capability providers' fields
   // and their no-event monitoring description rather than replacing that block.
-  return { ...facts, loop: { ...facts.loop,
+  return { ...facts,
+    work: { ledger: '复用原 TaskCard/Store/WorkerJournal；归属不授予权限，完整执行索引与当前执行分开；显式原身份或本人纠正才关联', office: '已有授权本地材料即时查询不建派单；跨轮用 record_local_work 原 ID 记录文本交付与材料版本；不要求 Git/代码评审，不对外发送', attention: '仅 Loop/Pi 已接入工作，list_attention/attention_save/attention_pause 与 track_work 分开；模型理解责任终点，程序核本人来源/权限/去重/撤销；关注不授权执行', timeZone: c.timeZone ?? '未配置（不可按开发机器时区设期限）' },
+    reply: { entry: 'reply；直接最终文字最多补正一次，不原文兜底', fragments: '事项/总量/决定/交付/通知须引用本轮工具 fact.id，核对权限、版本、新鲜度、覆盖与提醒；省略taskId仍核对', semantic: '普通文字是否夹带未声明旧断言仍须语义检查，程序约束不能替代' },
+    piObservation: { sources: c.piObservation?.sources.filter(s => s.enabled).map(s => ({ id: s.id, project: s.project ?? null, subject: s.allowSubject, result: s.allowResult })) ?? [], protocol: 'version:1限定原子快照；只读，未加载导出的旧会话未接通，不扫描历史；无独立Pi控制能力', lease: '30秒刷新、90秒未刷新只标来源未核实；运行停稳不等于业务交付' },
+    loop: { ...facts.loop,
     protocol: { ...facts.loop.protocol, verification: 'list_projects/list_tasks/query_loop 分页摘要；get_task/worker_status 先核对原来源再按需读定义与分层事实；read_task_evidence 逐次核权读证据。失败保留 sourceRevision/lastVerifiedAt，技术状态不是业务验收' },
     sensing: ['按获准项目 Git common identity 定位约定运行索引，自动发现 version:1/kernel:1 单/多任务正式记录；PA 自派与本人独立启动分别按原身份跟踪。通知仅唤醒，默认 60 秒兜底，分页续查；只恢复当前事实，不补造丢失过程',
-      ...facts.loop.sensing.slice(1).map(text => text.replace('全来源新任务自动发现、长期关注尚未实现；', '未登记 Loop 单会话、独立 Pi、未知协议及完整长期关注管理未接通；'))] } };
+      ...facts.loop.sensing.slice(1).map(text => text.replace('全来源新任务自动发现、长期关注尚未实现；', '未登记 Loop 单会话、未接入的独立 Pi 及未知协议未接通；持久关注仅支持明确登记的 Loop/Pi 工作来源；'))] } };
 }

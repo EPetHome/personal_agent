@@ -95,10 +95,24 @@ export class Store {
     } catch (e) { if (ownsTransaction) this.db.exec('ROLLBACK'); throw e; }
   }
   task(id: string): TaskCard | undefined { const row = this.db.prepare('SELECT body FROM tasks WHERE id=?').get(id); return row ? parseJson<TaskCard>(String(row.body)) : undefined; }
+  taskTarget(id: string) {
+    const seen = new Set<string>();
+    while (true) {
+      if (seen.has(id) || seen.size >= 64) throw new Error('事项关联存在循环，未沿猜测归属继续');
+      seen.add(id); const next = this.get<string | null>(`work:alias:${id}`, null);
+      if (!next) return id; id = next;
+    }
+  }
+  workTask(id: string): TaskCard | undefined {
+    const card = this.task(id); if (!card?.work?.current) return card;
+    const fields = Object.fromEntries(Object.entries(card.work.current).map(([key, value]) => [key, value === null ? undefined : value]));
+    return { ...card, ...fields, ...(['cancelled', 'closed', 'reconciled'].includes(card.status) ? { status: card.status, waiting: card.waiting, notice: card.notice } : {}) };
+  }
+  private matched(ids: string[], original = false) { return [...new Set(ids.map(id => original ? id : this.taskTarget(id)))].flatMap(id => { const card = original ? this.task(id) : this.workTask(id); return card ? [card] : []; }); }
   /** Stable insertion-order paging. A cursor freezes the upper rowid, so concurrent
    * updates/new discoveries cannot repeat or silently skip rows on later pages. */
-  taskPage(projects: string[], options: { project?: string | string[]; cursor?: string; limit?: number; includeClosed?: boolean; protocol?: string; decisionOnly?: boolean } = {}) {
-    const scope = JSON.stringify([projects, options.project ?? '', !!options.includeClosed, options.protocol ?? '', !!options.decisionOnly]);
+  taskPage(projects: string[], options: { project?: string | string[]; businessProject?: string; cursor?: string; limit?: number; includeClosed?: boolean; protocol?: string; decisionOnly?: boolean; observationSources?: string[]; observationDeny?: string[] } = {}) {
+    const scope = JSON.stringify([projects, options.project ?? '', !!options.includeClosed, options.protocol ?? '', !!options.decisionOnly, options.observationSources ?? [], options.observationDeny ?? [], options.businessProject ?? '']);
     let after = 0, upper = Number(this.db.prepare('SELECT COALESCE(MAX(rowid),0) AS n FROM tasks').get()!.n);
     if (options.cursor) {
       const cursor = parseJson<{ scope: string; after: number; upper: number }>(Buffer.from(options.cursor, 'base64url').toString());
@@ -107,17 +121,23 @@ export class Store {
     }
     const project = "json_extract(body,'$.worker.project')", permitted = projects.length ? `${project} IN (${projects.map(() => '?').join(',')})` : '0';
     const selected = options.project ? Array.isArray(options.project) ? options.project : [options.project] : [];
-    const clauses = ['rowid<=?', `(${project} IS NULL OR ${permitted})`, ...(options.includeClosed ? [] : ["status NOT IN ('closed','cancelled','reconciled','done','已合入','已放弃')"]), ...(selected.length ? [`${project} IN (${selected.map(() => '?').join(',')})`] : []), ...(options.protocol ? ["json_extract(body,'$.worker.loop.protocol')=?"] : []), ...(options.decisionOnly ? ["(COALESCE(json_extract(body,'$.waiting'),'')<>'' OR json_extract(body,'$.deferred')=1 OR status IN ('waiting-approval','等你决定'))"] : [])];
-    const params = [upper, ...projects, ...selected, ...(options.protocol ? [options.protocol] : [])];
+    const projected = "json_patch(body,COALESCE(json_extract(body,'$.work.current'),'{}'))", state = "COALESCE(json_extract(body,'$.work.current.status'),status)";
+    const clauses = ['rowid<=?', `(${project} IS NULL OR ${permitted})`, ...(options.includeClosed ? [] : ["status NOT IN ('closed','cancelled','reconciled')", `${state} NOT IN ('done','已合入','已放弃')`, "json_extract(body,'$.work.linkedTo') IS NULL"]), ...(selected.length ? [`${project} IN (${selected.map(() => '?').join(',')})`] : []), ...(options.protocol ? ["json_extract(body,'$.worker.loop.protocol')=?"] : []), ...(options.decisionOnly ? ["(COALESCE(json_extract(body,'$.waiting'),'')<>'' OR json_extract(body,'$.deferred')=1 OR status IN ('waiting-approval','等你决定'))"] : [])];
+    const observed = options.observationSources ?? [];
+    clauses.push(`(json_extract(body,'$.observation.sourceId') IS NULL OR json_extract(body,'$.observation.sourceId') IN (${observed.length ? observed.map(() => '?').join(',') : 'NULL'}))`);
+    clauses.push(`NOT EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(body,'$.work.executions'),'[]')) e WHERE json_extract(e.value,'$.kind')='pi-observation' AND json_extract(e.value,'$.sourceId') NOT IN (${observed.length ? observed.map(() => '?').join(',') : "''"}))`);
+    if (options.observationDeny?.length) clauses.push("NOT EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(body,'$.work.executions'),'[]')) e, json_each(?) d WHERE json_extract(e.value,'$.kind')='pi-observation' AND (json_extract(e.value,'$.recordPath')=d.value OR substr(json_extract(e.value,'$.recordPath'),1,length(d.value)+1)=d.value||'/'))");
+    if (options.businessProject) clauses.push("json_extract(body,'$.work.ownership.kind')='project' AND json_extract(body,'$.work.ownership.id')=?");
+    const params = [upper, ...projects, ...selected, ...(options.protocol ? [options.protocol] : []), ...observed, ...observed, ...(options.observationDeny?.length ? [JSON.stringify(options.observationDeny)] : []), ...(options.businessProject ? [options.businessProject] : [])];
     const where = clauses.join(' AND '), limit = Math.min(50, Math.max(1, Math.floor(options.limit ?? 10)));
     const total = Number(this.db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE ${where}`).get(...params)!.n);
-    const rows = this.db.prepare(`SELECT rowid AS position,id,status,updated,
+    const rows = this.db.prepare(`SELECT rowid AS position,id,${state} AS status,updated,
       json_extract(body,'$.title') AS title, substr(json_extract(body,'$.goal'),1,180) AS goal,
       ${project} AS project, json_extract(body,'$.worker.kind') AS worker,
-      json_extract(body,'$.worker.origin') AS origin, json_extract(body,'$.lastVerifiedAt') AS lastVerifiedAt,
-      json_extract(body,'$.sourceCurrent.state') AS sourceState,
-      json_extract(body,'$.sourceDefinition.state') AS definitionState,
-      json_extract(body,'$.sourceHealth') AS health,
+      json_extract(body,'$.worker.origin') AS origin, json_extract(${projected},'$.lastVerifiedAt') AS lastVerifiedAt,
+      json_extract(${projected},'$.sourceCurrent.state') AS sourceState,
+      json_extract(${projected},'$.sourceDefinition.state') AS definitionState,
+      json_extract(${projected},'$.sourceHealth') AS health,
       CASE WHEN COALESCE(json_extract(body,'$.waiting'),'')<>'' OR json_extract(body,'$.deferred')=1 THEN 1 ELSE 0 END AS decision
       FROM tasks WHERE ${where} AND rowid>? ORDER BY rowid LIMIT ?`).all(...params, after, limit + 1);
     const more = rows.length > limit, page = rows.slice(0, limit), last = page.at(-1);
@@ -130,22 +150,24 @@ export class Store {
     try { const value = run(); if (own) this.db.exec('COMMIT'); return value; }
     catch (error) { if (own) this.db.exec('ROLLBACK'); throw error; }
   }
-  taskTable() { return (this.db.prepare("SELECT body FROM tasks WHERE status<>'closed' ORDER BY updated DESC").all() as Row[]).map(r => { const t = parseJson<TaskCard>(String(r.body)); return { id: t.id, title: t.title, status: t.status, waiting: t.waiting, updated: t.updated }; }); }
+  taskTable() { return (this.db.prepare("SELECT body FROM tasks WHERE status<>'closed' AND json_extract(body,'$.work.linkedTo') IS NULL ORDER BY updated DESC").all() as Row[]).map(r => { const t = this.workTask(parseJson<TaskCard>(String(r.body)).id)!; return { id: t.id, title: t.title, status: t.status, waiting: t.waiting, updated: t.updated }; }); }
   searchClosed(query: string, limit = 20) { return (this.db.prepare("SELECT body FROM tasks WHERE status='closed' AND instr(body,?)>0 ORDER BY updated DESC LIMIT ?").all(query, Math.min(50, Math.max(1, limit))) as Row[]).map(r => parseJson<TaskCard>(String(r.body))); }
-  match(input: Input) {
+  match(input: Input, original = false): TaskCard[] {
+    if (input.source === 'pi' && (input.raw as { observation?: number } | undefined)?.observation === 1) {
+      const raw = input.raw as { sourceId?: string; recordKey?: string };
+      const card = input.workerId ? this.task(input.workerId) : undefined;
+      return card && card.observation && card.observation.sourceId === raw.sourceId && card.observation.recordKey === raw.recordKey ? this.matched([card.id], original) : [];
+    }
     if (input.source === 'loop' && (input.raw as { kernel?: number } | undefined)?.kernel === 1) {
       const card = input.workerId ? this.task(input.workerId) : undefined, binding = card?.worker?.loop;
       if (!card || !binding) return [];
       const linked = this.db.prepare("SELECT t.body FROM task_events e JOIN tasks t ON t.id=e.task WHERE e.event=? AND json_extract(t.body,'$.worker.loop.repository')=? AND json_extract(t.body,'$.worker.loop.runId')=? AND json_extract(t.body,'$.worker.loop.cardFile')=? AND json_extract(t.body,'$.worker.loop.ledger')=? ORDER BY t.rowid").all(input.id, binding.repository, binding.runId, binding.cardFile, binding.ledger);
-      return linked.length ? linked.map(row => parseJson<TaskCard>(String(row.body))) : [card];
+      return this.matched(linked.length ? linked.map(row => parseJson<TaskCard>(String(row.body)).id) : [card.id], original);
     }
     const sources = [['message', input.quoteId], ['message', input.messageId], ['loop', input.batchFile], ['pi', input.workerId]].filter((x): x is [string, string] => !!x[1]);
     const ids = new Set<string>();
     for (const [kind, value] of sources) for (const r of this.db.prepare('SELECT task FROM subscriptions WHERE kind=? AND value=?').all(kind, value)) ids.add(String(r.task));
-    return [...ids].flatMap(id => {
-      const card = this.task(id); if (!card) return [];
-      return [card];
-    });
+    return this.matched([...ids], original);
   }
   /** JSON-only additive enrichment; no schema rewrite or second task ledger. */
   applyLoopSnapshot(card: TaskCard, revision: number, fingerprint: string, update: () => void) {
@@ -183,15 +205,13 @@ export class Store {
     return this.db.prepare("SELECT body FROM tasks WHERE json_extract(body,'$.worker.loop.protocol')='kernel:1' AND status NOT IN ('closed','cancelled','reconciled')").all().map(r => parseJson<TaskCard>(String(r.body)));
   }
   recordTaskEvent(card: TaskCard, input: Input, status: string) {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    this.transaction(() => {
       if (this.db.prepare('INSERT OR IGNORE INTO task_events VALUES(?,?)').run(card.id, input.id).changes) {
         card.status = status;
         card.dispatches.push({ event: input.id, at: input.at, status, reported: input.status, source: input.source });
         card.updated = new Date().toISOString(); this.putTask(card);
       }
-      this.db.exec('COMMIT');
-    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
+    });
   }
   addWindow(id: string, seq: number, role: 'user' | 'assistant', text: string) {
     this.db.prepare('INSERT OR IGNORE INTO window VALUES(?,?,?,?,?)').run(id, seq, role, text, tokenBudget(text));
@@ -203,7 +223,7 @@ export class Store {
       if (left <= Math.floor(this.config.windowTokens * 0.6)) break;
     }
   }
-  window() { return this.db.prepare('SELECT role,text,tokens FROM window ORDER BY seq').all() as { role: 'user' | 'assistant'; text: string; tokens: number }[]; }
+  window() { return this.db.prepare('SELECT id,role,text,tokens FROM window ORDER BY seq').all() as { id: string; role: 'user' | 'assistant'; text: string; tokens: number }[]; }
   replies(inputId: string) { return this.db.prepare("SELECT * FROM outbox WHERE input_id=? AND state='sent' ORDER BY rowid").all(inputId) as OutboxRow[]; }
   close() { this.db.close(); }
 }

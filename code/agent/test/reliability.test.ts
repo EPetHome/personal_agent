@@ -100,7 +100,7 @@ test('A3: per-turn capability facts use two loaded snapshots, actual tools, fina
     const facts = JSON.parse(f.model.requests[0].body.messages.find((m: any) => { try { return JSON.parse(m.content).type === '任务表'; } catch { return false; } }).content).capabilities;
     assert.equal(facts.read.projects[0].id, `project-${n}`); assert.deepEqual(facts.read.inboxes, f.config.inboxDirs); assert.equal(facts.read.attachments, f.config.attachmentDir); assert.deepEqual(facts.read.evidence[0].registeredRunDirs, f.config.projects[0]!.loopRunDirs);
     assert.ok(facts.tools.includes('list_directory')); assert.ok(facts.documents.formats.includes('DOCX 正文/表格')); assert.equal(facts.loop.independentOfPiWriteDirs, true); assert.deepEqual(facts.write.projects[0].writeDirs, []); assert.deepEqual(facts.write.projects[0].skills, {});
-    assert.ok(facts.loop.projects[0].scope.deny.includes('.autoreview.json')); assert.ok(facts.loop.projects[0].scope.deny.includes('wiki/')); assert.ok(facts.loop.projects[0].scope.deny.includes(`code/deny-${n}/`)); assert.match(facts.loop.sensing.join(), /不主动通知/); assert.match(facts.loop.sensing.join(), /尚无独立/);
+    assert.ok(facts.loop.projects[0].scope.deny.includes('.autoreview.json')); assert.ok(facts.loop.projects[0].scope.deny.includes('wiki/')); assert.ok(facts.loop.projects[0].scope.deny.includes(`code/deny-${n}/`)); assert.match(facts.loop.sensing.join(), /通知仅唤醒/); assert.deepEqual(facts.piObservation.sources, []); assert.match(facts.piObservation.protocol, /未加载.*未接通/);
     assert.equal(JSON.stringify(facts).includes(f.config.model.auth.path), false);
     await writeFile(f.configPath, JSON.stringify({ ...raw, inboxDirs: [] }));
     await f.inject({ id: 'no-hot-load', text: '再问一次范围' }); await until(() => app.store.row('feishu:no-hot-load')?.state === 'done'); assert.ok(JSON.stringify(f.model.requests.at(-1).body.messages).includes(f.config.inboxDirs[0]!));
@@ -224,8 +224,9 @@ test('A9: real installed Loop pure parser/preflight accepts generated plan, disc
 });
 
 for (const kind of ['known', 'unknown']) test(`A10: ${kind} causes survive Router tool wrapper and execute-before-check; unsafe exception never leaks`, async t => {
-  const f = await fixture({ flow: [{ tools: [{ name: 'worker_status', arguments: { id: 'missing' } }] }, { tools: [{ name: 'worker_dispatch', arguments: { ...taskArgs, instructionInput: '', instruction: '' } }] }, { text: '按工具结果交代' }] }); t.after(() => f.close()); f.config.approval.readPi = false;
+  const f = await fixture({ flow: [{ tools: [{ name: 'worker_status', arguments: { id: 'error-card' } }] }, { tools: [{ name: 'worker_dispatch', arguments: { ...taskArgs, instructionInput: '', instruction: '' } }] }, { text: '按工具结果交代' }] }); t.after(() => f.close()); f.config.approval.readPi = false;
   const app = await f.start(); const error = kind === 'known' ? new SafeError('scope_conflict', '构造范围冲突，未执行。') : new Error('SYNTHETIC_CREDENTIAL=DO_NOT_LEAK\nSTACK-BODY');
+  app.store.putTask({ id: 'error-card', title: '构造原事项', goal: '原目标', completion: '原标准', boundary: '只读', status: 'running', waiting: '', dispatches: [], conclusion: '', updated: new Date().toISOString(), subscriptions: [], worker: { kind: 'pi', project: 'p', batchFile: 'constructed-original-job' } });
   app.router.workers.status = async () => { throw error; };
   let checks = 0, effects = 0;
   app.router.workers.adapters.set('pi', { kind: 'pi', async status() { if (++checks > 1) throw error; return { state: 'idle', fingerprint: 'frozen', data: {} }; }, async dispatch() { effects++; return { status: 'sent', reason: 'unexpected' }; } } as unknown as WorkerAdapter);

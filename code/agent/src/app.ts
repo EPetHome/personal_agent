@@ -32,7 +32,7 @@ export class App {
       this.loopMonitor = new LoopMonitor(c, this.store, this.router.workers);
       this.intake = new Intake(c, this.store, this.router.files, input => {
         // A scan already accepted before stop may finish persisting, but cannot start work.
-        if (this.store.enqueue(input) || this.store.retryLoopSource(input)) this.pump();
+        if (this.store.enqueue(input) || this.store.retryLoopSource(input) || this.store.row(input.id)?.state === 'pending') this.pump();
       }, facts => this.router.workers.observeLoop(facts));
     } catch (error) { this.release(); this.store.close(); throw error; }
   }

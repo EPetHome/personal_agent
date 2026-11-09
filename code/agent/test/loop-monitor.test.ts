@@ -237,7 +237,7 @@ for (const change of ['decision', 'completion']) for (const arrival of ['queued-
     assert.equal((input.raw as { runId: string }).runId, f.b.runId);
     assert.ok(['task-a', 'task-b'].includes(app.store.task(input.workerId!)!.worker!.loop!.taskId!));
   }
-  await intake.scan(); assert.equal(originalEvents().length, 1); assert.equal(offered.filter(input => input.workerId === 'original').length, 2);
+  await intake.scan(); assert.equal(originalEvents().length, 1); assert.equal(offered.filter(input => input.workerId === 'original').length, 1, 'durably queued verification is not re-offered before consumption');
   assert.equal(Number(app.store.db.prepare('SELECT COUNT(*) AS n FROM inputs WHERE id=?').get(event.id)!.n), 1);
   assert.deepEqual(app.store.match(event).map(card => card.id), ['original']);
   app.store.start(event.id); assert.equal(await app.router.process(app.store.row(event.id)!, new AbortController().signal), 'done'); app.store.finish(event.id);

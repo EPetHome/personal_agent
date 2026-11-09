@@ -1,7 +1,7 @@
 import { AIMessage, HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { tool, type StructuredToolInterface } from '@langchain/core/tools';
+import { tool } from '@langchain/core/tools';
 import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
-import { createAgent, humanInTheLoopMiddleware } from 'langchain';
+import { createAgent, createMiddleware, humanInTheLoopMiddleware } from 'langchain';
 import { Command } from '@langchain/langgraph';
 import { join } from 'node:path';
 import type { Config, Input, QueueRow, Turn } from './types.js';
@@ -10,13 +10,16 @@ import { Files } from './files.js';
 import { RouterModel } from './model.js';
 import { turns, turn } from './context.js';
 import { SYSTEM_PROMPT } from './prompt.js';
-import { deliver, type Channel } from './channel.js';
-import { hash } from './util.js';
+import type { Channel } from './channel.js';
+import { hash, parseJson } from './util.js';
 import { TaskContext } from './task-context.js';
 import { Workers, type PendingAction } from './worker.js';
 import { SafeError, failure } from './errors.js';
 import { capabilities } from './capabilities.js';
 import { OutputRequests } from './outputs.js';
+import { ReplyFacts } from './reply-facts.js';
+import { Attention } from './attention.js';
+import { observationGrant } from './pi-observation.js';
 
 interface GraphSnapshot {
   values: { messages?: { content: unknown }[] }; next: string[];
@@ -32,7 +35,8 @@ export class Router {
   readonly workers: Workers;
   readonly tasks: TaskContext;
   private readonly toolNames: string[];
-  private readonly replyFinal: (text: string) => Promise<unknown>;
+  readonly replies: ReplyFacts;
+  readonly attention: Attention;
   constructor(readonly config: Config, readonly store: Store, readonly channel: Channel) {
     this.saver = SqliteSaver.fromConnString(join(config.dataDir, 'checkpoints.sqlite'));
     this.saver.db.pragma('journal_mode = WAL'); this.saver.db.pragma('synchronous = FULL');
@@ -42,6 +46,8 @@ export class Router {
     const make = (name: string, description: string, fields: Record<string, Field>, required: string[], run: (args: Record<string, unknown>) => Promise<unknown> | unknown) => tool(async (args: Record<string, unknown>) => {
       let result: unknown;
       try {
+        this.replies.disclosure(turn());
+        if (turn().replyCorrection && !['reply', 'get_task', 'list_projects', 'list_tasks', 'list_executions', 'query_loop', 'query_pi_observations', 'list_attention', 'read_file', 'read_image', 'read_task_evidence', 'worker_status', 'search_closed_tasks', 'read_events', 'list_directory', 'search_files'].includes(name)) throw new SafeError('correction_read_only', '回复补正只能查询和形成合法 reply，不能执行新动作');
         for (const field of [...required, 'reason', 'plan']) if (typeof args[field] !== 'string' || args[field].length > 64000) throw new SafeError('invalid_arguments', '工具参数无效或超过长度上限；未执行。');
         result = await run(args);
       } catch (error) { turn().signal.throwIfAborted(); result = failure(error); }
@@ -53,29 +59,30 @@ export class Router {
         const card = store.task(task.id)!;
         result = { ...view, card: await this.tasks.visibleSummary(card), ...(['loop', 'pi'].includes(card.worker?.kind ?? '') ? { snapshot: undefined } : {}) };
       }
+      result = this.replies.issue(name, args, result, t);
       store.log('tool_result', { inputId: t.input.id, tool: name, arguments: args, result: name === 'read_file' || name === 'read_image' ? { ok: view.ok, category: view.category, error: view.error, path: view.path, sha256: view.sha256 } : result });
       return result;
     }, { name, description, schema: { type: 'object', properties: { ...fields, reason: stringField, plan: stringField }, required: [...required, 'reason', 'plan'], additionalProperties: false } });
     this.tasks = new TaskContext(config, store, this.files, this.workers);
+    this.replies = new ReplyFacts(config, store, channel, this.tasks, this.workers);
+    this.attention = new Attention(config, store);
     const record = (path: string, value: unknown) => { turn().materials.push({ path, sha256: hash(JSON.stringify(value)) }); return value; };
     const tools = [
-      make('reply', '给用户本人发文字。reason 简述依据，plan 给方案或说明不需行动；不向别人发送。', { text: stringField, taskId: stringField }, ['text'], async args => {
-        const t = turn();
-        const mentioned = typeof args.taskId === 'string' ? store.task(args.taskId) : undefined;
-        if (mentioned && this.workers.quietTask(mentioned, t.input)) return { ok: false, category: 'no_new_decision', reason: '旧事项没有相关新事实，不附带催办；请仅回答当前问题。' };
-        const key = `${t.input.id}:reply:${hash(String(args.text))}`;
-        const result = await deliver(store, channel, t.input.id, key, String(args.text), t.signal);
-        t.replied = result.status === 'sent' || t.replied;
-        const taskId = typeof args.taskId === 'string' ? args.taskId : t.taskId;
-        const card = taskId ? store.task(taskId) : undefined;
-        if (result.status === 'sent' && typeof result.id === 'string' && card && !card.subscriptions.some(s => s.kind === 'message' && s.value === result.id)) {
-          card.subscriptions.push({ kind: 'message', value: result.id }); store.putTask(card);
-        }
-        return result;
-      }),
+      make('reply', '给本人回复的唯一出口。普通闲聊用 text；事项/总量/决定/交付/通知用 fragments JSON 数组：{kind:text|task|overview|decision|delivery|notice|action|material,text,factId,taskId?,certainty:current|last-known|unknown,coverage:complete|partial}。factId 只能引用本轮实际工具返回的 fact.id，省略 taskId 仍核对原事项。basis=cache/index 只可说明最后已知或未知；indexComplete 不等于来源完整。overview 按 fact.complete 如实填覆盖；动作回执用 action，材料引用用 material；二者不证明来源当前状态。缺依据先查询或说明未知；不附无关旧催办。text 与 fragments 二选一。不向别人发送。', { text: stringField, taskId: stringField, factId: stringField, certainty: stringField, fragments: stringField }, [], args => this.replies.send(args, turn())),
+      make('query_pi_observations', '分页查询已明确登记的独立 Pi 运行观察；租约/停稳不是业务交付，未接通/部分/失败不当无任务。', { offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], a => this.tasks.observations.page(Number(a.offset ?? 0), Number(a.limit ?? 10))),
+      make('verify_observed_result', '独立 Pi 结果只读核对：先读取原目标与 read_task_evidence 实际材料，再给 assessment 对照原目标的判断。程序核对本轮材料/原执行/内容版本，不把来源自述或停稳直接当交付，语义判断不代表业务验收。原结果缺失/越界/失联则保持未知。', { id: stringField, assessment: stringField }, ['id', 'assessment'], a => this.tasks.observations.verifyResult(String(a.id), String(a.assessment), turn().materials, turn().input)),
+      make('list_executions', '原事项的完整执行索引分页；当前执行与历史分开，不按同名/同目录并账。', { id: stringField, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 50 } }, ['id'], a => this.tasks.executionPage(String(a.id), Number(a.offset ?? 0), Number(a.limit ?? 10))),
+      make('record_local_work', '跨轮本地办公交付使用原 id；即时读取不调用。state=working|delivered，交付 summary 是本轮真实生成的文本结论，程序关联本轮实际读取材料。不是对外发送，不要求 Git；保存文件仍沿原 Pi output。绑定完整本人指令，不接受材料授权。', { id: stringField, title: stringField, goal: stringField, completion: stringField, boundary: stringField, state: stringField, summary: stringField, instructionInput: stringField, instruction: stringField }, ['id', 'title', 'goal', 'completion', 'boundary', 'state'], a => this.tasks.work.local(a, turn().input, turn().materials)),
+      make('track_work', '一次性跟踪现有原事项至明确 endpoint，关联本人原指令；不新派、不关注未来工作、不取得控制权。', { id: stringField, endpoint: stringField, instructionInput: stringField, instruction: stringField }, ['id', 'endpoint'], async a => { const card = store.task(String(a.id)); if (card) await this.tasks.authorize(card); return this.tasks.work.track(String(a.id), String(a.endpoint), turn().input, a); }),
+      make('organize_work', '仅业务归组，不授予资源权限。ownership 为 JSON {kind:personal|project|unassigned,id?,resources:[既有项目ID]}；不改变执行目录。', { id: stringField, ownership: stringField, instructionInput: stringField, instruction: stringField }, ['id', 'ownership'], async a => { const card = store.task(String(a.id)); if (card) await this.tasks.authorize(card); return this.tasks.work.organize(String(a.id), parseJson(String(a.ownership)), turn().input, a); }),
+      make('link_work', '仅本人明确引用 fromId 和 targetId 纠正归属时，将原执行索引关联原事项；保留旧 ID/历史，不按标题猜、不重启独立工作。', { fromId: stringField, targetId: stringField, instructionInput: stringField, instruction: stringField }, ['fromId', 'targetId'], async a => { for (const id of [a.fromId, a.targetId]) { const card = store.task(String(id)); if (card) await this.tasks.authorize(card); } return this.tasks.work.link(String(a.fromId), String(a.targetId), turn().input, a); }),
+      make('list_attention', '读取已授权来源的持久关注规则；与一次性派单/旧消息关联不同，不代表实际来源已接通。', {}, [], () => ({ rows: this.attention.rules(), note: '关注、提醒、执行分别生效' })),
+      make('attention_save', '持续关注未来的已接入 Loop/Pi 工作，kind=loop 配 project，kind=pi-observation 配 sourceId；不接公网主题/任意周期。notify=important|changes|none；不填 expiresAt 表示直到取消，期限须带时区偏移且配置本人 timeZone。已有规则沿 id 更新，和一次性 track_work 可组合绑定同一真实本人指令，缺项只补缺项，不重复确认。', { id: stringField, kind: stringField, project: stringField, sourceId: stringField, expiresAt: stringField, notify: stringField, instructionInput: stringField, instruction: stringField }, ['kind', 'notify'], a => this.attention.save(a, turn().input)),
+      make('attention_pause', '暂停原关注规则发现新工作，不停止外部执行；未撤销一次性委托继续回收并明确回执。', { id: stringField, instructionInput: stringField, instruction: stringField }, ['id'], a => this.attention.pause(String(a.id), turn().input, a)),
+      make('search_files', '仅在已有授权本地目录检索材料；即时查询不建派单。bounded/partial 表示有界结果，不能称搜遍所有资料。', { path: stringField, query: stringField }, ['path', 'query'], a => this.files.search(String(a.path), String(a.query), turn().materials)),
       make('get_task', '按当前权限先核对原来源，再按需展开任务定义和分层事实。失败保留最后确认时间；不建卡或永久关注。', { id: stringField }, ['id'], a => this.tasks.detail(String(a.id), turn().materials, turn().signal)),
       make('list_projects', '获准项目入口分页；给总量、本页量、是否更多、续查位置及来源覆盖。', { cursor: stringField, limit: { type: 'integer', minimum: 1, maximum: 50 } }, [], a => this.tasks.projectPage(String(a.cursor ?? ''), Number(a.limit ?? 10))),
-      make('list_tasks', '任务摘要分页；先核对此页原来源，失败/部分不冒充实时全貌。cursor 沿原范围续查；不创建任务、永久关注或执行。', { project: stringField, cursor: stringField, limit: { type: 'integer', minimum: 1, maximum: 50 }, includeClosed: { type: 'boolean' } }, [], a => this.tasks.taskPage({ project: typeof a.project === 'string' ? a.project : undefined, cursor: typeof a.cursor === 'string' ? a.cursor : undefined, limit: Number(a.limit ?? 10), includeClosed: a.includeClosed === true }, turn().signal)),
+      make('list_tasks', '任务摘要分页；先核对此页原来源，失败/部分不冒充实时全貌。cursor 沿原范围续查；不创建任务、永久关注或执行。', { project: stringField, businessProject: stringField, cursor: stringField, limit: { type: 'integer', minimum: 1, maximum: 50 }, includeClosed: { type: 'boolean' } }, [], a => this.tasks.taskPage({ project: typeof a.project === 'string' ? a.project : undefined, businessProject: typeof a.businessProject === 'string' ? a.businessProject : undefined, cursor: typeof a.cursor === 'string' ? a.cursor : undefined, limit: Number(a.limit ?? 10), includeClosed: a.includeClosed === true }, turn().signal)),
       make('read_task_evidence', '只读原事项当前仍获准的证据；key 留空列证据引用，正文按 offset/length 分段。', { id: stringField, key: stringField, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 1, maximum: 64000 } }, ['id'], a => this.tasks.evidence(String(a.id), String(a.key ?? ''), turn().materials, turn().signal, Number(a.offset ?? 0), Number(a.length ?? 16000))),
       make('search_closed_tasks', '已关闭任务按原文搜索；只返回仍获准的摘要，详情再 get_task。', { query: stringField }, ['query'], async a => {
         const rows = [];
@@ -106,7 +113,9 @@ export class Router {
       make('update_task', '改同一任务的目标/完成标准/边界定义，不能改程序状态或订阅；原点头会因定义变化作废。', { id: stringField, goal: stringField, completion: stringField, boundary: stringField }, ['id', 'goal', 'completion', 'boundary'], a => {
         if (turn().input.source !== 'feishu' || turn().input.who !== config.feishu.userId) return { ok: false, reason: '只有本人来话能改任务定义' };
         const card = store.task(String(a.id)); if (!card || ['cancelled', 'closed', 'reconciled'].includes(card.status)) return { ok: false, reason: '任务不存在或已关闭' };
-        card.goal = String(a.goal); card.completion = String(a.completion); card.boundary = String(a.boundary); card.updated = new Date().toISOString(); store.putTask(card); return { ok: true, card };
+        card.goal = String(a.goal); card.completion = String(a.completion); card.boundary = String(a.boundary);
+        if (card.observation) { card.observation.definition = 'owner'; for (const ref of card.work?.executions ?? []) if (ref.kind === 'pi-observation' && ref.result) ref.result.verified = false; }
+        card.updated = new Date().toISOString(); store.putTask(card); return { ok: true, card };
       }),
     ];
     // Replace only this task's read adapters after the shared dispatch tool
@@ -116,10 +125,8 @@ export class Router {
       make('track_loop', '只读绑定已知原执行（正式记录也会自动发现）；多任务必须给 sourceTaskId，不是任务名。不是永久关注或派工。', { project: stringField, batchFile: stringField, sourceTaskId: stringField }, ['project', 'batchFile'], async a => ({ card: this.tasks.summary(await this.workers.trackLoop(String(a.project), String(a.batchFile), typeof a.sourceTaskId === 'string' ? a.sourceTaskId : undefined, turn().signal)) })),
     ]) tools[tools.findIndex(t => t.name === selected.name)] = selected;
     this.toolNames = tools.map(t => t.name);
-    const replyTool: StructuredToolInterface = tools[0]!;
-    this.replyFinal = text => replyTool.invoke({ text, reason: '模型直接返回给本人的文字', plan: '原文回复，不执行额外动作' });
     this.agent = createAgent({ model: new RouterModel(config, store), tools, checkpointer: this.saver,
-      middleware: [humanInTheLoopMiddleware({ interruptOn: {
+      middleware: [createMiddleware({ name: 'observation-disclosure', beforeModel: () => { this.replies.disclosure(turn()); } }), humanInTheLoopMiddleware({ interruptOn: {
         ...Object.fromEntries(tools.map(t => [t.name, false])),
         worker_dispatch: { allowedDecisions: ['approve', 'reject'], when: r => outputs.needsApproval(r.toolCall.args) },
         worker_reply: { allowedDecisions: ['approve', 'reject'], when: r => this.workers.needsApproval('worker_reply', r.toolCall.args) },
@@ -127,9 +134,28 @@ export class Router {
       } })] });
   }
   async context(input: Input) {
-    const window = this.store.window().map(m => m.role === 'user' ? new HumanMessage(m.text) : new AIMessage(m.text));
+    const active = turns.getStore(), window = [];
+    for (const message of this.store.window()) {
+      const grants = this.store.get<Record<string, string>>(`window:observation:${message.id}`, {});
+      try {
+        if (Object.keys(grants).length && this.store.get(`window:observation-access:${message.id}`, this.replies.disclosureScope()) !== this.replies.disclosureScope()
+          || !Object.entries(grants).every(([id, grant]) => observationGrant(this.tasks.observations.source(id)) === grant)) continue;
+      } catch { continue; }
+      window.push(message.role === 'user' ? new HumanMessage(message.text) : new AIMessage(message.text));
+      // These exact originals are entering this checkpoint too, even when no
+      // corresponding task is on the first page or matched by the current input.
+      if (active) active.observationGrants = { ...active.observationGrants, ...grants };
+    }
+    if (active) this.replies.saveDisclosure(active);
     const facts = { ...capabilities({ ...this.config, projects: this.config.projects.slice(0, 5) }, this.toolNames), projectCoverage: { total: this.config.projects.length, count: Math.min(5, this.config.projects.length), hasMore: this.config.projects.length > 5, rule: '仅入口页；其他项目用 list_projects 按需查询，实际授权仍由工具逐次核对' } };
     const tasks = { ...await this.tasks.context(input), capabilities: facts, workers: [...this.workers.adapters.keys()] };
+    if (active) for (const row of [...tasks.rows, ...tasks.matchedCards]) {
+      const card = this.store.task(String(row.id));
+      for (const id of new Set([...(card?.observation ? [card.observation.sourceId] : []), ...(card?.work?.executions.filter(e => e.kind === 'pi-observation').map(e => e.sourceId) ?? [])])) {
+        active.observationGrants = { ...active.observationGrants, [id]: observationGrant(this.tasks.observations.source(id)) };
+      }
+    }
+    if (active) this.replies.saveDisclosure(active);
     const incoming = { type: '新输入', ...input, raw: undefined };
     // Task data is not a higher-priority system instruction. Source text is always data.
     return [new SystemMessage(SYSTEM_PROMPT), ...window, new HumanMessage(JSON.stringify(tasks)), new HumanMessage(JSON.stringify(incoming))];
@@ -143,7 +169,7 @@ export class Router {
           try {
             const state = await this.run(origin, signal);
             this.remember(origin);
-            if (state === 'done') this.store.finish(origin.id);
+            if (state === 'done') { this.tasks.observations.acknowledge(origin.input); this.store.finish(origin.id); }
           } catch (error) {
             if (!(signal.reason instanceof Error && signal.reason.message === 'shutdown')) this.store.finish(origin.id, 'failed');
             throw error;
@@ -154,9 +180,15 @@ export class Router {
     }
     // A queued approval group is a checkpoint continuation, not a replay of
     // its original worker signal (which may now be cancelled or out of date).
-    if (this.workers.decisions(row.id)) return this.run(row, signal);
-    if (!await this.workers.ingest(row.input, signal)) return 'done';
-    return this.run(row, signal);
+    if (this.workers.decisions(row.id)) {
+      const state = await this.run(row, signal); if (state === 'done') this.tasks.observations.acknowledge(row.input); return state;
+    }
+    if ((row.input.raw as { observation?: number } | undefined)?.observation === 1) {
+      if (!await this.tasks.observations.ingest(row.input)) return 'done';
+    } else if (!await this.workers.ingest(row.input, signal)) return 'done';
+    const state = await this.run(row, signal);
+    if (state === 'done') this.tasks.observations.acknowledge(row.input);
+    return state;
   }
   private snapshot(thread: string) {
     // SAFETY: pinned createAgent delegates getState to LangGraph; HITL/restart tests
@@ -166,9 +198,10 @@ export class Router {
   private async run(row: QueueRow, signal: AbortSignal): Promise<'done' | 'waiting'> {
     const stateConfig = { configurable: { thread_id: row.id } };
     const matched = this.store.match(row.input);
-    const t: Turn = { input: row.input, signal, materials: [], replied: this.store.replies(row.id).some(r => !String(r.id).endsWith(':busy')), call: this.store.get(`calls:${row.id}`, 0), taskId: matched.length === 1 ? matched[0]!.id : undefined };
+    const t: Turn = { input: row.input, signal, materials: [], replied: this.store.replies(row.id).some(r => !String(r.id).endsWith(':busy')), call: this.store.get(`calls:${row.id}`, 0), observationGrants: this.store.get(`reply:grants:${row.id}`, {}), replyCorrection: this.store.get(`reply:correction:${row.id}`, false), taskId: matched.length === 1 ? matched[0]!.id : undefined };
     return turns.run(t, async () => {
       try {
+        this.replies.disclosure(t); // Check saved dependencies before resuming any suspended tool as well as before each model call.
         const snapshot = await this.snapshot(row.id);
         const initialized = !!snapshot.values?.messages?.length;
         const decisions = this.workers.decisions(row.id);
@@ -180,7 +213,7 @@ export class Router {
         for (let n = 0; ; n++) {
           const after = await this.snapshot(row.id);
           const requests = after.tasks?.flatMap(task => task.interrupts?.flatMap(i => i.value.actionRequests ?? []) ?? []) ?? [];
-          if (!requests.length) break;
+          if (!requests.length || t.replyCorrection) break;
           if (n >= this.config.maxToolRounds) throw new Error('工具轮数已到上限');
           await this.workers.suspend(row.id, requests, signal);
           const consumed = this.workers.decisions(row.id);
@@ -188,15 +221,15 @@ export class Router {
           this.store.log('input_result', { inputId: row.id, outcome: '等本人点头；暂停已存检查点' });
           return 'waiting';
         }
-        // A plain final assistant message is also a model-authored reply. Route it
-        // through the SAME durable reply tool, never infer intent from keywords.
+        // A direct final message never becomes an unchecked send fallback.
+        // Give the same graph one correction, then use a fixed non-claim receipt.
         if (row.input.source === 'feishu' && !this.store.db.prepare("SELECT 1 FROM outbox WHERE input_id=? AND id<>? LIMIT 1").get(row.id, `${row.id}:busy`)) {
-          // SAFETY: same pinned getState delegation; terminal graph messages contain content.
-          const final = await (this.agent.getState(stateConfig) as unknown as Promise<{ values: { messages?: { content: unknown }[] } }>);
-          const text = final.values.messages?.at(-1)?.content;
-          if (typeof text === 'string' && text.trim()) {
-            await this.replyFinal(text);
+          if (!this.store.get(`reply:correction:${row.id}`, false)) {
+            this.store.set(`reply:correction:${row.id}`, true); // Durable one-shot, including checkpoint recovery.
+            t.replyCorrection = true;
+            await this.agent.invoke({ messages: [new HumanMessage('程序补正：直接最终文字不能发送。仅沿本回合调用 reply；普通问答用 text，涉及事项/总量/催办/交付须引用本轮真实工具 fact 的 fragments，必要时查询或明确未知。只允许这一次补正，不得原文兜底或重复执行已有动作。')] }, options);
           }
+          if (!this.store.db.prepare("SELECT 1 FROM outbox WHERE input_id=? AND id<>? LIMIT 1").get(row.id, `${row.id}:busy`)) await this.replies.send({ text: '这条回复尚未完成核对，暂未发出事项结论；原事项保留。' }, t);
         }
         this.store.log('input_result', { inputId: row.id, outcome: t.replied || this.store.replies(row.id).length ? '已回复' : '处理完成；未主动通知', materials: t.materials });
         return 'done';
@@ -208,8 +241,11 @@ export class Router {
     // No tool output, file contents, base64, raw callback or logs enter the window.
     const text = i.attachments.length || i.source !== 'feishu' ? `[${i.source} 材料] ${i.attachments.map(a => `${a.kind}: ${a.path ?? a.name}`).join('；') || i.id}` : i.text;
     this.store.addWindow(`${i.id}:user`, row.seq * 1000, 'user', text);
+    const grants = this.store.get<Record<string, string>>(`reply:grants:${i.id}`, {});
+    this.store.set(`window:observation:${i.id}:user`, grants);
+    const scope = this.store.get(`reply:access:${i.id}`, this.replies.disclosureScope()); this.store.set(`window:observation-access:${i.id}:user`, scope);
     let n = 1;
-    for (const reply of this.store.replies(i.id)) if (!String(reply.id).endsWith(':busy')) this.store.addWindow(reply.id, row.seq * 1000 + n++, 'assistant', String(reply.text));
+    for (const reply of this.store.replies(i.id)) if (!String(reply.id).endsWith(':busy')) { this.store.addWindow(reply.id, row.seq * 1000 + n++, 'assistant', String(reply.text)); this.store.set(`window:observation:${reply.id}`, grants); this.store.set(`window:observation-access:${reply.id}`, scope); }
   }
   async prune() {
     // Keep a bounded number of complete input threads; retain pending/approval threads.

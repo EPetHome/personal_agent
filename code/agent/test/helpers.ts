@@ -5,7 +5,10 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 import { App } from '../src/app.js';
 import { fakeFeishu, scriptModel, type Script } from '../src/stubs/servers.js';
-import { sleep, parseJson } from '../src/util.js';
+import { sleep, parseJson, canonical, hash } from '../src/util.js';
+import type { Input, ObservationSource } from '../src/types.js';
+import type { PiObservationRecord } from '../src/pi-observation.js';
+import type { Store } from '../src/store.js';
 
 export async function until(test: () => boolean | Promise<boolean>, timeout = 8000) {
   const end = Date.now() + timeout;
@@ -19,6 +22,23 @@ export async function settleLaunchers(dataDir: string) {
     const receipt = join(dir, file.replace('.launch.json', '.receipt.json'));
     await until(async () => { try { return parseJson<{ state?: string }>(await readFile(receipt, 'utf8')).state === 'exited'; } catch { return false; } }, 8000);
   }
+}
+export function ownerInput(store: Store, id: string, text: string): Input {
+  const input: Input = { id, text, source: 'feishu', who: 'owner', chatType: 'p2p', messageId: `message-${id}`, at: new Date().toISOString(), attachments: [] };
+  store.enqueue(input); return input;
+}
+export const instructionArgs = (input: Input) => ({ instructionInput: input.id, instruction: input.text });
+export async function observationFixture(watch = false, script: Script = { flow: [{ text: '静默记录构造来源' }] }) {
+  const f = await fixture(script, { intake: { watch, fallbackMs: 60_000 } });
+  const path = join(f.root, 'pi-export'); await mkdir(path);
+  const source: ObservationSource = { id: 'selected-pi', enabled: true, exportRoot: await canonical(path), cwds: [f.config.projects[0]!.root], ownerUid: process.getuid!(), project: 'p', allowSubject: true, allowResult: true };
+  f.config.piObservation = { sources: [source] };
+  const record = (changes: Partial<PiObservationRecord> = {}): PiObservationRecord => ({ version: 1, kind: 'execution', sourceId: source.id, sessionId: 'original-session', instanceId: 'instance-1', executionId: 'input-1', revision: 1, observedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), cwd: source.cwds[0]!, state: 'running', ...changes });
+  const emit = async (r = record()) => {
+    const file = join(source.exportRoot, `${r.kind}-${hash(JSON.stringify([r.sourceId, r.sessionId, r.instanceId, r.executionId]))}.json`);
+    const temp = `${file}.tmp`; await writeFile(temp, JSON.stringify(r)); const { rename } = await import('node:fs/promises'); await rename(temp, file); return file;
+  };
+  return { ...f, source, record, emit };
 }
 export const replyScript: Script = { requireReasoning: true, flow: [{ tools: [{ name: 'reply', arguments: { text: '收到：{{text}}' } }] }, { text: 'done' }] };
 export async function fixture(script: Script = replyScript, override: Record<string, unknown> = {}) {
